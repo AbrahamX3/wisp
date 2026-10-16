@@ -526,7 +526,7 @@ mod tests {
             url: format!("https://nginx.org/download/nginx-{version}.zip"),
             vc: None,
         };
-        runtime::install(RuntimeKind::Nginx, &release).expect("nginx install");
+        runtime::install(RuntimeKind::Nginx, &release, &|_| {}).expect("nginx install");
     }
 
     fn ensure_php(version: &str) {
@@ -540,7 +540,7 @@ mod tests {
             ),
             vc: Some(16),
         };
-        runtime::install(RuntimeKind::Php, &release).expect("php install");
+        runtime::install(RuntimeKind::Php, &release, &|_| {}).expect("php install");
     }
 
     /// Starts the real nginx and php-cgi, serves a file, and stops again.

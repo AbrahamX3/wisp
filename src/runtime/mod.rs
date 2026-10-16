@@ -70,14 +70,18 @@ pub fn php_cgi(version: &str) -> PathBuf {
 }
 
 /// Download and unpack a release into its install directory.
-pub fn install(kind: RuntimeKind, release: &Release) -> Result<PathBuf> {
+pub fn install(
+    kind: RuntimeKind,
+    release: &Release,
+    progress: &(dyn Fn(f32) + Sync),
+) -> Result<PathBuf> {
     config::ensure();
     let dir = install_dir(kind, &release.version);
     let scratch = config::runtimes().join(".downloads");
     std::fs::create_dir_all(&scratch)?;
     let archive = scratch.join(format!("{}-{}.zip", kind.as_str(), release.version));
 
-    download::download_to(&release.url, &archive)?;
+    download::download_to_reporting(&release.url, &archive, progress)?;
 
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -129,7 +133,7 @@ mod tests {
             vc: None,
         };
 
-        let dir = install(RuntimeKind::Nginx, &release).expect("install should succeed");
+        let dir = install(RuntimeKind::Nginx, &release, &|_| {}).expect("install should succeed");
         assert!(dir.join("nginx.exe").is_file(), "nginx.exe should be unpacked");
         assert!(dir.join("conf").join("nginx.conf").is_file());
         assert!(dir.join("logs").is_dir());
@@ -160,7 +164,7 @@ mod tests {
             vc: Some(16),
         };
 
-        let dir = install(RuntimeKind::Php, &release).expect("install should succeed");
+        let dir = install(RuntimeKind::Php, &release, &|_| {}).expect("install should succeed");
         assert!(
             crate::runtime::php_cgi(version).is_file(),
             "php-cgi.exe should be unpacked"

@@ -30,6 +30,54 @@ pub fn get_text(url: &str) -> Result<String> {
 /// A generous ceiling for runtime archives; PHP builds are around 33 MB.
 const MAX_BODY: u64 = 1024 * 1024 * 1024;
 
+/// GET a file and write it to `dest`, reporting how far along it is.
+///
+/// `progress` is called with a fraction between 0 and 1 as bytes arrive, and
+/// only when the server said how large the file is; archives served without a
+/// length simply report nothing.
+pub fn download_to_reporting(
+    url: &str,
+    dest: &Path,
+    progress: &dyn Fn(f32),
+) -> Result<()> {
+    let mut response = ureq::get(url)
+        .call()
+        .map_err(|error| http_error(url, error))?;
+    let expected = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|length| *length > 0);
+
+    let mut reader = response.body_mut().as_reader();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut reader, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() as u64 > MAX_BODY {
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the download is larger than Wisp will accept",
+            )));
+        }
+        if let Some(expected) = expected {
+            progress((bytes.len() as f32 / expected as f32).min(1.0));
+        }
+    }
+    progress(1.0);
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, bytes)?;
+    Ok(())
+}
+
 /// GET a file and write it to `dest`.
 pub fn download_to(url: &str, dest: &Path) -> Result<()> {
     let mut response = ureq::get(url)

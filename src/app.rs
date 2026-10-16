@@ -20,11 +20,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu,
@@ -323,6 +325,8 @@ pub struct Wisp {
     catalog_fetched_at: Option<u64>,
     /// The runtime action in flight, keyed as `"php/8.4"` or `"nginx/1.27.0"`.
     busy_runtime: Option<String>,
+    /// How far the current download has got, when one is running.
+    busy_progress: Option<Arc<Mutex<f32>>>,
 
     /// Projects whose server block nginx should serve.
     nginx_on: HashSet<i64>,
@@ -428,6 +432,7 @@ impl Wisp {
             catalog_error: None,
             catalog_fetched_at: None,
             busy_runtime: None,
+            busy_progress: None,
             nginx_on: HashSet::new(),
             php_on: HashSet::new(),
             serve_status: serve::Status::default(),
@@ -1123,6 +1128,8 @@ impl Wisp {
         }
         let key = format!("{}/{}", kind.as_str(), release.version);
         self.busy_runtime = Some(key);
+        let progress = Arc::new(Mutex::new(0.0_f32));
+        self.busy_progress = Some(progress.clone());
         cx.notify();
 
         let version = release.version.clone();
@@ -1130,13 +1137,20 @@ impl Wisp {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    runtime::install(kind, &release).map(|path| path.to_string_lossy().to_string())
+                    let report = |fraction: f32| {
+                        if let Ok(mut slot) = progress.lock() {
+                            *slot = fraction;
+                        }
+                    };
+                    runtime::install(kind, &release, &report)
+                        .map(|path| path.to_string_lossy().to_string())
                 })
                 .await;
 
             entity
                 .update(cx, |this, cx| {
                     this.busy_runtime = None;
+                    this.busy_progress = None;
                     match outcome {
                         Ok(path) => {
                             if let Some(store) = &this.store {
@@ -1171,6 +1185,8 @@ impl Wisp {
         }
         let key = format!("php/{}", release.version);
         self.busy_runtime = Some(key);
+        let progress = Arc::new(Mutex::new(0.0_f32));
+        self.busy_progress = Some(progress.clone());
         cx.notify();
 
         let version = release.version.clone();
@@ -1179,7 +1195,12 @@ impl Wisp {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let path = runtime::install(RuntimeKind::Php, &release)?;
+                    let report = |fraction: f32| {
+                        if let Ok(mut slot) = progress.lock() {
+                            *slot = fraction;
+                        }
+                    };
+                    let path = runtime::install(RuntimeKind::Php, &release, &report)?;
                     // Only drop the old patch once the new one is in place.
                     let _ = runtime::remove(RuntimeKind::Php, &previous);
                     Ok::<_, runtime::RuntimeError>(path.to_string_lossy().to_string())
@@ -3135,6 +3156,13 @@ impl Wisp {
         cx.notify();
     }
 
+    /// How far the running download has got, if one is running.
+    fn current_progress(&self) -> Option<f32> {
+        self.busy_progress
+            .as_ref()
+            .and_then(|progress| progress.lock().ok().map(|slot| *slot))
+    }
+
     /// Show or hide the command palette, focusing its field when it appears.
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = !self.palette_open;
@@ -3491,7 +3519,13 @@ impl Wisp {
             RuntimeTab::Php => self.php_section(cx).into_any_element(),
             RuntimeTab::Nginx => self.nginx_section(cx).into_any_element(),
             RuntimeTab::Https => self.https_card(cx).into_any_element(),
-            RuntimeTab::Hosts => self.hosting_card(cx).into_any_element(),
+            RuntimeTab::Hosts => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(self.hosting_card(cx))
+                .child(self.hosts_block_card(cx))
+                .into_any_element(),
             RuntimeTab::Resources => self.resources_card(None, cx),
         };
 
@@ -3793,6 +3827,34 @@ impl Wisp {
         )
     }
 
+    /// The hosts block Wisp manages, as it is on disk.
+    fn hosts_block_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let header = section_header(
+            "Managed entries",
+            "The block Wisp owns in the hosts file. Everything else is left alone.",
+            cx,
+        );
+        let body: AnyElement = match managed_hosts_block() {
+            Some(text) => code_pane("hosts-code", text, cx),
+            None => div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Wisp has not written its block yet. Starting a site adds it.")
+                .into_any_element(),
+        };
+
+        ui::section(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(header)
+                .child(div().px(px(18.)).pb(px(18.)).child(body)),
+        )
+        .into_any_element()
+    }
+
     /// The state of the hosts-file elevated control.
     fn hosting_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
@@ -4020,21 +4082,28 @@ impl Wisp {
                     .iter()
                     .find(|runtime| runtime.line() == *line)
                     .cloned();
-                php_row(line, current.as_ref(), latest, self.busy_runtime.as_deref(), cx)
+                php_row(
+                    line,
+                    current.as_ref(),
+                    latest,
+                    self.busy_runtime.as_deref(),
+                    self.current_progress(),
+                    cx,
+                )
             })
             .collect();
 
         let body = if rows.is_empty() {
-            div()
-                .p(px(18.))
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(if self.catalog_loading {
-                    "Loading versions\u{2026}"
-                } else {
-                    "No PHP versions were found."
-                })
-                .into_any_element()
+            if self.catalog_loading {
+                version_skeletons()
+            } else {
+                div()
+                    .p(px(18.))
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No PHP versions were found.")
+                    .into_any_element()
+            }
         } else {
             div()
                 .flex()
@@ -4059,12 +4128,13 @@ impl Wisp {
         let installed = self.installed(RuntimeKind::Nginx);
         let active = self.settings.active_nginx.clone();
         let busy = self.busy_runtime.as_deref();
+        let progress = self.current_progress();
 
         let rows: Vec<AnyElement> = installed
             .iter()
             .map(|runtime| {
                 let is_active = active.as_deref() == Some(runtime.version.as_str());
-                nginx_row(runtime, is_active, busy, cx)
+                nginx_row(runtime, is_active, busy, progress, cx)
             })
             .collect();
 
@@ -4528,11 +4598,43 @@ fn badge(label: &str, cx: &App) -> impl IntoElement {
 }
 
 /// One PHP minor line, with its install/update/uninstall controls.
+/// Placeholder rows while the version list is on its way.
+fn version_skeletons() -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p(px(18.))
+        .child(Skeleton::new().h(px(24.)).w_full())
+        .child(Skeleton::new().h(px(24.)).w_full())
+        .child(Skeleton::new().h(px(24.)).w(px(320.)))
+        .into_any_element()
+}
+
+/// A download in flight, as a bar with its percentage beside it.
+fn download_progress(id: &'static str, progress: Option<f32>, cx: &App) -> AnyElement {
+    let fraction = progress.unwrap_or(0.0);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(div().w(px(120.)).child(Progress::new(id).value(fraction)))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{}%", (fraction * 100.0).round() as i32)),
+        )
+        .into_any_element()
+}
+
 fn php_row(
     line: &str,
     current: Option<&InstalledRuntime>,
     latest: &Release,
     busy: Option<&str>,
+    progress: Option<f32>,
     cx: &mut Context<Wisp>,
 ) -> AnyElement {
     let latest = latest.clone();
@@ -4553,19 +4655,7 @@ fn php_row(
     };
 
     let actions: Vec<AnyElement> = if busy_here {
-        vec![div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(Spinner::new().small())
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Working\u{2026}"),
-            )
-            .into_any_element()]
+        vec![download_progress("php-progress", progress, cx)]
     } else {
         match current {
             None => {
@@ -4662,25 +4752,14 @@ fn nginx_row(
     runtime: &InstalledRuntime,
     active: bool,
     busy: Option<&str>,
+    progress: Option<f32>,
     cx: &mut Context<Wisp>,
 ) -> AnyElement {
     let version = runtime.version.clone();
     let busy_here = busy.is_some_and(|key| key == format!("nginx/{version}"));
 
     let actions: Vec<AnyElement> = if busy_here {
-        vec![div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(Spinner::new().small())
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Working\u{2026}"),
-            )
-            .into_any_element()]
+        vec![download_progress("nginx-progress", progress, cx)]
     } else {
         let use_version = version.clone();
         let remove_version = version.clone();
@@ -5066,6 +5145,7 @@ fn ini_editor_body(
             .w_full()
             .into_any_element(),
         IniView::Generated => code_pane(
+            "ini-code",
             wisp.generated_ini(project, &project.php_ini_overrides),
             cx,
         ),
@@ -5082,9 +5162,9 @@ fn ini_editor_body(
 }
 
 /// A read-only block of monospace text in a bordered, scrolling pane.
-fn code_pane(text: String, cx: &App) -> AnyElement {
+fn code_pane(id: &'static str, text: String, cx: &App) -> AnyElement {
     div()
-        .id("ini-code")
+        .id(id)
         .w_full()
         .h(px(360.))
         .rounded_md()
@@ -5773,6 +5853,15 @@ fn find_ranges(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, us
         }
     }
     ranges
+}
+
+/// The `# wisp:start … # wisp:end` block as it is on disk, if there is one.
+fn managed_hosts_block() -> Option<String> {
+    let text = hosts::read().ok()?;
+    let start = text.find(hosts::START)?;
+    let rest = &text[start..];
+    let end = rest.find(hosts::END)?;
+    Some(rest[..end + hosts::END.len()].to_string())
 }
 
 fn cx_error() -> Hsla {    rgb(0xEF4444).into()
