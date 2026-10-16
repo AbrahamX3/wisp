@@ -6,8 +6,10 @@
 //! affinity and cheap to hold in the UI.
 
 mod projects;
+mod runtimes;
 
 pub use projects::{slugify, Project, ProjectDraft};
+pub use runtimes::{minor_line, InstalledRuntime};
 
 use std::path::PathBuf;
 
@@ -42,6 +44,14 @@ CREATE TABLE IF NOT EXISTS projects (
     php_ini_overrides  TEXT    NOT NULL DEFAULT '{}',
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtimes (
+    kind         TEXT    NOT NULL,
+    version      TEXT    NOT NULL,
+    path         TEXT    NOT NULL,
+    installed_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, version)
 );
 "#;
 

@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::form::{Field, Form};
@@ -24,18 +25,17 @@ use gpui_kit::*;
 use crate::assets::APP_ICON;
 use crate::autostart;
 use crate::brand;
-use crate::db::{self, Project, ProjectDraft, Store};
+use crate::db::{self, InstalledRuntime, Project, ProjectDraft, Store};
 use crate::platform;
+use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::settings::{Settings, ThemePreference};
 use crate::tray;
 use crate::ui;
 use crate::update;
+use crate::vcrt;
 
 /// Delay before the automatic launch update check, so start-up stays snappy.
 const AUTO_CHECK_DELAY: Duration = Duration::from_secs(6);
-
-/// The PHP major/minor lines offered in the editor before runtimes are managed.
-const PHP_VERSIONS: &[&str] = &["8.4", "8.3", "8.2", "8.1", "8.0", "7.4"];
 
 /// Repository URL, taken from `Cargo.toml` so it cannot drift from the updater's
 /// own `REPO_OWNER` / `REPO_NAME` (a test below keeps the two in step).
@@ -59,6 +59,13 @@ enum UpdateState {
     Available(String),
     Installing(String),
     ReadyToRestart(String),
+}
+
+/// Which top-level screen the sidebar is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Projects,
+    Services,
 }
 
 /// The create/edit dialog's live state. `id` is `None` while creating.
@@ -87,6 +94,14 @@ pub struct Wisp {
     editor: Option<EditorState>,
     /// A persistent problem (e.g. the database could not be opened).
     error: Option<String>,
+
+    screen: Screen,
+    runtimes: Vec<InstalledRuntime>,
+    catalog: Option<Catalog>,
+    catalog_loading: bool,
+    catalog_error: Option<String>,
+    /// The runtime action in flight, keyed as `"php/8.4"` or `"nginx/1.27.0"`.
+    busy_runtime: Option<String>,
 }
 
 impl Wisp {
@@ -107,8 +122,16 @@ impl Wisp {
             selected: None,
             editor: None,
             error,
+            screen: Screen::Projects,
+            runtimes: Vec::new(),
+            catalog: None,
+            catalog_loading: false,
+            catalog_error: None,
+            busy_runtime: None,
         };
         this.reload(cx);
+        this.reload_runtimes(cx);
+        this.load_catalog(cx);
 
         Self::spawn_auto_update_check(cx);
         this
@@ -212,6 +235,7 @@ impl Wisp {
 
         let entity = cx.entity();
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let php_versions = entity.read(cx).installed_php_versions();
             let Some(editor) = entity.read(cx).editor.as_ref() else {
                 return dialog;
             };
@@ -227,7 +251,7 @@ impl Wisp {
                 .title(title)
                 .w(px(580.))
                 .close_button(true)
-                .child(editor_form(editor, &entity, error))
+                .child(editor_form(editor, &entity, error, &php_versions, cx))
                 .footer(editor_footer(entity.clone(), is_new))
         });
     }
@@ -396,6 +420,260 @@ impl Wisp {
                 ToastKind::Error,
                 "The project database is unavailable.".to_string(),
             ),
+        }
+        cx.notify();
+    }
+
+    // ---- runtimes --------------------------------------------------------
+
+    fn goto(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if self.screen != screen {
+            self.screen = screen;
+            cx.notify();
+        }
+    }
+
+    fn reload_runtimes(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            match store.list_runtimes() {
+                Ok(runtimes) => self.runtimes = runtimes,
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.catalog_loading {
+            return;
+        }
+        self.catalog_loading = true;
+        self.catalog_error = None;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { Catalog::fetch() })
+                .await;
+            entity
+                .update(cx, |this, cx| {
+                    this.catalog_loading = false;
+                    match result {
+                        Ok(catalog) => {
+                            this.catalog = Some(catalog);
+                            this.catalog_error = None;
+                        }
+                        Err(error) => this.catalog_error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Installed versions of a kind, newest first.
+    fn installed(&self, kind: RuntimeKind) -> Vec<InstalledRuntime> {
+        let mut list: Vec<InstalledRuntime> = self
+            .runtimes
+            .iter()
+            .filter(|runtime| runtime.kind == kind.as_str())
+            .cloned()
+            .collect();
+        list.sort_by_key(|runtime| std::cmp::Reverse(version_key(&runtime.version)));
+        list
+    }
+
+    /// Installed PHP versions, for the editor's dropdown.
+    fn installed_php_versions(&self) -> Vec<String> {
+        self.installed(RuntimeKind::Php)
+            .into_iter()
+            .map(|runtime| runtime.version)
+            .collect()
+    }
+
+    /// The highest VC++ runtime an installed PHP build needs but is missing.
+    fn php_vcrt_gap(&self) -> Option<u16> {
+        let catalog = self.catalog.as_ref()?;
+        let mut needed: Option<u16> = None;
+        for runtime in &self.runtimes {
+            if runtime.kind != RuntimeKind::Php.as_str() {
+                continue;
+            }
+            let Some(release) = catalog.php.iter().find(|r| r.version == runtime.version) else {
+                continue;
+            };
+            if let Some(vc) = release.vc.filter(|vc| !vcrt::satisfies(*vc)) {
+                needed = Some(needed.map_or(vc, |current: u16| current.max(vc)));
+            }
+        }
+        needed
+    }
+
+    fn install_release(&mut self, kind: RuntimeKind, release: Release, cx: &mut Context<Self>) {
+        if self.busy_runtime.is_some() {
+            return;
+        }
+        let key = format!("{}/{}", kind.as_str(), release.version);
+        self.busy_runtime = Some(key);
+        cx.notify();
+
+        let version = release.version.clone();
+        cx.spawn(async move |entity, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    runtime::install(kind, &release).map(|path| path.to_string_lossy().to_string())
+                })
+                .await;
+
+            entity
+                .update(cx, |this, cx| {
+                    this.busy_runtime = None;
+                    match outcome {
+                        Ok(path) => {
+                            if let Some(store) = &this.store {
+                                let _ = store.add_runtime(kind.as_str(), &version, &path);
+                            }
+                            this.reload_runtimes(cx);
+                            this.push_toast(
+                                ToastKind::Success,
+                                format!("Installed {} {version}.", kind.label()),
+                            );
+                        }
+                        Err(error) => {
+                            this.push_toast(ToastKind::Error, error.to_string());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Replace an installed PHP patch with a newer one, repointing projects.
+    fn update_php(&mut self, current: String, release: Release, cx: &mut Context<Self>) {
+        if self.busy_runtime.is_some() {
+            return;
+        }
+        let key = format!("php/{}", release.version);
+        self.busy_runtime = Some(key);
+        cx.notify();
+
+        let version = release.version.clone();
+        let previous = current.clone();
+        cx.spawn(async move |entity, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = runtime::install(RuntimeKind::Php, &release)?;
+                    // Only drop the old patch once the new one is in place.
+                    let _ = runtime::remove(RuntimeKind::Php, &previous);
+                    Ok::<_, runtime::RuntimeError>(path.to_string_lossy().to_string())
+                })
+                .await;
+
+            entity
+                .update(cx, |this, cx| {
+                    this.busy_runtime = None;
+                    match outcome {
+                        Ok(path) => {
+                            if let Some(store) = &this.store {
+                                let _ = store.remove_runtime("php", &current);
+                                let _ = store.add_runtime("php", &version, &path);
+                                let _ = store.repoint_php(&current, &version);
+                            }
+                            this.reload_runtimes(cx);
+                            this.reload(cx);
+                            this.push_toast(
+                                ToastKind::Success,
+                                format!("Updated PHP to {version}."),
+                            );
+                        }
+                        Err(error) => {
+                            this.push_toast(ToastKind::Error, error.to_string());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn uninstall_runtime(
+        &mut self,
+        kind: RuntimeKind,
+        version: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy_runtime.is_some() {
+            return;
+        }
+        let key = format!("{}/{version}", kind.as_str());
+        self.busy_runtime = Some(key);
+        cx.notify();
+
+        let removing = version.clone();
+        cx.spawn(async move |entity, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { runtime::remove(kind, &removing) })
+                .await;
+
+            entity
+                .update(cx, |this, cx| {
+                    this.busy_runtime = None;
+                    match outcome {
+                        Ok(()) => {
+                            if let Some(store) = &this.store {
+                                let _ = store.remove_runtime(kind.as_str(), &version);
+                            }
+                            if kind == RuntimeKind::Nginx
+                                && this.settings.active_nginx.as_deref() == Some(version.as_str())
+                            {
+                                this.settings.active_nginx = None;
+                                this.settings.save();
+                            }
+                            this.reload_runtimes(cx);
+                            this.push_toast(
+                                ToastKind::Success,
+                                format!("Removed {} {version}.", kind.label()),
+                            );
+                        }
+                        Err(error) => {
+                            this.push_toast(ToastKind::Error, error.to_string());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn set_active_nginx(&mut self, version: String, cx: &mut Context<Self>) {
+        if self.settings.active_nginx.as_deref() == Some(version.as_str()) {
+            return;
+        }
+        self.settings.active_nginx = Some(version.clone());
+        self.settings.save();
+        self.push_toast(
+            ToastKind::Success,
+            format!("nginx {version} is now the active version."),
+        );
+        cx.notify();
+    }
+
+    fn install_vcrt(&mut self, cx: &mut Context<Self>) {
+        match vcrt::launch_installer() {
+            Ok(()) => self.push_toast(
+                ToastKind::Success,
+                "The Visual C++ installer is opening. Restart Wisp when it finishes.".to_string(),
+            ),
+            Err(error) => self.push_toast(ToastKind::Error, error),
         }
         cx.notify();
     }
@@ -820,41 +1098,67 @@ impl Wisp {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
 
-        let body = if self.projects.is_empty() {
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_2()
-                .px(px(20.))
-                .py(px(40.))
-                .text_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No projects yet"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Add one to serve it on a .test domain."),
-                )
-                .into_any_element()
+        let nav = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p(px(10.))
+            .child(nav_item(
+                "Projects",
+                IconName::FolderTree,
+                self.screen == Screen::Projects,
+                Screen::Projects,
+                self.projects.len(),
+                cx,
+            ))
+            .child(nav_item(
+                "Services",
+                IconName::Server,
+                self.screen == Screen::Services,
+                Screen::Services,
+                self.runtimes.len(),
+                cx,
+            ));
+
+        let body = if self.screen == Screen::Projects {
+            if self.projects.is_empty() {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .px(px(20.))
+                    .py(px(40.))
+                    .text_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No projects yet"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Add one to serve it on a .test domain."),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .id("project-list")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p(px(10.))
+                    .overflow_y_scroll()
+                    .children(self.projects.iter().map(|project| {
+                        let is_selected = selected == Some(project.id);
+                        project_row(project, is_selected, cx)
+                    }))
+                    .into_any_element()
+            }
         } else {
-            div()
-                .id("project-list")
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p(px(10.))
-                .overflow_y_scroll()
-                .children(self.projects.iter().map(|project| {
-                    let is_selected = selected == Some(project.id);
-                    project_row(project, is_selected, cx)
-                }))
-                .into_any_element()
+            div().into_any_element()
         };
 
         div()
@@ -866,26 +1170,19 @@ impl Wisp {
             .border_r_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().muted)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .child(ui::eyebrow("Projects", cx))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", self.projects.len())),
-                    ),
-            )
+            .child(nav)
+            .child(div().h(px(1.)).w_full().bg(cx.theme().border))
             .child(div().flex_1().overflow_hidden().child(body))
     }
 
-    fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn content(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.screen {
+            Screen::Projects => self.projects_content(cx),
+            Screen::Services => self.services_content(cx),
+        }
+    }
+
+    fn projects_content(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(project) = self.selected_project() else {
             return div()
                 .flex()
@@ -1046,6 +1343,287 @@ impl Wisp {
             .child(services)
             .into_any_element()
     }
+
+    // ---- services --------------------------------------------------------
+
+    fn services_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Services"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Install and manage the PHP and nginx builds Wisp runs."),
+                    ),
+            )
+            .child(
+                Button::new("refresh-catalog")
+                    .outline()
+                    .small()
+                    .icon(icon(IconName::RefreshCw))
+                    .label(if self.catalog_loading {
+                        "Refreshing\u{2026}"
+                    } else {
+                        "Refresh"
+                    })
+                    .disabled(self.catalog_loading)
+                    .on_click(cx.listener(|this, _, _window, cx| this.load_catalog(cx))),
+            );
+
+        let mut column = div().flex().flex_col().gap_6().child(header);
+
+        if let Some(message) = self.catalog_error.clone() {
+            column = column.child(
+                Alert::error("catalog-error", message)
+                    .title("Could not load the version list")
+                    .banner(),
+            );
+        }
+
+        if let Some(vc) = self.php_vcrt_gap() {
+            column = column.child(self.vcrt_banner(vc, cx));
+        }
+
+        column = column.child(self.php_section(cx));
+        column = column.child(self.nginx_section(cx));
+
+        div()
+            .id("services")
+            .flex()
+            .flex_col()
+            .size_full()
+            .p(px(28.))
+            .overflow_y_scroll()
+            .child(column)
+            .into_any_element()
+    }
+
+    fn vcrt_banner(&self, vc: u16, cx: &mut Context<Self>) -> impl IntoElement {
+        let family = if vc >= 17 {
+            "Visual C++ 2015\u{2013}2022 x64"
+        } else {
+            "Visual C++ 2015\u{2013}2019 x64"
+        };
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
+                .p(px(18.))
+                .child(
+                    icon(IconName::TriangleAlert)
+                        .text_color(brand::accent()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("The {family} runtime is required")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "PHP will not start without it. {}",
+                                    vcrt::description()
+                                )),
+                        ),
+                )
+                .child(
+                    Button::new("install-vcrt")
+                        .primary()
+                        .small()
+                        .label("Install runtime")
+                        .on_click(cx.listener(|this, _, _window, cx| this.install_vcrt(cx))),
+                ),
+        )
+    }
+
+    fn php_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let installed = self.installed(RuntimeKind::Php);
+
+        // One row per minor line, using the newest patch available in it.
+        let mut lines: Vec<(String, Release)> = Vec::new();
+        if let Some(catalog) = &self.catalog {
+            for release in &catalog.php {
+                let line = db::minor_line(&release.version);
+                if lines.iter().any(|(existing, _)| *existing == line) {
+                    continue;
+                }
+                lines.push((line, release.clone()));
+            }
+        }
+
+        let rows: Vec<AnyElement> = lines
+            .iter()
+            .map(|(line, latest)| {
+                let current = installed
+                    .iter()
+                    .find(|runtime| runtime.line() == *line)
+                    .cloned();
+                php_row(line, current.as_ref(), latest, self.busy_runtime.as_deref(), cx)
+            })
+            .collect();
+
+        let body = if rows.is_empty() {
+            div()
+                .p(px(18.))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(if self.catalog_loading {
+                    "Loading versions\u{2026}"
+                } else {
+                    "No PHP versions were found."
+                })
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .p(px(8.))
+                .children(rows)
+                .into_any_element()
+        };
+
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(section_header("PHP", "Choose a version per project. Updates replace the old patch.", cx))
+                .child(body),
+        )
+    }
+
+    fn nginx_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let installed = self.installed(RuntimeKind::Nginx);
+        let active = self.settings.active_nginx.clone();
+        let busy = self.busy_runtime.as_deref();
+
+        let rows: Vec<AnyElement> = installed
+            .iter()
+            .map(|runtime| {
+                let is_active = active.as_deref() == Some(runtime.version.as_str());
+                nginx_row(runtime, is_active, busy, cx)
+            })
+            .collect();
+
+        let body = if rows.is_empty() {
+            div()
+                .p(px(18.))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("No nginx installed yet.")
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .p(px(8.))
+                .children(rows)
+                .into_any_element()
+        };
+
+        // Versions offered for install: available, not already installed.
+        let installable: Vec<Release> = self
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .nginx
+                    .iter()
+                    .filter(|release| {
+                        !installed
+                            .iter()
+                            .any(|runtime| runtime.version == release.version)
+                    })
+                    .take(12)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let install_menu = if installable.is_empty() {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Up to date with the catalog.")
+                .into_any_element()
+        } else {
+            Button::new("install-nginx")
+                .outline()
+                .small()
+                .icon(icon(IconName::Download))
+                .label("Install a version")
+                .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                    let entity = cx.entity();
+                    move |menu, _, _| {
+                        let mut menu = menu.check_side(Side::Right);
+                        for release in &installable {
+                            let release = release.clone();
+                            let entity = entity.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(release.version.clone()).on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.install_release(RuntimeKind::Nginx, release.clone(), cx)
+                                    });
+                                }),
+                            );
+                        }
+                        menu
+                    }
+                })
+                .into_any_element()
+        };
+
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(section_header(
+                    "nginx",
+                    "One active version serves every project.",
+                    cx,
+                ))
+                .child(body)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .px(px(18.))
+                        .pb(px(14.))
+                        .child(install_menu),
+                ),
+        )
+    }
 }
 
 impl Render for Wisp {
@@ -1084,6 +1662,317 @@ impl Render for Wisp {
                 .child(self.content(cx)),
         )
     }
+}
+
+/// A top-level sidebar destination.
+fn nav_item(
+    label: &'static str,
+    icon_name: IconName,
+    active: bool,
+    screen: Screen,
+    count: usize,
+    cx: &mut Context<Wisp>,
+) -> impl IntoElement {
+    let base = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .px(px(12.))
+        .py(px(9.))
+        .rounded_lg();
+
+    let styled = if active {
+        base.bg(brand::accent_wash())
+            .border_1()
+            .border_color(brand::accent_tint())
+    } else {
+        base
+    };
+
+    styled
+        .id(label)
+        .hover(|d| d.bg(cx.theme().list_hover))
+        .on_click(cx.listener(move |this, _, _window, cx| this.goto(screen, cx)))
+        .child(icon(icon_name).small().text_color(if active {
+            brand::accent()
+        } else {
+            cx.theme().muted_foreground
+        }))
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .child(label),
+        )
+        .child(if count > 0 {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(count.to_string())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        })
+}
+
+/// A section title and its one-line description inside a plate.
+fn section_header(title: &str, subtitle: &str, cx: &App) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px(px(18.))
+        .pt(px(16.))
+        .pb(px(10.))
+        .child(
+            div()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(subtitle.to_string()),
+        )
+}
+
+/// A small accent badge, e.g. "Up to date" or "Active".
+fn badge(label: &str, cx: &App) -> impl IntoElement {
+    let color = brand::accent();
+    let _ = cx;
+    div()
+        .px(px(8.))
+        .py(px(3.))
+        .rounded_full()
+        .bg(brand::accent_wash())
+        .border_1()
+        .border_color(brand::accent_tint())
+        .text_xs()
+        .text_color(color)
+        .child(label.to_string())
+}
+
+/// One PHP minor line, with its install/update/uninstall controls.
+fn php_row(
+    line: &str,
+    current: Option<&InstalledRuntime>,
+    latest: &Release,
+    busy: Option<&str>,
+    cx: &mut Context<Wisp>,
+) -> AnyElement {
+    let latest = latest.clone();
+    let busy_here = busy.is_some_and(|key| {
+        key == format!("php/{}", latest.version)
+            || current.is_some_and(|runtime| key == format!("php/{}", runtime.version))
+    });
+
+    let status = match current {
+        None => "Not installed".to_string(),
+        Some(runtime) if runtime.version == latest.version => {
+            format!("Installed {}", runtime.version)
+        }
+        Some(runtime) => format!(
+            "{} installed \u{00b7} {} available",
+            runtime.version, latest.version
+        ),
+    };
+
+    let actions: Vec<AnyElement> = if busy_here {
+        vec![div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(Spinner::new().small())
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Working\u{2026}"),
+            )
+            .into_any_element()]
+    } else {
+        match current {
+            None => {
+                let release = latest.clone();
+                vec![Button::new(format!("php-install-{line}"))
+                    .small()
+                    .primary()
+                    .label(format!("Install {}", release.version))
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.install_release(RuntimeKind::Php, release.clone(), cx)
+                    }))
+                    .into_any_element()]
+            }
+            Some(runtime) if runtime.version == latest.version => {
+                let version = runtime.version.clone();
+                vec![
+                    badge("Up to date", cx).into_any_element(),
+                    Button::new(format!("php-remove-{line}"))
+                        .small()
+                        .ghost()
+                        .label("Uninstall")
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.uninstall_runtime(RuntimeKind::Php, version.clone(), cx)
+                        }))
+                        .into_any_element(),
+                ]
+            }
+            Some(runtime) => {
+                let current_version = runtime.version.clone();
+                let release = latest.clone();
+                let remove_version = runtime.version.clone();
+                vec![
+                    Button::new(format!("php-update-{line}"))
+                        .small()
+                        .primary()
+                        .label(format!("Update to {}", release.version))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.update_php(current_version.clone(), release.clone(), cx)
+                        }))
+                        .into_any_element(),
+                    Button::new(format!("php-remove2-{line}"))
+                        .small()
+                        .ghost()
+                        .label("Uninstall")
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.uninstall_runtime(RuntimeKind::Php, remove_version.clone(), cx)
+                        }))
+                        .into_any_element(),
+                ]
+            }
+        }
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded_lg()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(format!("PHP {line}")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(actions),
+        )
+        .into_any_element()
+}
+
+/// One installed nginx version, with active selection and uninstall.
+fn nginx_row(
+    runtime: &InstalledRuntime,
+    active: bool,
+    busy: Option<&str>,
+    cx: &mut Context<Wisp>,
+) -> AnyElement {
+    let version = runtime.version.clone();
+    let busy_here = busy.is_some_and(|key| key == format!("nginx/{version}"));
+
+    let actions: Vec<AnyElement> = if busy_here {
+        vec![div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(Spinner::new().small())
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Working\u{2026}"),
+            )
+            .into_any_element()]
+    } else {
+        let use_version = version.clone();
+        let remove_version = version.clone();
+        let active_or_use = if active {
+            badge("Active", cx).into_any_element()
+        } else {
+            Button::new(format!("nginx-use-{version}"))
+                .small()
+                .outline()
+                .label("Use")
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.set_active_nginx(use_version.clone(), cx)
+                }))
+                .into_any_element()
+        };
+        vec![
+            active_or_use,
+            Button::new(format!("nginx-remove-{version}"))
+                .small()
+                .ghost()
+                .label("Uninstall")
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.uninstall_runtime(RuntimeKind::Nginx, remove_version.clone(), cx)
+                }))
+                .into_any_element(),
+        ]
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded_lg()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(format!("nginx {version}")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(actions),
+        )
+        .into_any_element()
+}
+
+fn version_key(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
 }
 
 /// A single project in the sidebar.
@@ -1185,40 +2074,56 @@ fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
 }
 
 /// The body of the create/edit dialog.
-fn editor_form(editor: &EditorState, entity: &Entity<Wisp>, error: Option<String>) -> impl IntoElement {
+fn editor_form(
+    editor: &EditorState,
+    entity: &Entity<Wisp>,
+    error: Option<String>,
+    php_versions: &[String],
+    cx: &App,
+) -> impl IntoElement {
     let php_label = editor
         .php_version
         .clone()
         .unwrap_or_else(|| "Not set".to_string());
 
-    let php_menu = Button::new("php-version")
-        .outline()
-        .label(php_label)
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, {
-            let entity = entity.clone();
-            move |menu, _, _| {
+    let php_menu: AnyElement = if php_versions.is_empty() {
+        div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("Install a PHP version on the Services page first.")
+            .into_any_element()
+    } else {
+        let versions: Vec<String> = php_versions.to_vec();
+        Button::new("php-version")
+            .outline()
+            .label(php_label)
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                 let entity = entity.clone();
-                let mut menu = menu.check_side(Side::Right);
-                for version in PHP_VERSIONS {
-                    let version = version.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::new(version.clone()).on_click({
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                let version = version.clone();
-                                entity.update(cx, |this, cx| {
-                                    if let Some(editor) = this.editor.as_mut() {
-                                        editor.php_version = Some(version.clone());
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                    );
+                move |menu, _, _| {
+                    let entity = entity.clone();
+                    let mut menu = menu.check_side(Side::Right);
+                    for version in &versions {
+                        let version = version.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(version.clone()).on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    let version = version.clone();
+                                    entity.update(cx, |this, cx| {
+                                        if let Some(editor) = this.editor.as_mut() {
+                                            editor.php_version = Some(version.clone());
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        );
+                    }
+                    menu
                 }
-                menu
-            }
-        });
+            })
+            .into_any_element()
+    };
 
     let mut form = Form::new()
         .child(

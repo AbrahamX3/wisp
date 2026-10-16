@@ -49,6 +49,10 @@ pub struct Settings {
     /// closed. Off by default: closing a window should normally close it.
     #[serde(default)]
     pub background: bool,
+    /// The installed nginx version Wisp treats as active. One nginx process
+    /// serves every project, so only one version runs at a time.
+    #[serde(default)]
+    pub active_nginx: Option<String>,
 }
 
 impl Settings {

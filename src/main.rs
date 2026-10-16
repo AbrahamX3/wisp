@@ -15,10 +15,12 @@ mod config;
 mod db;
 mod fonts;
 mod platform;
+mod runtime;
 mod settings;
 mod tray;
 mod ui;
 mod update;
+mod vcrt;
 
 use gpui_kit::*;
 use std::io::Write as _;

@@ -171,6 +171,15 @@ impl Store {
         Ok(())
     }
 
+    /// Point every project on the old PHP patch at the new one, after an update.
+    pub fn repoint_php(&self, from: &str, to: &str) -> Result<()> {
+        self.connect()?.execute(
+            "UPDATE projects SET php_version = ?2, updated_at = ?3 WHERE php_version = ?1",
+            rusqlite::params![from, to, now_unix()],
+        )?;
+        Ok(())
+    }
+
     /// Whether another project already claims this domain.
     pub fn domain_taken(&self, domain: &str, except_id: Option<i64>) -> Result<bool> {
         let conn = self.connect()?;
