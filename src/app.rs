@@ -27,10 +27,9 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu,
-    SidebarMenuItem,
+    SidebarMenuItem, SidebarToggleButton,
 };
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
@@ -2535,11 +2534,10 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("toggle-sidebar")
-                            .ghost()
-                            .small()
-                            .icon(icon(IconName::PanelLeft))
-                            .tooltip("Show or hide the project list")
+                        // The kit's own toggle, which draws the right icon for
+                        // the side and state instead of a fixed one.
+                        SidebarToggleButton::new()
+                            .collapsed(self.sidebar_collapsed)
                             .on_click(cx.listener(|this, _, _window, cx| this.toggle_sidebar(cx))),
                     )
                     .child(
@@ -4402,31 +4400,24 @@ impl Render for Wisp {
                     .min_h(px(0.))
                     .overflow_hidden()
                     .child(
-                        // The sidebar keeps its own width: without a size the
-                        // group splits the window in half between the two panels,
-                        // which left the list stranded in a field of empty space.
-                        h_resizable("wisp-shell")
-                            .child(
-                                resizable_panel()
-                                    .size(if self.sidebar_collapsed {
-                                        px(48.)
-                                    } else {
-                                        px(255.)
-                                    })
-                                    .size_range(if self.sidebar_collapsed {
-                                        px(48.)..px(48.)
-                                    } else {
-                                        px(200.)..px(460.)
-                                    })
-                                    .child(sidebar),
-                            )
-                            .child(resizable_panel().child(
-                                div()
-                                    .min_w(px(0.))
-                                    .h_full()
-                                    .overflow_hidden()
-                                    .child(content),
-                            )),
+                        // Fixed width, not resizable: `Sidebar` sizes itself and
+                        // offers no width builder, so a draggable panel either
+                        // left a dead band beside it when widened or let its rows
+                        // paint over the page when squeezed. It still collapses
+                        // to icons from the toggle in the top bar.
+                        div()
+                            .flex_shrink_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(sidebar),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(content),
                     ),
             )
             .child(status);
