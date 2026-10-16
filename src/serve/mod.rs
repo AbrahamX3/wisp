@@ -11,6 +11,7 @@ pub mod process;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::time::Duration;
 
 use crate::runtime::{self, RuntimeKind};
 
@@ -133,11 +134,17 @@ impl Supervisor {
         }
     }
 
-    /// Stop and forget one project's worker.
+    /// Stop one project's worker but keep its port, so a restart reuses the port
+    /// the already-written vhost points at.
     pub fn stop_project(&mut self, id: i64) {
         if let Some(mut worker) = self.workers.remove(&id) {
             let _ = process::kill_tree(&mut worker.child);
         }
+    }
+
+    /// Forget a project's port entirely (used when it is no longer wanted).
+    pub fn forget_project(&mut self, id: i64) {
+        self.stop_project(id);
         self.ports.remove(&id);
     }
 
@@ -223,7 +230,7 @@ impl Supervisor {
             .filter(|id| !wanted.contains(id))
             .collect();
         for id in stale {
-            self.stop_project(id);
+            self.forget_project(id);
         }
 
         for site in sites {
@@ -264,7 +271,21 @@ impl Supervisor {
             ("PHP_FCGI_MAX_REQUESTS", "0".to_string()),
             ("PHP_FCGI_CHILDREN", "0".to_string()),
         ];
-        Ok(process::spawn(&exe, &args, &env, Some(&runtime_dir))?)
+        let log = config::site_logs(&site.slug).join("php-cgi.log");
+        let mut child = process::spawn_logged(&exe, &args, &env, Some(&runtime_dir), &log)?;
+
+        // A worker that fails to start (bad ini, missing DLL, busy port) exits
+        // immediately. Wait for it to accept connections so nginx never points
+        // at a dead port — a 502 with no explanation is worse than an error.
+        if !wait_for_port(port, Duration::from_millis(3000)) {
+            let tail = read_log_tail(&log);
+            let _ = process::kill_tree(&mut child);
+            return Err(ServeError::Start(format!(
+                "the PHP worker for \"{}\" did not start. {tail}",
+                site.domain
+            )));
+        }
+        Ok(child)
     }
 
     fn ensure_nginx(&mut self, version: &str, prefix: &Path) -> Result<()> {
@@ -357,6 +378,21 @@ fn system32() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
         .join("System32")
+}
+
+/// Wait until something accepts connections on `port`, or the timeout passes.
+fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A localhost port the OS says is free.

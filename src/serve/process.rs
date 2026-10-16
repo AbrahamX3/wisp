@@ -15,6 +15,35 @@ pub fn spawn(
     env: &[(&str, String)],
     cwd: Option<&Path>,
 ) -> std::io::Result<Child> {
+    build(exe, args, env, cwd).spawn()
+}
+
+/// Like [`spawn`], but captures the child's output into `log` so startup
+/// failures are not lost. Used for the PHP workers.
+pub fn spawn_logged(
+    exe: &Path,
+    args: &[String],
+    env: &[(&str, String)],
+    cwd: Option<&Path>,
+    log: &Path,
+) -> std::io::Result<Child> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(log)?;
+    let sink = file.try_clone()?;
+    build(exe, args, env, cwd)
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::from(sink))
+        .spawn()
+}
+
+fn build(
+    exe: &Path,
+    args: &[String],
+    env: &[(&str, String)],
+    cwd: Option<&Path>,
+) -> Command {
     use std::os::windows::process::CommandExt as _;
 
     let mut command = Command::new(exe);
@@ -30,7 +59,7 @@ pub fn spawn(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    command.spawn()
+    command
 }
 
 /// Whether a child is still alive, reaping it if it has exited.
