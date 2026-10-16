@@ -27,21 +27,6 @@ pub fn plate(cx: &App, inner: impl IntoElement) -> impl IntoElement {
         )
 }
 
-/// A small uppercase label that introduces a group of content.
-pub fn eyebrow(label: &str, cx: &App) -> impl IntoElement {
-    div()
-        .px(px(8.))
-        .py(px(3.))
-        .rounded_full()
-        .bg(cx.theme().muted)
-        .border_1()
-        .border_color(cx.theme().border)
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(cx.theme().muted_foreground)
-        .child(uppercase(label))
-}
-
 /// The brand accent as a small filled dot, for status and selection.
 pub fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(8.)).rounded_full().bg(color)
@@ -54,8 +39,4 @@ pub fn accent_rail() -> impl IntoElement {
         .h_full()
         .rounded_full()
         .bg(brand::gradient())
-}
-
-fn uppercase(label: &str) -> String {
-    label.to_uppercase()
 }

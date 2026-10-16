@@ -44,6 +44,16 @@ use crate::vcrt;
 /// Delay before the automatic launch update check, so start-up stays snappy.
 const AUTO_CHECK_DELAY: Duration = Duration::from_secs(6);
 
+/// How long a fetched runtime catalog stays fresh before Services refreshes it.
+const CATALOG_TTL_SECS: u64 = 12 * 60 * 60;
+
+/// Seconds since the Unix epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 /// Repository URL, taken from `Cargo.toml` so it cannot drift from the updater's
 /// own `REPO_OWNER` / `REPO_NAME` (a test below keeps the two in step).
 const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -88,6 +98,8 @@ struct EditorState {
     app_name: Entity<InputState>,
     root_path: Entity<InputState>,
     domain: Entity<InputState>,
+    /// The suffix chosen next to the domain label, e.g. `.test`.
+    domain_suffix: String,
     php_version: Option<String>,
     ssl_enabled: bool,
     error: Option<String>,
@@ -113,6 +125,8 @@ pub struct Wisp {
     catalog: Option<Catalog>,
     catalog_loading: bool,
     catalog_error: Option<String>,
+    /// Unix time the catalog was last fetched, so it can refresh when stale.
+    catalog_fetched_at: Option<u64>,
     /// The runtime action in flight, keyed as `"php/8.4"` or `"nginx/1.27.0"`.
     busy_runtime: Option<String>,
 
@@ -128,6 +142,9 @@ pub struct Wisp {
     elevation_busy: bool,
     /// The domains last written to the hosts file, so we only elevate on change.
     hosts_written: Vec<String>,
+    /// A folder chosen in the native picker, applied to the editor on next render
+    /// (which is where a `Window` is available).
+    pending_root: Option<String>,
 }
 
 impl Wisp {
@@ -153,6 +170,7 @@ impl Wisp {
             catalog: None,
             catalog_loading: false,
             catalog_error: None,
+            catalog_fetched_at: None,
             busy_runtime: None,
             running: HashSet::new(),
             serve_status: serve::Status::default(),
@@ -162,6 +180,7 @@ impl Wisp {
             mode: ControlMode::Uac,
             elevation_busy: false,
             hosts_written: Vec::new(),
+            pending_root: None,
         };
         this.reload(cx);
         this.reload_runtimes(cx);
@@ -224,25 +243,27 @@ impl Wisp {
                 ..Default::default()
             });
 
+        let (domain_label, domain_suffix) = db::split_domain(&draft.domain);
+
         let name = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("My Shop")
+                .placeholder("My App")
                 .default_value(draft.name.clone())
         });
         let app_name = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("my-shop")
+                .placeholder("my-app")
                 .default_value(draft.app_name.clone())
         });
         let root_path = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(r"C:\Sites\my-shop")
+                .placeholder(r"C:\Sites\my-app")
                 .default_value(draft.root_path.clone())
         });
         let domain = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("my-shop.test")
-                .default_value(draft.domain.clone())
+                .placeholder("my-app")
+                .default_value(domain_label)
         });
 
         // Deriving the domain from the app name while the domain is still empty
@@ -263,6 +284,7 @@ impl Wisp {
             app_name,
             root_path,
             domain,
+            domain_suffix,
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
             error: None,
@@ -307,7 +329,50 @@ impl Wisp {
         }
         editor
             .domain
-            .update(cx, |state, cx| state.set_value(format!("{slug}.test"), window, cx));
+            .update(cx, |state, cx| state.set_value(slug, window, cx));
+    }
+
+    /// Open the native folder picker. The result arrives asynchronously, so it
+    /// is stashed and applied on the next render, where a `Window` is available.
+    fn browse_root(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_none() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Choose the project's root folder")
+                .pick_folder();
+            let _ = sender.send(picked);
+        });
+
+        cx.spawn(async move |entity, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async move { receiver.recv().ok().flatten() })
+                .await;
+            if let Some(folder) = picked {
+                entity
+                    .update(cx, |this, cx| {
+                        this.pending_root = Some(folder.to_string_lossy().to_string());
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Apply a folder chosen in the picker to the editor's root input.
+    fn apply_pending_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_root.take() else {
+            return;
+        };
+        if let Some(editor) = self.editor.as_ref() {
+            editor
+                .root_path
+                .update(cx, |state, cx| state.set_value(path, window, cx));
+        }
     }
 
     fn cancel_editor(&mut self, cx: &mut Context<Self>) {
@@ -324,7 +389,11 @@ impl Wisp {
             name: editor.name.read(cx).value().to_string(),
             app_name: editor.app_name.read(cx).value().to_string(),
             root_path: editor.root_path.read(cx).value().to_string(),
-            domain: editor.domain.read(cx).value().to_string(),
+            domain: format!(
+                "{}{}",
+                editor.domain.read(cx).value().trim(),
+                editor.domain_suffix
+            ),
             php_version: editor.php_version.clone(),
             ssl_enabled: editor.ssl_enabled,
             php_ini_overrides: "{}".to_string(),
@@ -466,7 +535,20 @@ impl Wisp {
     fn goto(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.screen != screen {
             self.screen = screen;
+            // Opening Services with a stale catalog refreshes it in the
+            // background, so new PHP and nginx releases show up without a click.
+            if screen == Screen::Services && self.catalog_is_stale() {
+                self.load_catalog(cx);
+            }
             cx.notify();
+        }
+    }
+
+    /// Whether the catalog should be refetched.
+    fn catalog_is_stale(&self) -> bool {
+        match self.catalog_fetched_at {
+            Some(at) => now_unix().saturating_sub(at) >= CATALOG_TTL_SECS,
+            None => true,
         }
     }
 
@@ -500,6 +582,7 @@ impl Wisp {
                         Ok(catalog) => {
                             this.catalog = Some(catalog);
                             this.catalog_error = None;
+                            this.catalog_fetched_at = Some(now_unix());
                         }
                         Err(error) => this.catalog_error = Some(error.to_string()),
                     }
@@ -572,6 +655,11 @@ impl Wisp {
                         Ok(path) => {
                             if let Some(store) = &this.store {
                                 let _ = store.add_runtime(kind.as_str(), &version, &path);
+                            }
+                            // A freshly installed nginx becomes the active one.
+                            if kind == RuntimeKind::Nginx {
+                                this.settings.active_nginx = Some(version.clone());
+                                this.settings.save();
                             }
                             this.reload_runtimes(cx);
                             this.push_toast(
@@ -1330,15 +1418,9 @@ impl Wisp {
                     )
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Wisp"),
-                            )
-                            .child(ui::eyebrow("Local PHP", cx)),
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Wisp"),
                     ),
             )
             .child(
@@ -2108,7 +2190,10 @@ impl Wisp {
                 .dropdown_menu_with_anchor(Anchor::BottomRight, {
                     let entity = cx.entity();
                     move |menu, _, _| {
-                        let mut menu = menu.check_side(Side::Right);
+                        let mut menu = menu
+                            .check_side(Side::Right)
+                            .item(PopupMenuItem::new("nginx Version").disabled(true))
+                            .separator();
                         for release in &installable {
                             let release = release.clone();
                             let entity = entity.clone();
@@ -2154,6 +2239,7 @@ impl Wisp {
 impl Render for Wisp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         flush_toasts(&mut self.toasts, window, cx);
+        self.apply_pending_root(window, cx);
 
         let mut root = div()
             .flex()
@@ -2619,7 +2705,8 @@ fn editor_form(
     let php_label = editor
         .php_version
         .clone()
-        .unwrap_or_else(|| "Not set".to_string());
+        .map(|version| format!("PHP {version}"))
+        .unwrap_or_else(|| "Choose a version".to_string());
 
     let php_menu: AnyElement = if php_versions.is_empty() {
         div()
@@ -2629,6 +2716,7 @@ fn editor_form(
             .into_any_element()
     } else {
         let versions: Vec<String> = php_versions.to_vec();
+        let selected = editor.php_version.clone();
         Button::new("php-version")
             .outline()
             .label(php_label)
@@ -2636,22 +2724,28 @@ fn editor_form(
                 let entity = entity.clone();
                 move |menu, _, _| {
                     let entity = entity.clone();
-                    let mut menu = menu.check_side(Side::Right);
+                    let mut menu = menu
+                        .check_side(Side::Right)
+                        .item(PopupMenuItem::new("PHP Version").disabled(true))
+                        .separator();
                     for version in &versions {
                         let version = version.clone();
+                        let is_current = selected.as_deref() == Some(version.as_str());
                         menu = menu.item(
-                            PopupMenuItem::new(version.clone()).on_click({
-                                let entity = entity.clone();
-                                move |_, _, cx| {
-                                    let version = version.clone();
-                                    entity.update(cx, |this, cx| {
-                                        if let Some(editor) = this.editor.as_mut() {
-                                            editor.php_version = Some(version.clone());
-                                        }
-                                        cx.notify();
-                                    });
-                                }
-                            }),
+                            PopupMenuItem::new(version.clone())
+                                .checked(is_current)
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_, _, cx| {
+                                        let version = version.clone();
+                                        entity.update(cx, |this, cx| {
+                                            if let Some(editor) = this.editor.as_mut() {
+                                                editor.php_version = Some(version.clone());
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
                         );
                     }
                     menu
@@ -2676,16 +2770,81 @@ fn editor_form(
         .child(
             Field::new()
                 .label("Root folder")
-                .description("The project's document root.")
-                .child(Input::new(&editor.root_path)),
+                .description("Point at the project root; public/ is served when it exists.")
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&editor.root_path)))
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("browse-root")
+                                .outline()
+                                .small()
+                                .icon(icon(IconName::FolderOpen))
+                                .label("Browse")
+                                .on_click(move |_, window, cx| {
+                                    entity.update(cx, |this, cx| this.browse_root(window, cx));
+                                })
+                                .into_any_element()
+                        }),
+                ),
         )
         .child(
             Field::new()
                 .label("Domain")
-                .description("Must end with .test. HTTPS uses a locally-trusted certificate.")
-                .child(Input::new(&editor.domain)),
+                .description("HTTPS uses a locally-trusted certificate.")
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&editor.domain)))
+                        .child({
+                            let entity = entity.clone();
+                            let current = editor.domain_suffix.clone();
+                            Button::new("domain-suffix")
+                                .outline()
+                                .label(current.clone())
+                                .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                                    let entity = entity.clone();
+                                    let mut menu = menu
+                                        .check_side(Side::Right)
+                                        .item(PopupMenuItem::new("Suffix").disabled(true))
+                                        .separator();
+                                    for suffix in db::DOMAIN_SUFFIXES {
+                                        let suffix = (*suffix).to_string();
+                                        let is_current = suffix == current;
+                                        menu = menu.item(
+                                            PopupMenuItem::new(suffix.clone())
+                                                .checked(is_current)
+                                                .on_click({
+                                                    let entity = entity.clone();
+                                                    move |_, _, cx| {
+                                                        let suffix = suffix.clone();
+                                                        entity.update(cx, |this, cx| {
+                                                            if let Some(editor) =
+                                                                this.editor.as_mut()
+                                                            {
+                                                                editor.domain_suffix =
+                                                                    suffix.clone();
+                                                            }
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                })
+                                .into_any_element()
+                        }),
+                ),
         )
-        .child(Field::new().label("PHP").child(php_menu))
+        .child(Field::new().label("PHP Version").child(php_menu))
         .child(
             Field::new().label("HTTPS").child({
                 let entity = entity.clone();

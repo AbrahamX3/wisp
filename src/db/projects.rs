@@ -225,18 +225,45 @@ pub fn slugify(input: &str) -> String {
     out
 }
 
-/// Check a `.test` domain, returning a message for the editor when it is wrong.
+/// The domain suffixes Wisp offers, shown in the editor's suffix select.
+///
+/// `.test` is reserved by RFC 6761 for testing and is the default. `.localhost`
+/// resolves to the loopback interface. `.internal` is ICANN-reserved for private
+/// use, and `.local` is common on local networks. All of them are safe from the
+/// browser HSTS preload list (unlike `.dev` and `.app`).
+pub const DOMAIN_SUFFIXES: &[&str] = &[".test", ".localhost", ".internal", ".local"];
+
+/// Split a stored domain into its editable label and its suffix. An unknown
+/// suffix is treated as part of the label, with `.test` as the default.
+pub fn split_domain(domain: &str) -> (String, String) {
+    let lower = domain.trim().to_lowercase();
+    for suffix in DOMAIN_SUFFIXES {
+        if let Some(label) = lower.strip_suffix(suffix) {
+            return (label.to_string(), (*suffix).to_string());
+        }
+    }
+    (lower, DOMAIN_SUFFIXES[0].to_string())
+}
+
+/// Check a domain (label plus one of [`DOMAIN_SUFFIXES`]), returning a message
+/// for the editor when it is wrong.
 pub fn validate_domain(domain: &str) -> std::result::Result<(), String> {
     let domain = domain.trim();
     if domain.is_empty() {
         return Err("A domain is required, for example myapp.test.".into());
     }
     let lower = domain.to_lowercase();
-    let Some(label) = lower.strip_suffix(".test") else {
-        return Err("The domain must end with .test, for example myapp.test.".into());
+    let Some(label) = DOMAIN_SUFFIXES
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+    else {
+        return Err(format!(
+            "The domain must end with one of {}.",
+            DOMAIN_SUFFIXES.join(", ")
+        ));
     };
     if label.is_empty() {
-        return Err("Add a name before .test, for example myapp.test.".into());
+        return Err("Add a name before the domain suffix.".into());
     }
     for part in label.split('.') {
         if part.is_empty() {
@@ -257,7 +284,7 @@ pub fn validate_domain(domain: &str) -> std::result::Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slugify, validate_domain};
+    use super::{slugify, split_domain, validate_domain};
 
     #[test]
     fn slugify_lowercases_and_dashes() {
@@ -267,19 +294,32 @@ mod tests {
     }
 
     #[test]
-    fn valid_test_domains_pass() {
+    fn valid_domains_pass() {
         assert!(validate_domain("myapp.test").is_ok());
         assert!(validate_domain("shop-1.test").is_ok());
         assert!(validate_domain("api.myapp.test").is_ok());
         assert!(validate_domain("MYAPP.test").is_ok());
+        assert!(validate_domain("myapp.internal").is_ok());
+        assert!(validate_domain("myapp.localhost").is_ok());
     }
 
     #[test]
-    fn other_tlds_are_rejected() {
-        assert!(validate_domain("myapp.local").is_err());
+    fn unsupported_suffixes_are_rejected() {
+        assert!(validate_domain("myapp.dev").is_err());
         assert!(validate_domain("myapp").is_err());
         assert!(validate_domain("").is_err());
         assert!(validate_domain(".test").is_err());
+    }
+
+    #[test]
+    fn domains_split_into_a_label_and_a_suffix() {
+        assert_eq!(split_domain("myapp.test"), ("myapp".into(), ".test".into()));
+        assert_eq!(
+            split_domain("api.Shop.TEST"),
+            ("api.shop".into(), ".test".into())
+        );
+        // An unknown suffix stays part of the label.
+        assert_eq!(split_domain("myapp.dev"), ("myapp.dev".into(), ".test".into()));
     }
 
     #[test]

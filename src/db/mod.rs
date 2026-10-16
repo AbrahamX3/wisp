@@ -8,7 +8,7 @@
 mod projects;
 mod runtimes;
 
-pub use projects::{slugify, Project, ProjectDraft};
+pub use projects::{slugify, split_domain, Project, ProjectDraft, DOMAIN_SUFFIXES};
 pub use runtimes::{minor_line, InstalledRuntime};
 
 use std::path::PathBuf;
