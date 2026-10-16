@@ -7,9 +7,10 @@ FastCGI worker per project.
 Built in Rust with [GPUI Kit](https://gpui-kit.com).
 
 > **Status:** the shell, the icon pipeline, settings/tray/autostart/update, SQLite
-> project storage with the projects UI, and the Services page (PHP/nginx catalog
-> with install, update and uninstall) are in place. Starting the web server,
-> per-project TLS and the log viewer are next.
+> project storage with the projects UI, the Services page (PHP/nginx catalog with
+> install, update and uninstall), and actually serving a project (generated nginx
+> vhosts plus a per-project php-cgi worker) are in place. Per-project TLS and the
+> host entries, then the log viewer, are next.
 
 ## What it will do
 

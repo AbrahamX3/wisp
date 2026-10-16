@@ -4,6 +4,8 @@
 //! shared "tray and plate" primitive, the brand accent marks the active project
 //! and the primary action, and nothing else carries colour.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -28,6 +30,7 @@ use crate::brand;
 use crate::db::{self, InstalledRuntime, Project, ProjectDraft, Store};
 use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
+use crate::serve::{self, SiteSpec};
 use crate::settings::{Settings, ThemePreference};
 use crate::tray;
 use crate::ui;
@@ -68,6 +71,12 @@ enum Screen {
     Services,
 }
 
+/// Process-wide owner of nginx and the PHP workers, so the app-quit hook can
+/// stop them, and the background sync can move it in and out.
+pub struct ServerGlobal(pub serve::Supervisor);
+
+impl Global for ServerGlobal {}
+
 /// The create/edit dialog's live state. `id` is `None` while creating.
 struct EditorState {
     id: Option<i64>,
@@ -102,6 +111,12 @@ pub struct Wisp {
     catalog_error: Option<String>,
     /// The runtime action in flight, keyed as `"php/8.4"` or `"nginx/1.27.0"`.
     busy_runtime: Option<String>,
+
+    /// Projects the user has asked to serve.
+    running: HashSet<i64>,
+    serve_status: serve::Status,
+    serve_error: Option<String>,
+    serve_busy: bool,
 }
 
 impl Wisp {
@@ -128,10 +143,15 @@ impl Wisp {
             catalog_loading: false,
             catalog_error: None,
             busy_runtime: None,
+            running: HashSet::new(),
+            serve_status: serve::Status::default(),
+            serve_error: None,
+            serve_busy: false,
         };
         this.reload(cx);
         this.reload_runtimes(cx);
         this.load_catalog(cx);
+        Self::spawn_status_poll(cx);
 
         Self::spawn_auto_update_check(cx);
         this
@@ -678,6 +698,129 @@ impl Wisp {
         cx.notify();
     }
 
+    // ---- serving ---------------------------------------------------------
+
+    /// Periodically reconcile the reported process status with reality.
+    fn spawn_status_poll(cx: &mut Context<Self>) {
+        cx.spawn(async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(2000))
+                    .await;
+                let applied = entity.update(cx, |this, cx| {
+                    // While a sync is in flight the supervisor is checked out to
+                    // the background task, so a status read would be misleading.
+                    if this.serve_busy {
+                        return;
+                    }
+                    let status = cx.global_mut::<ServerGlobal>().0.status();
+                    if status.nginx_running != this.serve_status.nginx_running
+                        || status.running_projects != this.serve_status.running_projects
+                    {
+                        this.serve_status = status;
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The specs for the projects the user asked to run.
+    fn site_specs(&self) -> std::result::Result<Vec<SiteSpec>, String> {
+        let mut specs = Vec::new();
+        for project in &self.projects {
+            if !self.running.contains(&project.id) {
+                continue;
+            }
+            let Some(php) = project.php_version.clone().filter(|value| !value.is_empty()) else {
+                return Err(format!(
+                    "\"{}\" has no PHP version set. Choose one in Edit.",
+                    project.name
+                ));
+            };
+            if !runtime::php_cgi(&php).is_file() {
+                return Err(format!(
+                    "PHP {php} is not installed (needed by \"{}\").",
+                    project.name
+                ));
+            }
+            specs.push(SiteSpec {
+                id: project.id,
+                slug: project.slug(),
+                domain: project.domain.clone(),
+                root: PathBuf::from(&project.root_path),
+                php_version: php,
+            });
+        }
+        Ok(specs)
+    }
+
+    fn toggle_project_running(&mut self, id: i64, cx: &mut Context<Self>) {
+        if !self.running.remove(&id) {
+            self.running.insert(id);
+        }
+        self.sync_server(cx);
+    }
+
+    fn stop_all_projects(&mut self, cx: &mut Context<Self>) {
+        if self.running.is_empty() {
+            return;
+        }
+        self.running.clear();
+        self.sync_server(cx);
+    }
+
+    /// Reconcile nginx and the PHP workers with the requested set.
+    fn sync_server(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        let specs = match self.site_specs() {
+            Ok(specs) => specs,
+            Err(message) => {
+                self.serve_error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let version = self.settings.active_nginx.clone();
+        let mut supervisor = std::mem::take(&mut cx.global_mut::<ServerGlobal>().0);
+        self.serve_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let (supervisor, outcome) = cx
+                .background_executor()
+                .spawn(async move {
+                    let outcome = supervisor
+                        .sync(version.as_deref(), &specs)
+                        .map(|()| supervisor.status());
+                    (supervisor, outcome)
+                })
+                .await;
+
+            entity
+                .update(cx, |this, cx| {
+                    cx.global_mut::<ServerGlobal>().0 = supervisor;
+                    this.serve_busy = false;
+                    match outcome {
+                        Ok(status) => {
+                            this.serve_status = status;
+                            this.serve_error = None;
+                        }
+                        Err(error) => this.serve_error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     // ---- settings toggles ------------------------------------------------
 
     fn toggle_background(&mut self, cx: &mut Context<Self>) {
@@ -995,6 +1138,19 @@ impl Wisp {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .child(if self.running.is_empty() {
+                        div().into_any_element()
+                    } else {
+                        Button::new("stop-all")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::Square))
+                            .label("Stop all")
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.stop_all_projects(cx)),
+                            )
+                            .into_any_element()
+                    })
                     .child(
                         Button::new("new-project")
                             .primary()
@@ -1301,33 +1457,96 @@ impl Wisp {
                 .child(detail_row("Config folder", &format!("sites/{slug}"), cx)),
         );
 
+        let is_running = self.serve_status.running_projects.contains(&id);
+        let nginx_up = self.serve_status.nginx_running;
+        let dot_color = if is_running {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
+        let status_text = if is_running { "Running" } else { "Stopped" };
+        let subtitle = if is_running {
+            if nginx_up {
+                "nginx is serving this domain over HTTP."
+            } else {
+                "Starting\u{2026}"
+            }
+        } else {
+            "Start to serve this project on its domain."
+        };
+
+        let serve_actions: AnyElement = if self.serve_busy {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new().small())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Applying\u{2026}"),
+                )
+                .into_any_element()
+        } else if is_running {
+            Button::new("stop-project")
+                .outline()
+                .small()
+                .icon(icon(IconName::Square))
+                .label("Stop")
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_project_running(id, cx)
+                }))
+                .into_any_element()
+        } else {
+            Button::new("start-project")
+                .primary()
+                .small()
+                .icon(icon(IconName::Play))
+                .label("Start")
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_project_running(id, cx)
+                }))
+                .into_any_element()
+        };
+
         let services = ui::plate(
             cx,
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_3()
+                .justify_between()
+                .gap_4()
                 .p(px(18.))
-                .child(icon(IconName::Server).text_color(brand::accent()))
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_1()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(ui::dot(dot_color))
                         .child(
                             div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("Services"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("nginx and PHP start here once the runtime manager lands next."),
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(status_text),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(subtitle),
+                                ),
                         ),
-                ),
+                )
+                .child(serve_actions),
         );
 
         div()
@@ -1643,6 +1862,16 @@ impl Render for Wisp {
                 div().px(px(20.)).pb(px(12.)).child(
                     Alert::error("db-error", message)
                         .title("Something went wrong")
+                        .banner(),
+                ),
+            );
+        }
+
+        if let Some(message) = self.serve_error.clone() {
+            root = root.child(
+                div().px(px(20.)).pb(px(12.)).child(
+                    Alert::error("serve-error", message)
+                        .title("Could not start the server")
                         .banner(),
                 ),
             );

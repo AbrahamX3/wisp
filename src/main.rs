@@ -16,6 +16,7 @@ mod db;
 mod fonts;
 mod platform;
 mod runtime;
+mod serve;
 mod settings;
 mod tray;
 mod ui;
@@ -47,6 +48,14 @@ fn main() {
             gpui_kit::init(cx);
             cx.set_app_identity("com.abraham.wisp", "Wisp");
             cx.set_global(tray::TrayState::default());
+            cx.set_global(app::ServerGlobal(serve::Supervisor::default()));
+
+            // Stop nginx and the PHP workers on the way out, so nothing is left
+            // holding port 80 or a FastCGI port.
+            let _ = cx.on_app_quit(|cx| {
+                cx.global_mut::<app::ServerGlobal>().0.stop_all();
+                async {}
+            });
 
             // Register the bundled typeface before the first window, so the
             // first frame is already laid out in it.
