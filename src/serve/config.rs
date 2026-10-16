@@ -206,7 +206,8 @@ max_execution_time=120\n\
     ));
 
     let overrides = overrides.trim();
-    if !overrides.is_empty() {
+    // An older record may hold the placeholder empty object; ignore it.
+    if !overrides.is_empty() && overrides != "{}" {
         out.push_str("\n; ---- Project overrides ------------------------------------------------\n");
         out.push_str(overrides);
         out.push('\n');
@@ -370,6 +371,21 @@ mod tests {
         let project_at = ini.find("memory_limit = 1G").unwrap();
         assert!(project_at > override_at, "project overrides come last");
         assert!(ini.contains("upload_max_filesize = 256M"));
+    }
+
+    #[test]
+    fn the_placeholder_empty_object_is_not_appended() {
+        // An older record stored `{}` for "no overrides"; it must not reach the
+        // ini, where it is a syntax error.
+        let ext = std::env::temp_dir().join("wisp-ext-test2");
+        let _ = std::fs::remove_dir_all(&ext);
+        std::fs::create_dir_all(&ext).unwrap();
+
+        let ini = php_ini("", &ext, Path::new(r"C:\logs\e.log"), "{}");
+        assert!(!ini.contains("Project overrides"));
+        assert!(!ini.contains("{}"));
+
+        let _ = std::fs::remove_dir_all(&ext);
     }
 
     #[test]

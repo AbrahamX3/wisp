@@ -77,7 +77,14 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.connect()?.execute_batch(SCHEMA)?;
+        let conn = self.connect()?;
+        conn.execute_batch(SCHEMA)?;
+        // Older records stored a placeholder empty object for "no overrides",
+        // which would be appended to php.ini as `{}` and break it.
+        conn.execute(
+            "UPDATE projects SET php_ini_overrides = '' WHERE TRIM(php_ini_overrides) = '{}'",
+            [],
+        )?;
         Ok(())
     }
 }

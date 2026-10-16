@@ -297,7 +297,7 @@ impl Supervisor {
         // immediately. Wait for it to accept connections so nginx never points
         // at a dead port — a 502 with no explanation is worse than an error.
         if !wait_for_port(port, Duration::from_millis(3000)) {
-            let tail = read_log_tail(&log);
+            let tail = read_log_tail(&log, "worker log");
             let _ = process::kill_tree(&mut child);
             return Err(ServeError::Start(format!(
                 "the PHP worker for \"{}\" did not start. {tail}",
@@ -326,7 +326,7 @@ impl Supervisor {
         // so rather than leaving the UI thinking it started.
         std::thread::sleep(std::time::Duration::from_millis(600));
         if !process::is_running(&mut child) {
-            let tail = read_log_tail(&prefix.join("logs").join("error.log"));
+            let tail = read_log_tail(&prefix.join("logs").join("error.log"), "nginx log");
             return Err(ServeError::Start(format!(
                 "nginx stopped right after starting. {tail}"
             )));
@@ -440,18 +440,18 @@ fn with_trailing_sep(prefix: &Path) -> String {
     value
 }
 
-/// The last part of nginx's error log, to explain a failed start.
-fn read_log_tail(path: &Path) -> String {
+/// The last part of a log file, to explain a failed start.
+fn read_log_tail(path: &Path, label: &str) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return "See the nginx log for details.".to_string();
+        return "See the log for details.".to_string();
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return "See the nginx log for details.".to_string();
+        return "See the log for details.".to_string();
     }
     let mut chars: Vec<char> = trimmed.chars().rev().take(600).collect();
     chars.reverse();
-    format!("nginx log: {}", chars.into_iter().collect::<String>())
+    format!("{label}: {}", chars.into_iter().collect::<String>())
 }
 
 #[cfg(test)]
