@@ -6,41 +6,68 @@ FastCGI worker per project.
 
 Built in Rust with [GPUI Kit](https://gpui-kit.com).
 
-See [NEXT-PHASE.md](NEXT-PHASE.md) for what is still open.
+## Install
 
-> **Status:** the shell, the icon pipeline, settings/tray/autostart/update, SQLite
-> project storage with the projects UI, the Services page (PHP/nginx runtimes with
-> install, update and uninstall), serving per project (generated nginx vhosts plus
-> a per-project php-cgi worker with its own php.ini), local HTTPS with a
-> per-domain certificate authority, `.test` hosts entries via an elevated helper,
-> and a per-project log viewer are in place. The interface is built on GPUI Kit's
-> own components: a collapsible `Sidebar` with project search, tabs for each
-> project (Overview · Services · Logs · Settings), a log viewer with search, match
-> navigation and follow, a toolbar of per-service controls, live CPU/RAM
-> sparklines, a Ctrl-K command palette, and a tray menu with a submenu per site.
+Download **`Wisp-Setup-<version>.exe`** from the
+[latest release](https://github.com/AbrahamX3/wisp/releases/latest) and run it.
+It installs per user, so it never asks for elevation, and Wisp keeps itself up to
+date from then on.
 
-## What it will do
+PHP and nginx are not bundled. Wisp installs them for you from the built-in
+catalog, so a fresh install needs no manual setup: add a project, pick a PHP
+version, and the app fetches the runtime it needs.
 
-- **Projects** — add a project with a name, a root path and a domain; its `.test`
-  domain is managed for you. Edit and delete projects freely; **deleting a
-  project only removes it from Wisp, never the files on disk.**
-- **PHP and nginx, managed** — a Services page installs, updates and removes PHP
-  and nginx builds, so you can pick a PHP version per project and keep nginx on
-  one active version.
-- **HTTPS by default** — a local certificate authority issues a certificate per
-  domain and is trusted once, so `https://myapp.test` just works.
-- **Per-project `php.ini`** — each project gets its own PHP configuration, with
-  per-project overrides applied last.
+## What it does
+
+- **Projects** — a name, a folder and a `.test` domain. Wisp writes the nginx
+  server block, issues the certificate and adds the hosts entry. **Removing a
+  project only removes it from Wisp; the files on disk are never touched.**
+- **PHP and nginx, managed** — install, update and remove runtime builds from
+  the Runtimes page. Pick a PHP version per project; nginx runs on one active
+  version for all of them. Downloads report their progress.
+- **Per-project `php.ini`** — generated from the runtime's own template, with
+  your overrides applied last. An editor shows the generated file, your
+  overrides, and a diff of what they change; saving restarts the worker.
 - **Per-service control** — start, stop and restart a project's nginx entry and
-  its PHP worker independently, from the window or the tray.
-- **Logs** — nginx access/error and PHP/worker logs per project, with a search
-  field, match navigation, follow and a scroll region of their own.
-- **Ctrl-K** — a command palette for jumping to a destination, opening a project,
-  or starting, stopping and restarting everything.
-- **Windows-native** — starts with Windows, lives in the tray with a submenu per
-  site, and updates itself from GitHub Releases.
+  its PHP worker independently, or both together, from the window or the tray.
+- **HTTPS by default** — a local certificate authority issues a certificate per
+  domain and is trusted once, so `https://myapp.test` just works. The Runtimes
+  page lists each certificate and when it expires.
+- **Logs** — access, error, PHP and worker logs, with search that highlights its
+  hits, match navigation, level or status filters, follow, wrap and copy.
+- **Links, not buttons** — a domain or a folder is clickable wherever it appears.
+- **Project icons** — each project gets a generated colour-and-letter icon, or
+  you can pick an image.
+- **Live resource use** — CPU and memory for the nginx and PHP processes Wisp
+  started, sampled every two seconds, not just whole-machine figures.
+- **Ctrl-K** — jump to a screen, open a project, or start, stop and restart
+  everything.
+- **Windows-native** — optional start-with-Windows, lives in the tray with a
+  submenu per site, and updates itself from GitHub Releases.
 
-## Running it
+## Where it keeps things
+
+Everything lives under `%USERPROFILE%\.config\wisp`:
+
+```
+wisp.db        projects and installed runtimes (SQLite)
+settings.json  theme, background mode, update cache
+runtimes/      installed PHP and nginx builds
+nginx/         the running nginx's configuration
+sites/<slug>/  each project's generated nginx config and php.ini
+certs/         the local certificate authority and issued certificates
+```
+
+Wisp owns the block between `# wisp:start` and `# wisp:end` in your hosts file
+and leaves every other line alone. Writing it needs administrator rights once;
+Wisp sets up a scheduled task for that automatically so it never prompts again.
+
+## Requirements
+
+- Windows 10 or 11, 64-bit.
+- Nothing else. Wisp offers to install the Visual C++ runtime if PHP needs it.
+
+## Building from source
 
 ```
 cargo run
@@ -49,9 +76,7 @@ cargo run
 The first build compiles a lot of UI dependencies and takes several minutes.
 Later builds are fast.
 
-### Requirements
-
-- Rust (MSVC toolchain). Built on 1.99.
+- Rust with the MSVC toolchain.
 - Visual Studio Build Tools with the **Desktop development with C++** workload.
 
 ## Project layout
@@ -61,7 +86,7 @@ src/
   main.rs        # entry point; single instance; window options
   app.rs         # the GPUI window: sidebar, project tabs, status bar, tray bridge
   ui/            # theme tokens and the shared section/dot primitives
-  assets.rs      # serves the embedded brand icon over GPUI Kit's defaults
+  assets.rs      # serves the brand icon and the icons beyond the kit's defaults
   autostart.rs   # the "start with Windows" Run entry
   tray.rs        # the tray icon and its per-site menu (background mode)
   platform.rs    # the Win32 calls with no safe wrapper: mutex, show/hide window
@@ -75,7 +100,7 @@ src/
   update.rs      # self-update from GitHub Releases
 build.rs         # rasterises assets/icon.svg into the .ico + tray pixels
 packaging/       # Inno Setup installer script
-scripts/         # release notes, icon export
+scripts/         # release notes, icon export, window capture
 ```
 
 ## Icon
@@ -105,6 +130,16 @@ git tag v0.2.0
 git push && git push --tags
 ```
 
-In the app, **Menu → Check for updates** asks GitHub Releases whether a newer
-version exists (verified against `SHA256SUMS` before installing). Wisp also
-checks automatically a few seconds after launch, at most once a day, silently.
+Wisp checks GitHub Releases a few seconds after launch, at most once a day, and
+silently. In the app, **Settings → Updates** checks on demand. A downloaded
+update is verified against `SHA256SUMS` before it is applied.
+
+## Known limitations
+
+- Windows only, for now.
+- File paths inside log lines are not yet clickable; everything else that names
+  a domain or a folder is.
+- Failures are reported in the window, not as OS notifications, so a failure
+  while Wisp is hidden in the tray is easy to miss.
+
+[NEXT-PHASE.md](NEXT-PHASE.md) tracks what is left.
