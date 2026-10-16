@@ -5,6 +5,7 @@
 //! and the primary action, and nothing else carries colour.
 
 use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,9 +29,10 @@ use gpui_kit::component::setting::{
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem, SidebarMenu,
     SidebarMenuItem, SidebarToggleButton,
 };
+use gpui_kit::component::Collapsible;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -2746,17 +2748,15 @@ impl Wisp {
             })
             .collect();
 
-        let mut menu = SidebarMenu::new();
+        let mut menu = SidebarGroup::<ProjectEntry>::new("Projects");
         if visible.is_empty() {
-            menu = menu.child(
-                SidebarMenuItem::new(if self.projects.is_empty() {
+            menu = menu.child(ProjectEntry::Note(SharedString::from(
+                if self.projects.is_empty() {
                     "No projects yet"
                 } else {
                     "No matches"
-                })
-                .icon(IconName::FolderOpen)
-                .disable(true),
-            );
+                },
+            )));
         } else {
             for project in &visible {
                 let active = selected == Some(project.id) && !on_runtimes && !on_settings;
@@ -2769,7 +2769,13 @@ impl Wisp {
                 } else {
                     cx.theme().muted_foreground
                 };
-                menu = menu.child(project_menu_item(project, active, color, cx));
+                menu = menu.child(project_entry(
+                    project,
+                    active,
+                    color,
+                    self.sidebar_collapsed,
+                    cx,
+                ));
             }
         }
 
@@ -2819,9 +2825,8 @@ impl Wisp {
             .collapsible(SidebarCollapsible::Icon)
             .collapsed(self.sidebar_collapsed)
             .header(header)
-            .child(SidebarGroup::new("Projects").child(menu))
-            .footer(nav.render("sidebar-nav", window, cx))
-    }
+            .child(menu)
+            .footer(nav.render("sidebar-nav", window, cx))    }
     fn content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.screen {
             Screen::Projects => self.projects_content(window, cx),
@@ -4717,20 +4722,22 @@ fn about_settings_page() -> SettingPage {
         )
 }
 
-/// One project row in the sidebar: name, a status dot, and selection.
-fn project_menu_item(
+/// One project row in the sidebar, as the group's entry type.
+fn project_entry(
     project: &Project,
     active: bool,
     color: Hsla,
+    collapsed: bool,
     cx: &mut Context<Wisp>,
-) -> SidebarMenuItem {
+) -> ProjectEntry {
     let id = project.id;
-
-    SidebarMenuItem::new(project.name.clone())
-        .icon(IconName::Globe)
-        .active(active)
-        .suffix(move |_window, _cx| ui::dot(color))
-        .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
+    ProjectEntry::Row(Box::new(ProjectRow {
+        project: project.clone(),
+        active,
+        status: color,
+        collapsed,
+        on_click: Rc::new(cx.listener(move |this, _, _window, cx| this.select(id, cx))),
+    }))
 }
 
 
@@ -6250,6 +6257,121 @@ fn project_icon(project: &Project, size: Pixels) -> AnyElement {
 }
 
 /// The error colour, for the few places a raw token is right.
+/// The click handler a sidebar row carries.
+type RowHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// One row in the sidebar's project list: the project's icon, its name, and its
+/// status dot.
+///
+/// Built here rather than as a `SidebarMenuItem` because that item's leading
+/// slot takes an `Icon`, which is an SVG from the asset system: it cannot show a
+/// raster image the user chose, and it cannot draw the generated letter either,
+/// since the SVG renderer implements no text. `SidebarGroup` is generic over
+/// `SidebarItem`, so a row that can show either is a supported shape rather than
+/// a workaround.
+#[derive(Clone)]
+struct ProjectRow {
+    project: Project,
+    active: bool,
+    status: Hsla,
+    collapsed: bool,
+    on_click: RowHandler,
+}
+
+impl ProjectRow {
+    fn into_element(self, id: ElementId, cx: &mut App) -> AnyElement {
+        let row = div()
+            .id(id)
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px(px(8.))
+            .py(px(6.))
+            .rounded_md();
+
+        let row = if self.active {
+            row.bg(cx.theme().sidebar_accent)
+                .text_color(cx.theme().sidebar_accent_foreground)
+        } else {
+            row.hover(|this| this.bg(cx.theme().sidebar_accent))
+        };
+
+        let mut row = row.child(project_icon(&self.project, px(18.)));
+        if self.collapsed {
+            // Icon only: there is no room for a name at icon width.
+            row = row.justify_center();
+        } else {
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_sm()
+                        .child(self.project.name.clone()),
+                )
+                .child(ui::dot(self.status));
+        }
+
+        let handler = self.on_click.clone();
+        row.on_click(move |event, window, cx| handler(event, window, cx))
+            .into_any_element()
+    }
+}
+
+/// A sidebar entry: a project, or the note shown when there are none.
+///
+/// One group holds one kind of item, so the empty state travels as an entry
+/// rather than as a separate element beside the group.
+#[derive(Clone)]
+enum ProjectEntry {
+    /// Boxed: a row is much larger than a note, and the group stores one slice.
+    Row(Box<ProjectRow>),
+    Note(SharedString),
+}
+
+impl Collapsible for ProjectEntry {
+    fn is_collapsed(&self) -> bool {
+        match self {
+            ProjectEntry::Row(row) => row.collapsed,
+            ProjectEntry::Note(_) => false,
+        }
+    }
+
+    fn collapsed(self, collapsed: bool) -> Self {
+        match self {
+            ProjectEntry::Row(row) => ProjectEntry::Row(Box::new(ProjectRow {
+                collapsed,
+                ..*row
+            })),
+            note => note,
+        }
+    }
+}
+
+impl SidebarItem for ProjectEntry {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        match self {
+            ProjectEntry::Row(row) => row.into_element(id.into(), cx),
+            ProjectEntry::Note(note) => div()
+                .w_full()
+                .px(px(8.))
+                .py(px(8.))
+                .text_sm()
+                .text_color(cx.theme().sidebar_foreground.opacity(0.55))
+                .child(note)
+                .into_any_element(),
+        }
+    }
+}
+
 fn cx_error() -> Hsla {    rgb(0xEF4444).into()
 }
 
