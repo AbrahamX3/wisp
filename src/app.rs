@@ -25,7 +25,7 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
@@ -1618,6 +1618,27 @@ impl Wisp {
         self.sync_server(cx);
     }
 
+    /// Start or stop both of a project's services together.
+    fn set_project(&mut self, id: i64, wanted: bool, cx: &mut Context<Self>) {
+        let changed = if wanted {
+            let nginx = self.nginx_on.insert(id);
+            let php = self.php_on.insert(id);
+            nginx || php
+        } else {
+            let nginx = self.nginx_on.remove(&id);
+            let php = self.php_on.remove(&id);
+            nginx || php
+        };
+        if changed {
+            self.sync_server(cx);
+        }
+    }
+
+    /// Restart a project's PHP worker, which is what its nginx entry shares.
+    fn restart_project(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.restart_service(id, true, cx);
+    }
+
     /// Act on a request from the tray. The window owns the running state, so all
     /// tray commands funnel through here rather than the supervisor directly.
     fn handle_tray(&mut self, request: tray::TrayRequest, cx: &mut Context<Self>) {
@@ -2096,27 +2117,6 @@ impl Wisp {
             bar = bar.child(div().text_ellipsis().overflow_hidden().child(text));
         }
 
-        // Right: ambient notices.
-        let hosts = match self.mode {
-            ControlMode::Elevated => "elevated",
-            ControlMode::Task => "no-prompt",
-            ControlMode::Uac => "asks",
-        };
-        let hosts_label = if wide {
-            format!("Hosts: {hosts}")
-        } else {
-            hosts.to_string()
-        };
-        bar = bar.right(
-            Button::new("status-hosts")
-                .ghost()
-                .xsmall()
-                .icon(icon(IconName::ShieldCheck))
-                .label(hosts_label)
-                .tooltip("How Wisp writes the hosts file")
-                .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Settings, cx))),
-        );
-
         if let Some(version) = self.settings.available_version.clone() {
             bar = bar.right(
                 Button::new("status-update")
@@ -2167,31 +2167,39 @@ impl Wisp {
             button.on_click(cx.listener(move |this, _, _window, cx| action(this, cx)))
         };
 
-        bar.right(site_button(
-            "status-start-all",
-            IconName::Play,
-            labels.map_or("", |l| l.0),
-            "Start every project and nginx",
-            any_stopped,
-            Wisp::start_all,
-        ))
-        .right(site_button(
-            "status-restart-all",
-            IconName::RotateCcw,
-            labels.map_or("", |l| l.1),
-            "Restart every project's worker",
-            any_running,
-            Wisp::restart_all,
-        ))
-        .right(site_button(
-            "status-stop-all",
-            IconName::Square,
-            labels.map_or("", |l| l.2),
-            "Stop every project and nginx",
-            any_running,
-            Wisp::stop_all,
-        ))
-        .into_any_element()
+        let controls = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(site_button(
+                "status-start-all",
+                IconName::Play,
+                labels.map_or("", |l| l.0),
+                "Start every project and nginx",
+                any_stopped,
+                Wisp::start_all,
+            ))
+            .child(site_button(
+                "status-restart-all",
+                IconName::RotateCcw,
+                labels.map_or("", |l| l.1),
+                "Restart every project's worker",
+                any_running,
+                Wisp::restart_all,
+            ))
+            .child(site_button(
+                "status-stop-all",
+                IconName::Square,
+                labels.map_or("", |l| l.2),
+                "Stop every project and nginx",
+                any_running,
+                Wisp::stop_all,
+            ));
+
+        bar.right(Separator::vertical())
+            .right(controls)
+            .into_any_element()
     }
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2342,7 +2350,7 @@ impl Wisp {
             })
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
         let on_runtimes = self.screen == Screen::Services;
         let on_settings = self.screen == Screen::Settings;
@@ -2385,23 +2393,24 @@ impl Wisp {
             }
         }
 
-        let footer = SidebarFooter::new()
-            .child(nav_item(
-                "Runtimes",
-                IconName::Server,
-                on_runtimes,
-                Screen::Services,
-                self.runtimes.len(),
-                cx,
-            ))
-            .child(nav_item(
-                "Settings",
-                IconName::Settings,
-                on_settings,
-                Screen::Settings,
-                0,
-                cx,
-            ));
+        // Runtimes and Settings are destinations of their own, so they sit below
+        // the projects as full-width menu rows rather than as a pair of buttons.
+        let runtime_count = self.runtimes.len();
+        let nav = SidebarMenu::new()
+            .w_full()
+            .child(
+                SidebarMenuItem::new("Runtimes")
+                    .icon(IconName::Server)
+                    .active(on_runtimes)
+                    .suffix(move |_window, cx| runtime_count_suffix(runtime_count, cx))
+                    .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Services, cx))),
+            )
+            .child(
+                SidebarMenuItem::new("Settings")
+                    .icon(IconName::Settings)
+                    .active(on_settings)
+                    .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Settings, cx))),
+            );
 
         // The window already shows the Wisp mark and name above, so the sidebar
         // header is only the search field.
@@ -2411,9 +2420,8 @@ impl Wisp {
         Sidebar::new("wisp-sidebar")
             .header(header)
             .child(SidebarGroup::new("Projects").child(menu))
-            .footer(footer)
+            .footer(nav.render("sidebar-nav", window, cx))
     }
-
     fn content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.screen {
             Screen::Projects => self.projects_content(window, cx),
@@ -2658,11 +2666,63 @@ impl Wisp {
         let php_on = self.php_on.contains(&id);
         let busy = self.serve_busy;
 
-        let header = section_header(
-            "Services",
-            "This project's nginx server block and its PHP worker.",
-            cx,
-        );
+        let header = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .justify_between()
+            .gap_4()
+            .child(div().flex_1().child(section_header(
+                "Services",
+                "This project's nginx server block and its PHP worker.",
+                cx,
+            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pt(px(14.))
+                    .pr(px(18.))
+                    .child(
+                        Button::new("project-start")
+                            .primary()
+                            .small()
+                            .icon(icon(IconName::Play))
+                            .label("Start both")
+                            .tooltip("Start this project's nginx entry and PHP worker")
+                            .disabled(busy || (nginx_on && php_on))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.set_project(id, true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("project-restart")
+                            .outline()
+                            .small()
+                            .icon(icon(IconName::RotateCcw))
+                            .label("Restart")
+                            .tooltip("Restart this project's PHP worker")
+                            .disabled(busy || !(nginx_on || php_on))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.restart_project(id, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("project-stop")
+                            .danger()
+                            .small()
+                            .icon(icon(IconName::Square))
+                            .label("Stop both")
+                            .tooltip("Stop this project's nginx entry and PHP worker")
+                            .disabled(busy || !(nginx_on || php_on))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.set_project(id, false, cx)
+                            })),
+                    ),
+            );
         let nginx_state = if !nginx_on {
             "Not serving".to_string()
         } else if nginx_up {
@@ -3707,7 +3767,7 @@ impl Render for Wisp {
             root = root.child(banner);
         }
 
-        let sidebar = self.sidebar(cx);
+        let sidebar = self.sidebar(window, cx);
         let content = self.content(window, cx);
         let status = self.status_bar(window, cx);
 
@@ -3974,62 +4034,6 @@ fn project_menu_item(
         .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
 }
 
-/// A top-level sidebar destination.
-fn nav_item(
-    label: &'static str,
-    icon_name: IconName,
-    active: bool,
-    screen: Screen,
-    count: usize,
-    cx: &mut Context<Wisp>,
-) -> impl IntoElement {
-    let base = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_3()
-        .px(px(12.))
-        .py(px(9.))
-        .rounded_lg();
-
-    let styled = if active {
-        base.bg(cx.theme().accent)
-            .border_1()
-            .border_color(cx.theme().accent)
-    } else {
-        base
-    };
-
-    styled
-        .id(label)
-        .hover(|d| d.bg(cx.theme().list_hover))
-        .on_click(cx.listener(move |this, _, _window, cx| this.goto(screen, cx)))
-        .child(icon(icon_name).small().text_color(if active {
-            cx.theme().primary
-        } else {
-            cx.theme().muted_foreground
-        }))
-        .child(
-            div()
-                .flex_1()
-                .text_sm()
-                .font_weight(if active {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .child(label),
-        )
-        .child(if count > 0 {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(count.to_string())
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        })
-}
 
 /// A section title and its one-line description inside a plate.
 fn section_header(title: &str, subtitle: &str, cx: &App) -> impl IntoElement {
@@ -4754,6 +4758,18 @@ fn inline_editor_footer(entity: Entity<Wisp>) -> impl IntoElement {
         .gap_2()
         .child(cancel)
         .child(save)
+}
+
+/// The muted count shown at the end of the Runtimes row.
+fn runtime_count_suffix(count: usize, cx: &App) -> AnyElement {
+    if count == 0 {
+        return div().into_any_element();
+    }
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(count.to_string())
+        .into_any_element()
 }
 
 fn cx_error() -> Hsla {
