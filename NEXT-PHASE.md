@@ -3,41 +3,34 @@
 A working list of everything still open, kept in the repo so nothing depends on
 remembering it. Grouped by area, roughly in the order I would tackle it.
 
-## Resource monitor should watch *our* services, not the machine
+## Resource monitor
 
-Right now the Resources card samples global CPU and RAM. It answers "is my PC
-busy", not "is this site slow". It should target the processes Wisp actually
-starts:
+**Done:** the sampler now measures what Wisp started — one tree for the shared
+nginx (master plus forked workers) and one process per running project's
+`php-cgi` — published from the supervisor as pids and resolved each tick, because
+pids change on every worker restart. The machine totals remain underneath as
+context, and the Overview tab shows only its own project.
 
-- **nginx** — one shared process tree, so one row.
-- **PHP workers** — one `php-cgi` per project, so a row per running site.
+Still open:
 
-Wanted shape:
-
-- Per-service CPU and memory, with the same 2s sampling and five-minute history
-  behind a sparkline, but sampled per process.
-- A project-scoped view (on the project's Overview, is *this* project heavy?) and
-  a global view on Runtimes › Resources (which site is heavy?).
-- Identify each process by PID from the supervisor, so the mapping cannot drift
-  when a worker is restarted.
-
-Notes: `sysinfo` can refresh a specific PID set (`Process::new` / `refresh_processes`
-with a filter), but CPU needs two samples per process, and PIDs change on every
-worker restart, so the sampler has to re-resolve PIDs each tick rather than cache
-them. The supervisor already knows which worker belongs to which project.
+- nginx's cost is shown as one figure; a per-project share is not attributable,
+  since one server serves every site. Consider labelling it "shared" more
+  loudly, or showing requests/site instead of CPU.
+- No throughput view. `stub_status` on nginx would give requests/site, which is a
+  more honest per-site signal than CPU.
 
 ## Logs
 
-The pane is now padded and fills the height, but the viewer is still thin:
+**Done:** padding and a bordered pane that fills the height, a working
+previous-match button, highlighted search hits, and a Wrap toggle.
 
-- **Level and status filters** — errors/PHP by level, access by status code. This
-  was planned earlier and never built.
-- **Highlight the matched substring** in each line rather than only filtering.
-- **Wrap toggle** — currently lines are nowrap only; the planned toggle never
-  shipped.
-- **Copy** — selecting text out of the log is not possible today.
-- **Row treatment** — consider alternating row tint and a subtle separator so
-  400 lines of stack trace is readable.
+Still open:
+
+- **Level and status filters** — errors/PHP by level, access by status code.
+  This was planned earlier and still is not built.
+- **Copy** — text cannot be selected out of the log yet.
+- **Row treatment** — alternating row tint or a separator, so a dense log is
+  easier to scan.
 - **Persist** the source, follow, wrap and case choices across restarts.
 
 ## php.ini editor
@@ -64,6 +57,15 @@ Overrides are a plain textarea in the project form. Wanted: a proper editor shee
 
 ## Shell and chrome
 
+**Done:** the sidebar footer lists Runtimes and Settings as proper full-width
+rows, the status bar dropped the duplicated hosts control and groups the
+all-sites buttons behind a separator, the project Services tab has its Start
+both / Restart / Stop both back alongside the per-service controls, and the
+Overview rows put their open buttons next to the value instead of at the far
+edge.
+
+Still open:
+
 - **Resizable master–detail** — `h_resizable` so the sidebar width can be dragged,
   with the width persisted.
 - **Collapsible sidebar** — `Sidebar` supports it; expose a toggle and remember
@@ -72,8 +74,9 @@ Overrides are a plain textarea in the project form. Wanted: a proper editor shee
   menu (File / Project / Services / Help).
 - **First-run wizard** — `Stepper` over: set up managed hosts access, install a
   PHP version, create the first project.
-- **Tab bar styling** — in the current build the tab strip draws a box that runs
-  to the right edge and the last tab sits in its own outline. Verify and fix.
+- **Tab strip styling** — the segmented `TabBar` draws a full-width container and
+  the last tab reads as its own box. Confirm whether that is the component's
+  intent or something to override.
 
 ## Notifications
 
@@ -93,6 +96,11 @@ mode.
 
 ## Traps worth remembering
 
+- **PowerShell splices over a function range can eat the next one.** Twice now,
+  replacing a method by line range removed methods that sat between the start
+  and the assumed end (`hosting_card`, then `toggle_palette` and
+  `palette_overlay`). After any range edit, grep for the neighbouring method
+  names before building.
 - **Force-killing Wisp leaks nginx.** `Stop-Process -Force` skips the app-quit
   hook that stops nginx and the workers, so `nginx.exe` keeps ports 80 and 443 and
   the next start fails with a confusing sync error. The supervisor sweeps orphans
