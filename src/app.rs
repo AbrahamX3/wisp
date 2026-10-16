@@ -227,8 +227,7 @@ impl LogKind {
 
 /// The create/edit dialog's live state. `id` is `None` while creating.
 struct EditorState {
-    id: Option<i64>,
-    name: Entity<InputState>,
+    id: Option<i64>,    name: Entity<InputState>,
     app_name: Entity<InputState>,
     root_path: Entity<InputState>,
     domain: Entity<InputState>,
@@ -245,6 +244,56 @@ struct EditorState {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Which pane of the php.ini editor is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IniView {
+    /// The overrides the user owns, which are applied last.
+    Overrides,
+    /// The whole file Wisp would write, read-only.
+    Generated,
+    /// What the overrides change.
+    Diff,
+}
+
+impl IniView {
+    fn index(self) -> usize {
+        match self {
+            IniView::Overrides => 0,
+            IniView::Generated => 1,
+            IniView::Diff => 2,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => IniView::Generated,
+            2 => IniView::Diff,
+            _ => IniView::Overrides,
+        }
+    }
+}
+
+/// The php.ini editor: whose file it is, what the user typed, and which pane.
+struct IniEditor {
+    project: i64,
+    view: IniView,
+    overrides: Entity<TextareaState>,
+    error: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// One row of the php.ini diff.
+enum DiffRow {
+    /// A line both sides share.
+    Same(String),
+    /// Lines both sides share, collapsed because nobody reads them.
+    Skipped(usize),
+    /// Only the generated file has this line.
+    Removed(String),
+    /// Only the effective file has this line.
+    Added(String),
+}
+
 pub struct Wisp {
     theme: ThemePreference,
     settings: Settings,
@@ -256,6 +305,8 @@ pub struct Wisp {
     projects: Vec<Project>,
     selected: Option<i64>,
     editor: Option<EditorState>,
+    /// The php.ini editor, when it is open.
+    ini_editor: Option<IniEditor>,
     /// A persistent problem (e.g. the database could not be opened).
     error: Option<String>,
 
@@ -355,6 +406,7 @@ impl Wisp {
             projects: Vec::new(),
             selected: None,
             editor: None,
+            ini_editor: None,
             error,
             screen: Screen::Projects,
             runtimes: Vec::new(),
@@ -564,6 +616,126 @@ impl Wisp {
                 .child(editor_form(editor, &entity, error, &php_versions, window, cx))
                 .footer(editor_footer(entity.clone(), is_new))
         });
+    }
+
+    /// Open the php.ini editor for a project.
+    fn open_ini_editor(
+        &mut self,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let overrides = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("upload_max_filesize = 128M\nmax_execution_time = 300")
+                .default_value(project.php_ini_overrides.clone())
+        });
+        self.ini_editor = Some(IniEditor {
+            project: project.id,
+            view: IniView::Overrides,
+            overrides,
+            error: None,
+            _subscriptions: Vec::new(),
+        });
+
+        let entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let read = entity.read(cx);
+            let Some(editor) = read.ini_editor.as_ref() else {
+                return dialog;
+            };
+            let Some(project) = read.projects.iter().find(|p| p.id == editor.project) else {
+                return dialog;
+            };
+            let title = format!("php.ini \u{00b7} {}", project.name);
+            let error = editor.error.clone();
+            let body = ini_editor_body(editor, &entity, read, project, cx);
+            dialog
+                .title(title)
+                .w(px(760.))
+                .close_button(true)
+                .child(body)
+                .footer(ini_editor_footer(entity.clone(), error))
+        });
+    }
+
+    /// The whole php.ini Wisp would write, with `overrides` applied last.
+    ///
+    /// Passing an empty string for `overrides` gives the file without the
+    /// user's additions, which is what the diff needs as its base.
+    fn generated_ini(&self, project: &Project, overrides: &str) -> String {
+        let Some(version) = project.php_version.as_deref() else {
+            return String::new();
+        };
+        let runtime_dir = runtime::install_dir(RuntimeKind::Php, version);
+        let template =
+            std::fs::read_to_string(runtime_dir.join("php.ini-development")).unwrap_or_default();
+        let extension_dir = runtime_dir.join("ext");
+        let dir = serve::config::site_dir(&project.slug());
+        let error_log = dir.join("logs").join("php-error.log");
+        serve::config::php_ini(&template, &extension_dir, &error_log, overrides)
+    }
+
+    /// Save the overrides and restart PHP so they take effect.
+    fn save_ini_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.ini_editor.as_ref() else {
+            return false;
+        };
+        let id = editor.project;
+        let text = editor.overrides.read(cx).value().to_string();
+        let Some(project) = self.projects.iter().find(|p| p.id == id).cloned() else {
+            return false;
+        };
+
+        let mut draft = ProjectDraft::from_project(&project);
+        draft.php_ini_overrides = text;
+
+        let Some(store) = &self.store else {
+            self.set_ini_error("The project database is unavailable.".to_string(), cx);
+            return false;
+        };
+
+        match store.update_project(id, &draft) {
+            Ok(()) => {
+                self.ini_editor = None;
+                self.reload(cx);
+                // Dropping the generated file is what makes the worker restart.
+                self.restart_service(id, true, cx);
+                self.push_toast(
+                    ToastKind::Success,
+                    format!("Saved php.ini for {}.", project.name),
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.set_ini_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    /// Empty the overrides, which hands the file back to the generated values.
+    fn reset_ini_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.ini_editor.as_ref() else {
+            return;
+        };
+        editor
+            .overrides
+            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        cx.notify();
+    }
+
+    fn set_ini_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(editor) = self.ini_editor.as_mut() {
+            editor.error = Some(message);
+        }
+        cx.notify();
+    }
+
+    fn close_ini_editor(&mut self, cx: &mut Context<Self>) {
+        self.ini_editor = None;
+        cx.notify();
     }
 
     /// Mirror the app name into the domain while the domain is still automatic.
@@ -2740,7 +2912,7 @@ impl Wisp {
                             .primary()
                             .small()
                             .icon(icon(IconName::Play))
-                            .label("Start both")
+                            .label("Start")
                             .tooltip("Start this project's nginx entry and PHP worker")
                             .disabled(busy || (nginx_on && php_on))
                             .on_click(cx.listener(move |this, _, _window, cx| {
@@ -2764,7 +2936,7 @@ impl Wisp {
                             .danger()
                             .small()
                             .icon(icon(IconName::Square))
-                            .label("Stop both")
+                            .label("Stop")
                             .tooltip("Stop this project's nginx entry and PHP worker")
                             .disabled(busy || !(nginx_on || php_on))
                             .on_click(cx.listener(move |this, _, _window, cx| {
@@ -3108,15 +3280,53 @@ impl Wisp {
                 .gap_2()
                 .child(
                     div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("php.ini overrides"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Appended last, so these win over the generated values."),
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("php.ini"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Overrides are appended last, so they win."),
+                                ),
+                        )
+                        .child(
+                            Button::new("edit-ini")
+                                .outline()
+                                .small()
+                                .icon(icon(IconName::SquarePen))
+                                .label("Edit php.ini")
+                                .on_click({
+                                    let entity = cx.entity();
+                                    move |_, window, cx| {
+                                        let project = entity
+                                            .read(cx)
+                                            .projects
+                                            .iter()
+                                            .find(|p| p.id == id)
+                                            .cloned();
+                                        if let Some(project) = project {
+                                            entity.update(cx, |this, cx| {
+                                                this.open_ini_editor(project, window, cx)
+                                            });
+                                        }
+                                    }
+                                }),
+                        ),
                 )
                 .child(
                     div()
@@ -3128,7 +3338,7 @@ impl Wisp {
                             cx.theme().foreground
                         })
                         .child(if overrides.trim().is_empty() {
-                            "None yet.".to_string()
+                            "None yet \u{2014} the generated file is used as-is.".to_string()
                         } else {
                             overrides
                         }),
@@ -4694,6 +4904,245 @@ fn metric_sparkline(id: String, values: Vec<f64>, max: f64, color: Hsla) -> impl
         .y_domain(0.0, if max <= 0.0 { 1.0 } else { max })
 }
 
+/// The php.ini editor's body: the overrides, the generated file, or the diff.
+fn ini_editor_body(
+    editor: &IniEditor,
+    entity: &Entity<Wisp>,
+    wisp: &Wisp,
+    project: &Project,
+    cx: &App,
+) -> AnyElement {
+    let tabs = TabBar::new("ini-tabs")
+        .segmented()
+        .selected_index(editor.view.index())
+        .children([
+            Tab::new().label("Overrides"),
+            Tab::new().label("Generated"),
+            Tab::new().label("Diff"),
+        ])
+        .on_click({
+            let entity = entity.clone();
+            move |index, _window, cx| {
+                let view = IniView::from_index(*index);
+                entity.update(cx, |this, cx| {
+                    if let Some(editor) = this.ini_editor.as_mut() {
+                        editor.view = view;
+                    }
+                    cx.notify();
+                });
+            }
+        });
+
+    let pane: AnyElement = match editor.view {
+        IniView::Overrides => Textarea::new(&editor.overrides)
+            .h(px(360.))
+            .w_full()
+            .into_any_element(),
+        IniView::Generated => code_pane(
+            wisp.generated_ini(project, &project.php_ini_overrides),
+            cx,
+        ),
+        IniView::Diff => diff_pane(wisp, project, cx),
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(tabs)
+        .child(pane)
+        .into_any_element()
+}
+
+/// A read-only block of monospace text in a bordered, scrolling pane.
+fn code_pane(text: String, cx: &App) -> AnyElement {
+    div()
+        .id("ini-code")
+        .w_full()
+        .h(px(360.))
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .overflow_y_scrollbar()
+        .px(px(12.))
+        .py(px(10.))
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_xs()
+        .child(text)
+        .into_any_element()
+}
+
+/// What the project's overrides change about the generated file.
+fn diff_pane(wisp: &Wisp, project: &Project, cx: &App) -> AnyElement {
+    let base = wisp.generated_ini(project, "");
+    let effective = wisp.generated_ini(project, &project.php_ini_overrides);
+    let rows = diff_lines(&base, &effective, 3);
+
+    if rows.is_empty() {
+        return div()
+            .id("ini-diff")
+            .w_full()
+            .h(px(360.))
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .p(px(18.))
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("No overrides yet, so the effective file is the generated one.")
+            .into_any_element();
+    }
+
+    let mut body = div().flex().flex_col().py(px(6.));
+    for row in rows {
+        body = body.child(match row {
+            DiffRow::Same(text) => diff_row(" ", &text, cx.theme().muted_foreground, cx),
+            DiffRow::Skipped(count) => div()
+                .px(px(10.))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("\u{2026} {count} unchanged lines"))
+                .into_any_element(),
+            DiffRow::Removed(text) => diff_row("-", &text, cx_error(), cx),
+            DiffRow::Added(text) => diff_row("+", &text, cx.theme().success, cx),
+        });
+    }
+
+    div()
+        .id("ini-diff")
+        .w_full()
+        .h(px(360.))
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .overflow_y_scrollbar()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_xs()
+        .child(body)
+        .into_any_element()
+}
+
+/// One diff row: its marker, then the line.
+fn diff_row(marker: &str, text: &str, color: Hsla, cx: &App) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .px(px(10.))
+        .whitespace_nowrap()
+        .child(div().w(px(8.)).flex_shrink(0.0).text_color(color).child(marker.to_string()))
+        .child(div().text_color(cx.theme().foreground).child(text.to_string()))
+        .into_any_element()
+}
+
+/// A line diff for the change Wisp makes, which is an append.
+///
+/// The generated file and the effective file share a long prefix and the
+/// overrides tail on to the end, so there is no need for a full LCS: strip the
+/// shared prefix and suffix and report what is left. Runs of unchanged lines
+/// collapse to a count, because the rest of the file is thousands of defaults
+/// nobody is looking at.
+fn diff_lines(base: &str, other: &str, context: usize) -> Vec<DiffRow> {
+    let base: Vec<&str> = base.lines().collect();
+    let other: Vec<&str> = other.lines().collect();
+
+    let mut prefix = 0;
+    while prefix < base.len() && prefix < other.len() && base[prefix] == other[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix + prefix < base.len()
+        && suffix + prefix < other.len()
+        && base[base.len() - 1 - suffix] == other[other.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let mut rows = Vec::new();
+
+    // Nothing differs anywhere: report nothing rather than reprinting the file.
+    if prefix + suffix >= base.len() && prefix + suffix >= other.len() {
+        return rows;
+    }
+
+    let head_from = prefix.saturating_sub(context);
+    if head_from > 0 {
+        rows.push(DiffRow::Skipped(head_from));
+    }
+    for line in &base[head_from..prefix] {
+        rows.push(DiffRow::Same((*line).to_string()));
+    }
+
+    for line in &base[prefix..base.len() - suffix] {
+        rows.push(DiffRow::Removed((*line).to_string()));
+    }
+    for line in &other[prefix..other.len() - suffix] {
+        rows.push(DiffRow::Added((*line).to_string()));
+    }
+
+    let tail_len = suffix.min(context);
+    for line in &base[base.len() - suffix..base.len() - suffix + tail_len] {
+        rows.push(DiffRow::Same((*line).to_string()));
+    }
+    if suffix > tail_len {
+        rows.push(DiffRow::Skipped(suffix - tail_len));
+    }
+
+    rows
+}
+
+fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoElement {
+    let reset = Button::new("ini-reset")
+        .label("Reset to generated")
+        .outline()
+        .on_click({
+            let entity = entity.clone();
+            move |_, window, cx| {
+                entity.update(cx, |this, cx| this.reset_ini_editor(window, cx));
+            }
+        });
+
+    let cancel = Button::new("ini-cancel")
+        .label("Cancel")
+        .outline()
+        .on_click({
+            let entity = entity.clone();
+            move |_, window, cx| {
+                entity.update(cx, |this, cx| this.close_ini_editor(cx));
+                window.close_dialog(cx);
+            }
+        });
+
+    let save = Button::new("ini-save")
+        .label("Save & restart PHP")
+        .primary()
+        .on_click({
+            let entity = entity.clone();
+            move |_, window, cx| {
+                let saved = entity.update(cx, |this, cx| this.save_ini_editor(cx));
+                if saved {
+                    window.close_dialog(cx);
+                }
+            }
+        });
+
+    let mut footer = div().flex().flex_col().gap_2();
+    if let Some(message) = error {
+        footer = footer.child(div().text_xs().text_color(cx_error()).child(message));
+    }
+
+    footer
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap_2()
+                .child(reset)
+                .child(div().flex().flex_row().gap_2().child(cancel).child(save)),
+        )
+}
+
 /// The body of the create/edit dialog.
 fn editor_form(
     editor: &EditorState,
@@ -5339,9 +5788,9 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
 #[cfg(test)]
 mod tests {
     use super::{
-        descends_from, domain_is_hand_edited, find_ranges, is_newer, measure_services,
-        merge_samples, push_capped, service_config_changed, should_offer_update, ServiceSample,
-        REPOSITORY_URL,
+        descends_from, diff_lines, domain_is_hand_edited, find_ranges, is_newer, measure_services,
+        merge_samples, push_capped, service_config_changed, should_offer_update, DiffRow,
+        ServiceSample, REPOSITORY_URL,
     };
     use crate::update::{REPO_NAME, REPO_OWNER};
     use std::collections::{HashMap, VecDeque};
@@ -5591,5 +6040,63 @@ mod tests {
         assert_eq!(find_ranges("erro", "error", true), vec![]);
         // A partial tail must not match either.
         assert_eq!(find_ranges("xerr", "error", true), vec![]);
+    }
+
+    // ---- the php.ini diff ------------------------------------------------
+
+    #[test]
+    fn an_unchanged_file_has_nothing_to_show() {
+        let text = "a\nb\nc";
+        assert!(diff_lines(text, text, 3).is_empty());
+    }
+
+    #[test]
+    fn appended_overrides_show_as_added_lines() {
+        let rows = diff_lines("a\nb\nc", "a\nb\nc\nupload_max_filesize = 128M", 3);
+        let added: Vec<&String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Added(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added, vec!["upload_max_filesize = 128M"]);
+        // Nothing was taken away, so nothing is reported as a removal.
+        assert!(!rows.iter().any(|row| matches!(row, DiffRow::Removed(_))));
+    }
+
+    #[test]
+    fn long_runs_are_collapsed_but_the_change_stays_visible() {
+        let base: String = (0..100).map(|n| format!("line {n}\n")).collect();
+        let other = format!("{base}max_execution_time = 300");
+
+        let rows = diff_lines(&base, &other, 2);
+        let skipped: usize = rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Skipped(count) => Some(*count),
+                _ => None,
+            })
+            .sum();
+        assert!(skipped >= 90, "the unchanged bulk should collapse: {skipped}");
+
+        let context = rows
+            .iter()
+            .filter(|row| matches!(row, DiffRow::Same(_)))
+            .count();
+        assert_eq!(context, 2, "only the configured context is kept");
+    }
+
+    #[test]
+    fn a_removed_tail_is_reported_as_removed() {
+        let rows = diff_lines("a\nb\ngone", "a\nb", 3);
+        let removed: Vec<&String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Removed(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec!["gone"]);
     }
 }
