@@ -379,8 +379,11 @@ mod tests {
         let root = std::env::temp_dir().join("wisp-serve-e2e");
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("WISP_CONFIG_DIR", &root);
-        // Something else on this machine may hold port 80.
-        std::env::set_var("WISP_HTTP_PORT", "18080");
+        // Honour an override (e.g. when port 80 is taken), else use the default.
+        let port: u16 = std::env::var("WISP_HTTP_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(80);
 
         ensure_nginx("1.27.0");
         ensure_php("8.3.35");
@@ -404,7 +407,8 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(900));
 
-        let body = ureq::get("http://127.0.0.1:18080/")
+        let url = format!("http://127.0.0.1:{port}/");
+        let body = ureq::get(&url)
             .header("Host", "demo.test")
             .call()
             .expect("the site should respond")
