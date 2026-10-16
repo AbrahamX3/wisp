@@ -167,12 +167,22 @@ server {{
 }
 
 /// Build a per-project `php.ini` from the runtime's `php.ini-development`
-/// template, appending the development overrides Wisp wants.
+/// template: enable every extension the build offers, and append the
+/// development overrides Wisp wants.
+///
+/// `extension_dir` must be set before any `extension=` line, or PHP cannot find
+/// the DLLs, so it goes at the very top, ahead of the template.
 pub fn php_ini(template: &str, extension_dir: &Path, error_log: &Path) -> String {
     let extension_dir = nginx_path(extension_dir);
     let error_log = nginx_path(error_log);
-    format!(
-        "{template}\n\
+
+    let mut out = format!(
+        "; ---- Wisp -------------------------------------------------------------\n\
+         extension_dir=\"{extension_dir}\"\n"
+    );
+    out.push_str(&enable_extensions(template));
+    out.push_str(&format!(
+        "\n\
 ; ---- Wisp overrides -------------------------------------------------------\n\
 cgi.fix_pathinfo=0\n\
 extension_dir=\"{extension_dir}\"\n\
@@ -186,8 +196,26 @@ memory_limit=512M\n\
 upload_max_filesize=64M\n\
 post_max_size=64M\n\
 max_execution_time=120\n\
-"
-    )
+",
+    ));
+    out
+}
+
+/// Uncomment the template's `;extension=` lines, so a project behaves like a
+/// full development build (intl, mbstring, curl, gd, pdo_mysql, …).
+fn enable_extensions(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    for line in template.lines() {
+        match line.strip_prefix(";extension=") {
+            Some(rest) => {
+                out.push_str("extension=");
+                out.push_str(rest.trim_start());
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The document root for a project: `public/` when that is how the app is laid
@@ -256,6 +284,23 @@ mod tests {
     }
 
     #[test]
+    fn extensions_are_enabled_after_the_extension_dir() {        let ini = php_ini(
+            ";extension=intl\n;extension=curl\nmemory_limit=128M\n",
+            Path::new(r"C:\php\ext"),
+            Path::new(r"C:\logs\php-error.log"),
+        );
+        assert!(ini.contains("extension=intl"));
+        assert!(ini.contains("extension=curl"));
+        assert!(!ini.contains(";extension=intl"));
+        let dir_at = ini.find("extension_dir=").expect("extension_dir is set");
+        let intl_at = ini.find("extension=intl").expect("intl is enabled");
+        assert!(
+            dir_at < intl_at,
+            "extension_dir must come before any extension"
+        );
+    }
+
+    #[test]
     fn php_overrides_are_appended_after_the_template() {
         let ini = php_ini(
             "memory_limit=128M\n",
@@ -272,8 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn a_public_folder_is_used_when_present() {
-        let root = std::env::temp_dir().join("wisp-docroot-test");
+    fn a_public_folder_is_used_when_present() {        let root = std::env::temp_dir().join("wisp-docroot-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("public")).unwrap();
         std::fs::write(root.join("public").join("index.php"), "<?php").unwrap();
@@ -287,5 +331,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = root;
         let _: PathBuf = PathBuf::new();
+    }
+
+    /// Writes a generated ini for the newest installed PHP and asks that PHP to
+    /// list its modules, proving `intl` (and friends) actually load.
+    /// Ignored by default; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs an installed PHP runtime"]
+    fn generated_ini_loads_extensions() {
+        let php_root = crate::config::runtimes().join("php");
+        let Some(dir) = std::fs::read_dir(&php_root).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.join("php.exe").is_file())
+        }) else {
+            eprintln!("no installed PHP runtime; skipping");
+            return;
+        };
+
+        let template = std::fs::read_to_string(dir.join("php.ini-development")).unwrap_or_default();
+        let ini = php_ini(
+            &template,
+            &dir.join("ext"),
+            &std::env::temp_dir().join("wisp-error.log"),
+        );
+        let ini_path = std::env::temp_dir().join("wisp-generated-php.ini");
+        std::fs::write(&ini_path, ini).unwrap();
+
+        let output = std::process::Command::new(dir.join("php.exe"))
+            .arg("-c")
+            .arg(&ini_path)
+            .arg("-m")
+            .output()
+            .expect("php.exe should run");
+        let modules = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(modules.contains("intl"), "intl should be loaded:\n{modules}");
+        assert!(modules.contains("curl"), "curl should be loaded");
+
+        let _ = std::fs::remove_file(&ini_path);
     }
 }
