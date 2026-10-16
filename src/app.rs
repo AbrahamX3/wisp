@@ -27,6 +27,7 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -197,6 +198,12 @@ pub struct Wisp {
     log_lines: Vec<String>,
     /// Filters the sidebar's project list.
     project_filter: Entity<InputState>,
+    /// Log search, follow and scroll state.
+    log_filter: Entity<InputState>,
+    log_case: bool,
+    log_follow: bool,
+    log_match: usize,
+    log_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -212,15 +219,24 @@ impl Wisp {
 
         // Filters the project list; typing re-renders the sidebar.
         let project_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
-        let _subscriptions = vec![cx.subscribe_in(
-            &project_filter,
-            window,
-            |_this, _state, event, _window, cx| {
+        let log_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find in log"));
+        let _subscriptions = vec![
+            cx.subscribe_in(
+                &project_filter,
+                window,
+                |_this, _state, event, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(&log_filter, window, |this, _state, event, _window, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.log_match = 0;
                     cx.notify();
                 }
-            },
-        )];
+            }),
+        ];
 
         let mut this = Self {
             theme: settings.theme,            settings,
@@ -252,6 +268,11 @@ impl Wisp {
             log_kind: LogKind::Php,
             log_lines: Vec::new(),
             project_filter,
+            log_filter,
+            log_case: false,
+            log_follow: true,
+            log_match: 0,
+            log_scroll: ScrollHandle::default(),
             _subscriptions,
         };
         this.reload(cx);
@@ -1295,6 +1316,12 @@ impl Wisp {
         };
         if lines != self.log_lines {
             self.log_lines = lines;
+            // Follow keeps the newest line in view; the exact bottom is known
+            // after the next layout, so this lands a frame later.
+            if self.log_follow {
+                let max = self.log_scroll.max_offset();
+                self.log_scroll.set_offset(point(px(0.), max.y));
+            }
             cx.notify();
         }
     }
@@ -1319,8 +1346,52 @@ impl Wisp {
         .detach();
     }
 
-    fn clear_log(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.selected_log_path() {
+    /// Move between search hits, scrolling the log towards the new one.
+    fn step_log_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let raw = self.log_filter.read(cx).value().to_string();
+        let needle = if self.log_case { raw } else { raw.to_lowercase() };
+        if needle.is_empty() {
+            return;
+        }
+
+        let hits: Vec<usize> = self
+            .log_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let hay = if self.log_case {
+                    (*line).clone()
+                } else {
+                    line.to_lowercase()
+                };
+                hay.contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        if hits.is_empty() {
+            self.log_match = 0;
+            cx.notify();
+            return;
+        }
+
+        let count = hits.len();
+        self.log_match = if forward {
+            (self.log_match + 1) % count
+        } else {
+            (self.log_match + count - 1) % count
+        };
+
+        // Line offsets are not tracked, so map the hit's position onto the
+        // scrollable range as an approximation.
+        let fraction = self.log_match as f32 / count as f32;
+        let max = self.log_scroll.max_offset();
+        self.log_scroll
+            .set_offset(point(px(0.), px(f32::from(max.y) * fraction)));
+        cx.notify();
+    }
+
+    fn clear_log(&mut self, cx: &mut Context<Self>) {        if let Some(path) = self.selected_log_path() {
             let _ = std::fs::write(&path, "");
         }
         self.refresh_logs(cx);
@@ -2441,97 +2512,191 @@ impl Wisp {
             .into_any_element()
     }
 
-    /// The selected project's log tail, with a file picker and controls.
+    /// The selected project's logs: source, search, follow and a bounded tail.
     fn logs_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.log_kind;
-        let picker = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .children(
-                [LogKind::Access, LogKind::Errors, LogKind::Php, LogKind::Worker]
-                    .into_iter()
-                    .map(|kind| {
-                    let button = Button::new(format!("log-{}", kind.label()))
-                        .small()
-                        .label(kind.label());
-                    let button = if kind == current {
-                        button.primary()
-                    } else {
-                        button.outline()
-                    };
-                    button
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            if this.log_kind != kind {
-                                this.log_kind = kind;
-                                this.log_lines.clear();
-                                this.refresh_logs(cx);
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                },
-            ));
+        let raw = self.log_filter.read(cx).value().to_string();
+        let needle = if self.log_case {
+            raw.clone()
+        } else {
+            raw.to_lowercase()
+        };
+
+        let visible: Vec<(usize, &String)> = self
+            .log_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let hay = if self.log_case {
+                    (*line).clone()
+                } else {
+                    line.to_lowercase()
+                };
+                hay.contains(&needle)
+            })
+            .collect();
+        let shown = visible.len();
+        let total = self.log_lines.len();
+        let matching = !needle.is_empty();
+
+        let sources: Vec<AnyElement> = [
+            LogKind::Access,
+            LogKind::Errors,
+            LogKind::Php,
+            LogKind::Worker,
+        ]
+        .into_iter()
+        .map(|kind| {
+            let button = Button::new(format!("log-{}", kind.label()))
+                .small()
+                .label(kind.label());
+            let button = if kind == current {
+                button.primary()
+            } else {
+                button.outline()
+            };
+            button
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if this.log_kind != kind {
+                        this.log_kind = kind;
+                        this.log_lines.clear();
+                        this.log_match = 0;
+                        this.refresh_logs(cx);
+                    }
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+        .collect();
+
+        let count = if matching {
+            format!("{} of {} lines", self.log_match.saturating_add(1).min(shown), shown)
+        } else {
+            format!("{total} lines")
+        };
 
         let header = section_header("Logs", "The tail of this project's logs.", cx);
-        let toolbar = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px(px(18.))
-            .pb(px(10.))
-            .child(picker)
-            .child(
+        let toolbar = Toolbar::new("logs-toolbar")
+            .contents(sources)
+            .content(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .child(div().w(px(220.)).child(Input::new(&self.log_filter)))
+                    .child({
+                        let button = Button::new("log-case")
+                            .small()
+                            .label("Aa")
+                            .tooltip("Match case");
+                        let button = if self.log_case {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        };
+                        button.on_click(cx.listener(|this, _, _window, cx| {
+                            this.log_case = !this.log_case;
+                            cx.notify();
+                        }))
+                    })
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(count.clone()))
+                    .child(
+                        Button::new("log-prev")
+                            .ghost()
+                            .xsmall()
+                            .icon(icon(IconName::ChevronRight))
+                            .tooltip("Previous match")
+                            .disabled(!matching)
+                            .on_click(cx.listener(|this, _, _window, cx| this.step_log_match(false, cx))),
+                    )
+                    .child(
+                        Button::new("log-next")
+                            .ghost()
+                            .xsmall()
+                            .icon(icon(IconName::ChevronRight))
+                            .tooltip("Next match")
+                            .disabled(!matching)
+                            .on_click(cx.listener(|this, _, _window, cx| this.step_log_match(true, cx))),
+                    )
+                    .child({
+                        let button = Button::new("log-follow")
+                            .small()
+                            .label("Follow")
+                            .tooltip("Keep the newest line in view");
+                        let button = if self.log_follow {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        };
+                        button.on_click(cx.listener(|this, _, _window, cx| {
+                            this.log_follow = !this.log_follow;
+                            if this.log_follow {
+                                let max = this.log_scroll.max_offset();
+                                this.log_scroll.set_offset(point(px(0.), max.y));
+                            }
+                            cx.notify();
+                        }))
+                    })
                     .child(
                         Button::new("log-folder")
-                            .outline()
+                            .ghost()
                             .small()
                             .icon(icon(IconName::FolderOpen))
-                            .label("Folder")
+                            .tooltip("Open the log folder")
                             .on_click(cx.listener(|this, _, _window, cx| this.open_log_folder(cx))),
                     )
                     .child(
                         Button::new("log-clear")
-                            .outline()
+                            .ghost()
                             .small()
                             .label("Clear")
+                            .tooltip("Empty this log file")
                             .on_click(cx.listener(|this, _, _window, cx| this.clear_log(cx))),
                     ),
             );
 
-        let body = if self.log_lines.is_empty() {
+        let body = if visible.is_empty() {
             div()
                 .px(px(18.))
                 .pb(px(16.))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Nothing logged yet.")
+                .child(if self.log_lines.is_empty() {
+                    "Nothing logged yet. Start the project and open its domain."
+                } else {
+                    "No lines match that search."
+                })
                 .into_any_element()
         } else {
-            let lines = self
-                .log_lines
+            let lines: Vec<AnyElement> = visible
                 .iter()
-                .map(|line| div().whitespace_nowrap().child(line.clone()));
+                .map(|(_, line)| {
+                    div()
+                        .whitespace_nowrap()
+                        .child((*line).clone())
+                        .into_any_element()
+                })
+                .collect();
+
             div()
-                .id("log-lines")
+                .relative()
                 .w_full()
-                .min_w(px(0.))
-                .h(px(220.))
-                .overflow_scrollbar()
-                .px(px(18.))
-                .pb(px(16.))
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_xs()
-                .child(div().flex().flex_col().gap_1().children(lines))
+                .h(px(240.))
+                .child(
+                    div()
+                        .id("log-lines")
+                        .track_scroll(&self.log_scroll)
+                        .overflow_y_scroll()
+                        .size_full()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .children(lines),
+                )
+                .vertical_scrollbar(&self.log_scroll)
                 .into_any_element()
         };
 
@@ -2542,7 +2707,7 @@ impl Wisp {
                 .flex_col()
                 .gap_1()
                 .child(header)
-                .child(toolbar)
+                .child(div().px(px(18.)).pb(px(6.)).child(toolbar))
                 .child(body),
         )
     }
@@ -2630,7 +2795,6 @@ impl Wisp {
                 .child(action),
         )
     }
-
     fn https_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let trusted = self.settings.ca_trusted;
 
