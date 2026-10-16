@@ -10,7 +10,6 @@
 mod app;
 mod assets;
 mod autostart;
-mod brand;
 mod config;
 mod ctl;
 mod db;

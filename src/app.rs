@@ -26,7 +26,6 @@ use gpui_kit::*;
 
 use crate::assets::APP_ICON;
 use crate::autostart;
-use crate::brand;
 use crate::db::{self, InstalledRuntime, Project, ProjectDraft, Store};
 use crate::elevation::{self, ActionOutcome, ControlMode};
 use crate::helper_task::{self, TaskError};
@@ -2006,7 +2005,7 @@ impl Wisp {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(ui::dot(brand::accent()))
+                            .child(ui::dot(cx.theme().primary))
                             .child(
                                 div()
                                     .text_sm()
@@ -2045,7 +2044,7 @@ impl Wisp {
                     ),
             );
 
-        let details = ui::plate(
+        let details = ui::section(
             cx,
             div()
                 .flex()
@@ -2152,7 +2151,7 @@ impl Wisp {
                 busy,
                 cx,
             ));
-        let services = ui::plate(
+        let services = ui::section(
             cx,
             div()
                 .flex()
@@ -2346,7 +2345,7 @@ impl Wisp {
                 .into_any_element()
         };
 
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2395,7 +2394,7 @@ impl Wisp {
         let badge_label = SharedString::from(badge_label);
         let state = SharedString::from(state);
 
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2410,7 +2409,7 @@ impl Wisp {
                         .flex_row()
                         .items_center()
                         .gap_3()
-                        .child(icon(IconName::ShieldCheck).text_color(brand::accent()))
+                        .child(icon(IconName::ShieldCheck).text_color(cx.theme().primary))
                         .child(
                             div()
                                 .flex()
@@ -2476,7 +2475,7 @@ impl Wisp {
             "Trust Wisp's certificate so https:// works in your browser."
         };
 
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2491,7 +2490,7 @@ impl Wisp {
                         .flex_row()
                         .items_center()
                         .gap_3()
-                        .child(icon(IconName::ShieldCheck).text_color(brand::accent()))
+                        .child(icon(IconName::ShieldCheck).text_color(cx.theme().primary))
                         .child(
                             div()
                                 .flex()
@@ -2520,7 +2519,7 @@ impl Wisp {
         } else {
             "Visual C++ 2015\u{2013}2019 x64"
         };
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2530,7 +2529,7 @@ impl Wisp {
                 .p(px(18.))
                 .child(
                     icon(IconName::TriangleAlert)
-                        .text_color(brand::accent()),
+                        .text_color(cx.theme().primary),
                 )
                 .child(
                     div()
@@ -2610,7 +2609,7 @@ impl Wisp {
                 .into_any_element()
         };
 
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2705,7 +2704,7 @@ impl Wisp {
                 .into_any_element()
         };
 
-        ui::plate(
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2806,9 +2805,9 @@ fn nav_item(
         .rounded_lg();
 
     let styled = if active {
-        base.bg(brand::accent_wash())
+        base.bg(cx.theme().accent)
             .border_1()
-            .border_color(brand::accent_tint())
+            .border_color(cx.theme().accent)
     } else {
         base
     };
@@ -2818,7 +2817,7 @@ fn nav_item(
         .hover(|d| d.bg(cx.theme().list_hover))
         .on_click(cx.listener(move |this, _, _window, cx| this.goto(screen, cx)))
         .child(icon(icon_name).small().text_color(if active {
-            brand::accent()
+            cx.theme().primary
         } else {
             cx.theme().muted_foreground
         }))
@@ -2869,15 +2868,15 @@ fn section_header(title: &str, subtitle: &str, cx: &App) -> impl IntoElement {
 
 /// A small accent badge, e.g. "Up to date" or "Active".
 fn badge(label: &str, cx: &App) -> impl IntoElement {
-    let color = brand::accent();
+    let color = cx.theme().primary;
     let _ = cx;
     div()
         .px(px(8.))
         .py(px(3.))
         .rounded_full()
-        .bg(brand::accent_wash())
+        .bg(cx.theme().accent)
         .border_1()
-        .border_color(brand::accent_tint())
+        .border_color(cx.theme().accent)
         .text_xs()
         .text_color(color)
         .child(label.to_string())
@@ -3139,7 +3138,7 @@ fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> imp
         .child(if project.ssl_enabled {
             icon(IconName::Lock)
                 .small()
-                .text_color(brand::accent())
+                .text_color(cx.theme().primary)
                 .into_any_element()
         } else {
             div().into_any_element()
@@ -3153,9 +3152,9 @@ fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> imp
         .rounded_lg();
 
     let styled = if selected {
-        base.bg(brand::accent_wash())
+        base.bg(cx.theme().accent)
             .border_1()
-            .border_color(brand::accent_tint())
+            .border_color(cx.theme().accent)
     } else {
         base
     };
@@ -3165,7 +3164,7 @@ fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> imp
         .hover(|d| d.bg(cx.theme().list_hover))
         .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
         .child(if selected {
-            ui::accent_rail().into_any_element()
+            ui::accent_rail(cx).into_any_element()
         } else {
             div().w(px(3.)).into_any_element()
         })
@@ -3774,7 +3773,7 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
         ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
         ThemePreference::System => Theme::sync_system_appearance(window, cx),
     }
-    brand::apply(cx);
+    crate::ui::theme::apply(cx);
 }
 
 #[cfg(test)]
