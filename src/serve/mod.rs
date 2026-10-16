@@ -46,6 +46,10 @@ pub struct SiteSpec {
     pub ssl_enabled: bool,
     /// Raw `php.ini` directives the project adds, appended last.
     pub php_ini_overrides: String,
+    /// Whether nginx should serve this site's server block.
+    pub vhost: bool,
+    /// Whether a php-cgi worker should run for this site.
+    pub worker: bool,
 }
 
 /// A snapshot of what is actually running.
@@ -104,15 +108,10 @@ impl Supervisor {
     }
 
     /// Bring the running set in line with `sites`, using `nginx_version`.
+    ///
+    /// A site can be served (`vhost`) and/or have a worker (`worker`)
+    /// independently, so nginx only runs while at least one site is served.
     pub fn sync(&mut self, nginx_version: Option<&str>, sites: &[SiteSpec]) -> Result<()> {
-        let version = nginx_version.ok_or_else(|| {
-            ServeError::Missing("No nginx version is active. Install one on Services.".into())
-        })?;
-        let prefix = config::nginx_prefix(version);
-        if !prefix.join("nginx.exe").is_file() {
-            return Err(ServeError::Missing(format!("nginx {version} is not installed.")));
-        }
-
         // A previous run may have been killed without stopping its workers,
         // leaving them holding ports and stale config. Clear them once.
         if !self.swept {
@@ -120,8 +119,45 @@ impl Supervisor {
             self.swept = true;
         }
 
-        let restart = self.write_configs(&prefix, sites)?;
-        self.ensure_nginx(version, &prefix)?;
+        // Write each worker's php.ini; the worker must restart if it changed.
+        let mut restart = Vec::new();
+        for site in sites.iter().filter(|site| site.worker) {
+            if self.write_php_ini(site)? {
+                restart.push(site.id);
+            }
+        }
+
+        // Drop workers for sites that no longer want one.
+        let wanted_workers: HashSet<i64> = sites
+            .iter()
+            .filter(|site| site.worker)
+            .map(|site| site.id)
+            .collect();
+        let stale: Vec<i64> = self
+            .workers
+            .keys()
+            .copied()
+            .filter(|id| !wanted_workers.contains(id))
+            .collect();
+        for id in stale {
+            self.forget_project(id);
+        }
+
+        if sites.iter().any(|site| site.vhost) {
+            let version = nginx_version.ok_or_else(|| {
+                ServeError::Missing("No nginx version is active. Install one on Services.".into())
+            })?;
+            let prefix = config::nginx_prefix(version);
+            if !prefix.join("nginx.exe").is_file() {
+                return Err(ServeError::Missing(format!("nginx {version} is not installed.")));
+            }
+            self.write_vhosts(&prefix, sites)?;
+            self.ensure_nginx(version, &prefix)?;
+        } else {
+            // Nothing is served, so nginx has nothing to do.
+            self.stop_nginx_only();
+        }
+
         self.reconcile_workers(sites, &restart)
     }
 
@@ -169,13 +205,16 @@ impl Supervisor {
 
     // ---- internals -------------------------------------------------------
 
-    fn write_configs(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<Vec<i64>> {
+    /// Write the server block for every served site, and drop the rest.
+    fn write_vhosts(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<()> {
         let vhosts = config::vhosts_dir(prefix);
         std::fs::create_dir_all(&vhosts)?;
-        let mut restart = Vec::new();
 
-        // Drop vhosts for projects that are no longer running.
-        let wanted: HashSet<&str> = sites.iter().map(|site| site.slug.as_str()).collect();
+        let wanted: HashSet<&str> = sites
+            .iter()
+            .filter(|site| site.vhost)
+            .map(|site| site.slug.as_str())
+            .collect();
         for entry in std::fs::read_dir(&vhosts)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
@@ -186,7 +225,7 @@ impl Supervisor {
             }
         }
 
-        for site in sites {
+        for site in sites.iter().filter(|site| site.vhost) {
             let port = self.port_for(site.id);
             let docroot = config::resolve_docroot(&site.root);
             let log_dir = config::site_logs(&site.slug);
@@ -208,16 +247,11 @@ impl Supervisor {
             }
             .render();
             std::fs::write(vhosts.join(format!("{}.conf", site.slug)), vhost)?;
-
-            if self.write_php_ini(site)? {
-                // The worker holds its ini in memory, so it must be restarted.
-                restart.push(site.id);
-            }
         }
 
         std::fs::create_dir_all(config::conf_dir(prefix))?;
         std::fs::write(config::main_config_path(prefix), config::main_config())?;
-        Ok(restart)
+        Ok(())
     }
 
     /// Write the per-project `php.ini`, returning whether it actually changed.
@@ -241,18 +275,8 @@ impl Supervisor {
     }
 
     fn reconcile_workers(&mut self, sites: &[SiteSpec], restart: &[i64]) -> Result<()> {
-        let wanted: HashSet<i64> = sites.iter().map(|site| site.id).collect();
-        let stale: Vec<i64> = self
-            .workers
-            .keys()
-            .copied()
-            .filter(|id| !wanted.contains(id))
-            .collect();
-        for id in stale {
-            self.forget_project(id);
-        }
-
-        for site in sites {
+        // Only sites that want a worker; the rest were forgotten in `sync`.
+        for site in sites.iter().filter(|site| site.worker) {
             let alive = self
                 .workers
                 .get_mut(&site.id)
@@ -516,6 +540,8 @@ mod tests {
             php_version: "8.3.35".to_string(),
             ssl_enabled: false,
             php_ini_overrides: String::new(),
+            vhost: true,
+            worker: true,
         };
 
         let mut supervisor = Supervisor::default();
@@ -570,6 +596,8 @@ mod tests {
                     php_version: php,
                     ssl_enabled: project.ssl_enabled,
                     php_ini_overrides: project.php_ini_overrides.clone(),
+                    vhost: true,
+                    worker: true,
                 })
             })
             .collect();
@@ -644,6 +672,8 @@ mod tests {
             php_version: "8.3.35".to_string(),
             ssl_enabled: true,
             php_ini_overrides: String::new(),
+            vhost: true,
+            worker: true,
         };
 
         let mut supervisor = Supervisor::default();

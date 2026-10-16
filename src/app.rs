@@ -166,8 +166,10 @@ pub struct Wisp {
     /// The runtime action in flight, keyed as `"php/8.4"` or `"nginx/1.27.0"`.
     busy_runtime: Option<String>,
 
-    /// Projects the user has asked to serve.
-    running: HashSet<i64>,
+    /// Projects whose server block nginx should serve.
+    nginx_on: HashSet<i64>,
+    /// Projects whose php-cgi worker should run.
+    php_on: HashSet<i64>,
     serve_status: serve::Status,
     serve_error: Option<String>,
     serve_busy: bool,
@@ -211,7 +213,8 @@ impl Wisp {
             catalog_error: None,
             catalog_fetched_at: None,
             busy_runtime: None,
-            running: HashSet::new(),
+            nginx_on: HashSet::new(),
+            php_on: HashSet::new(),
             serve_status: serve::Status::default(),
             serve_error: None,
             serve_busy: false,
@@ -517,7 +520,7 @@ impl Wisp {
 
                 // If the project is running and something that affects how it is
                 // served changed, apply it now. A rename alone changes nothing.
-                if self.running.contains(&saved_id) {
+                if self.is_on(saved_id) {
                     let after = self.projects.iter().find(|p| p.id == saved_id).cloned();
                     if let (Some(before), Some(after)) = (before, after) {
                         if service_config_changed(&before, &after) {
@@ -944,41 +947,64 @@ impl Wisp {
         .detach();
     }
 
-    /// The specs for the projects the user asked to run.
+    /// Whether a project is served or has a worker.
+    fn is_on(&self, id: i64) -> bool {
+        self.nginx_on.contains(&id) || self.php_on.contains(&id)
+    }
+
+    /// The specs for the projects the user asked to serve or run.
     fn site_specs(&self) -> std::result::Result<Vec<SiteSpec>, String> {
         let mut specs = Vec::new();
         for project in &self.projects {
-            if !self.running.contains(&project.id) {
+            let vhost = self.nginx_on.contains(&project.id);
+            let worker = self.php_on.contains(&project.id);
+            if !vhost && !worker {
                 continue;
             }
-            let Some(php) = project.php_version.clone().filter(|value| !value.is_empty()) else {
-                return Err(format!(
-                    "\"{}\" has no PHP version set. Choose one in Edit.",
-                    project.name
-                ));
-            };
-            if !runtime::php_cgi(&php).is_file() {
-                return Err(format!(
-                    "PHP {php} is not installed (needed by \"{}\").",
-                    project.name
-                ));
+
+            let php = project.php_version.clone().filter(|value| !value.is_empty());
+            if worker {
+                let Some(php) = php.clone() else {
+                    return Err(format!(
+                        "\"{}\" has no PHP version set. Choose one in Edit.",
+                        project.name
+                    ));
+                };
+                if !runtime::php_cgi(&php).is_file() {
+                    return Err(format!(
+                        "PHP {php} is not installed (needed by \"{}\").",
+                        project.name
+                    ));
+                }
             }
+
             specs.push(SiteSpec {
                 id: project.id,
                 slug: project.slug(),
                 domain: project.domain.clone(),
                 root: PathBuf::from(&project.root_path),
-                php_version: php,
+                php_version: php.unwrap_or_default(),
                 ssl_enabled: project.ssl_enabled,
                 php_ini_overrides: project.php_ini_overrides.clone(),
+                vhost,
+                worker,
             });
         }
         Ok(specs)
     }
 
-    fn toggle_project_running(&mut self, id: i64, cx: &mut Context<Self>) {
-        if !self.running.remove(&id) {
-            self.running.insert(id);
+    /// Turn this project's server block on or off.
+    fn toggle_nginx(&mut self, id: i64, cx: &mut Context<Self>) {
+        if !self.nginx_on.remove(&id) {
+            self.nginx_on.insert(id);
+        }
+        self.sync_server(cx);
+    }
+
+    /// Turn this project's PHP worker on or off.
+    fn toggle_php(&mut self, id: i64, cx: &mut Context<Self>) {
+        if !self.php_on.remove(&id) {
+            self.php_on.insert(id);
         }
         self.sync_server(cx);
     }
@@ -1089,7 +1115,7 @@ impl Wisp {
         let mut domains: Vec<String> = self
             .projects
             .iter()
-            .filter(|project| self.running.contains(&project.id))
+            .filter(|project| self.nginx_on.contains(&project.id))
             .map(|project| project.domain.clone())
             .collect();
         domains.sort();
@@ -1288,12 +1314,14 @@ impl Wisp {
 
     /// Serve every project that has a PHP version set.
     fn start_all(&mut self, cx: &mut Context<Self>) {
-        self.running = self
+        let ids: Vec<i64> = self
             .projects
             .iter()
             .filter(|project| project.php_version.is_some())
             .map(|project| project.id)
             .collect();
+        self.nginx_on = ids.iter().copied().collect();
+        self.php_on = ids.into_iter().collect();
         self.sync_server(cx);
         self.sync_hosts(cx);
     }
@@ -1303,7 +1331,8 @@ impl Wisp {
         if self.serve_busy {
             return;
         }
-        self.running.clear();
+        self.nginx_on.clear();
+        self.php_on.clear();
         {
             let server = cx.global_mut::<ServerGlobal>();
             server.0.stop_workers();
@@ -1319,7 +1348,7 @@ impl Wisp {
         if self.serve_busy {
             return;
         }
-        if self.running.is_empty() {
+        if self.nginx_on.is_empty() && self.php_on.is_empty() {
             self.start_all(cx);
             return;
         }
@@ -1327,13 +1356,16 @@ impl Wisp {
         self.sync_server(cx);
     }
 
-    /// Restart one project's worker (used by its Restart button).
-    fn restart_project(&mut self, id: i64, cx: &mut Context<Self>) {
+    /// Restart one of a project's two services.
+    fn restart_service(&mut self, id: i64, php: bool, cx: &mut Context<Self>) {
         if self.serve_busy {
             return;
         }
-        if let Some(project) = self.projects.iter().find(|project| project.id == id) {
-            let _ = std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
+        // Removing the ini makes the next sync restart just this worker.
+        if php {
+            if let Some(project) = self.projects.iter().find(|project| project.id == id) {
+                let _ = std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
+            }
         }
         self.sync_server(cx);
     }
@@ -1658,13 +1690,10 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child({
-                        let any_stopped = self
-                            .projects
-                            .iter()
-                            .any(|project| {
-                                project.php_version.is_some() && !self.running.contains(&project.id)
-                            });
-                        let any_running = !self.running.is_empty();
+                        let any_stopped = self.projects.iter().any(|project| {
+                            project.php_version.is_some() && !self.is_on(project.id)
+                        });
+                        let any_running = !self.nginx_on.is_empty() || !self.php_on.is_empty();
                         let busy = self.serve_busy;
 
                         div()
@@ -2076,90 +2105,53 @@ impl Wisp {
                 )),
         );
 
-        let is_running = self.serve_status.running_projects.contains(&id);
+        let worker_up = self.serve_status.running_projects.contains(&id);
         let nginx_up = self.serve_status.nginx_running;
-        let serve_actions: AnyElement = if self.serve_busy {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(Spinner::new().small())
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Applying\u{2026}"),
-                )
-                .into_any_element()
-        } else {
-            let mut buttons: Vec<AnyElement> = Vec::new();
-            if is_running {
-                buttons.push(
-                    Button::new("stop-project")
-                        .danger()
-                        .small()
-                        .icon(icon(IconName::Square))
-                        .label("Stop")
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_project_running(id, cx)
-                        }))
-                        .into_any_element(),
-                );
-                buttons.push(
-                    Button::new("restart-project")
-                        .outline()
-                        .small()
-                        .icon(icon(IconName::RotateCcw))
-                        .label("Restart")
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.restart_project(id, cx)
-                        }))
-                        .into_any_element(),
-                );
-            } else {
-                buttons.push(
-                    Button::new("start-project")
-                        .primary()
-                        .small()
-                        .icon(icon(IconName::Play))
-                        .label("Start")
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_project_running(id, cx)
-                        }))
-                        .into_any_element(),
-                );
-            }
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .children(buttons)
-                .into_any_element()
-        };
+        let nginx_on = self.nginx_on.contains(&id);
+        let php_on = self.php_on.contains(&id);
+        let busy = self.serve_busy;
 
         let services_header = section_header(
             "Services",
             "This project's nginx server block and its PHP worker.",
             cx,
         );
-        let nginx_state = if is_running {
+        let nginx_state = if !nginx_on {
+            "Not serving".to_string()
+        } else if nginx_up {
             format!("Serving {url}")
         } else {
-            "Not serving".to_string()
+            "Starting\u{2026}".to_string()
         };
-        let php_state = if is_running {
+        let php_state = if !php_on {
+            "Stopped".to_string()
+        } else if worker_up {
             format!("php-cgi {php}")
         } else {
-            "Stopped".to_string()
+            "Starting\u{2026}".to_string()
         };
-        let status_rows = div()
+        let rows = div()
             .flex()
             .flex_col()
             .p(px(8.))
-            .child(status_line("nginx", &nginx_state, is_running && nginx_up, cx))
-            .child(status_line("PHP", &php_state, is_running, cx));
+            .child(project_service_row(
+                "nginx",
+                &nginx_state,
+                nginx_on,
+                ProjectService::Nginx,
+                id,
+                busy,
+                cx,
+            ))
+            .child(project_service_row(
+                "PHP",
+                &php_state,
+                php_on,
+                ProjectService::Php,
+                id,
+                busy,
+                cx,
+            ));
         let services = ui::plate(
             cx,
             div()
@@ -2167,17 +2159,7 @@ impl Wisp {
                 .flex_col()
                 .gap_1()
                 .child(services_header)
-                .child(status_rows)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap_2()
-                        .px(px(18.))
-                        .pb(px(14.))
-                        .child(serve_actions),
-                ),
+                .child(rows),
         );
 
         let logs = self.logs_card(cx);
@@ -3190,19 +3172,79 @@ fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> imp
         .child(core)
 }
 
-/// A `label  value` row with a status dot, used by the per-project services.
-fn status_line(label: &str, value: &str, on: bool, cx: &App) -> impl IntoElement {
-    let color = if on {
+/// Which of a project's two services a row (or its buttons) refers to.
+#[derive(Clone, Copy)]
+enum ProjectService {
+    Nginx,
+    Php,
+}
+
+/// A project service row: status dot, name, status, and Start/Stop/Restart.
+fn project_service_row(
+    label: &str,
+    status: &str,
+    on: bool,
+    service: ProjectService,
+    id: i64,
+    busy: bool,
+    cx: &mut Context<Wisp>,
+) -> impl IntoElement {
+    let dot_color = if on {
         cx.theme().success
     } else {
         cx.theme().muted_foreground
     };
+
+    let mut actions: Vec<AnyElement> = Vec::new();
+    if on {
+        actions.push(
+            Button::new(format!("{label}-stop-{id}"))
+                .danger()
+                .small()
+                .icon(icon(IconName::Square))
+                .label("Stop")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _window, cx| match service {
+                    ProjectService::Nginx => this.toggle_nginx(id, cx),
+                    ProjectService::Php => this.toggle_php(id, cx),
+                }))
+                .into_any_element(),
+        );
+        actions.push(
+            Button::new(format!("{label}-restart-{id}"))
+                .outline()
+                .small()
+                .icon(icon(IconName::RotateCcw))
+                .label("Restart")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.restart_service(id, matches!(service, ProjectService::Php), cx)
+                }))
+                .into_any_element(),
+        );
+    } else {
+        actions.push(
+            Button::new(format!("{label}-start-{id}"))
+                .primary()
+                .small()
+                .icon(icon(IconName::Play))
+                .label("Start")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _window, cx| match service {
+                    ProjectService::Nginx => this.toggle_nginx(id, cx),
+                    ProjectService::Php => this.toggle_php(id, cx),
+                }))
+                .into_any_element(),
+        );
+    }
+
     div()
         .flex()
         .flex_row()
+        .flex_wrap()
         .items_center()
         .justify_between()
-        .gap_4()
+        .gap_3()
         .px(px(12.))
         .py(px(10.))
         .rounded_lg()
@@ -3212,7 +3254,7 @@ fn status_line(label: &str, value: &str, on: bool, cx: &App) -> impl IntoElement
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(ui::dot(color))
+                .child(ui::dot(dot_color))
                 .child(
                     div()
                         .text_sm()
@@ -3222,9 +3264,24 @@ fn status_line(label: &str, value: &str, on: bool, cx: &App) -> impl IntoElement
         )
         .child(
             div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(value.to_string()),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status.to_string()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .children(actions),
+                ),
         )
 }
 
