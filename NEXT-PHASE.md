@@ -22,16 +22,16 @@ Still open:
 ## Logs
 
 **Done:** padding and a bordered pane that fills the height, a working
-previous-match button, highlighted search hits, and a Wrap toggle.
+previous-match button, highlighted search hits, a Wrap toggle, filters in each
+source's own terms (4xx/5xx for access lines, Fatal/Warning/Notice for errors),
+Copy to the clipboard, a faint stripe on alternating rows, and the Follow, Wrap
+and case choice persisted in `settings.json`.
 
 Still open:
 
-- **Level and status filters** — errors/PHP by level, access by status code.
-  This was planned earlier and still is not built.
-- **Copy** — text cannot be selected out of the log yet.
-- **Row treatment** — alternating row tint or a separator, so a dense log is
-  easier to scan.
-- **Persist** the source, follow, wrap and case choices across restarts.
+- **Row stripe is barely visible** — `list_hover` turned out to be very subtle as
+  a row background. Needs a token with more presence, or a separator between
+  rows instead.
 
 ## php.ini editor
 
@@ -46,52 +46,58 @@ Overrides are a plain textarea in the project form. Wanted: a proper editor shee
 
 ## Runtimes
 
-- **`Progress`** for downloads — currently a spinner plus a label.
-- **`Skeleton`** while the catalog loads, instead of an empty page.
-- **`DataTable`** for the version lists (PHP lines, nginx builds) with columns for
-  version, size and install state.
-- **HTTPS tab** — list the issued certificates with subject, issuer and expiry,
-  instead of only the CA controls.
-- **Hosts tab** — show the managed `# wisp:start … # wisp:end` block and which
-  domains currently map where.
+**Done:** installs report real download progress from the server's
+`content-length` as a `Progress` bar with a percentage, the version list shows
+`Skeleton` placeholders while the catalog loads, the Hosts tab shows the managed
+`# wisp:start … # wisp:end` block as it is on disk, and the HTTPS tab lists each
+project's domain with how long ago its certificate was issued.
+
+Still open:
+
+- **`DataTable`** for the version lists — deliberately not done. `DataTable`
+  needs a full `TableDelegate` implementation per table, and the rows gained the
+  information that mattered (progress, install state) without it. Revisit if the
+  lists grow columns.
+- Nothing reads the certificates themselves (issuer, expiry); only file ages are
+  shown, because parsing `not_after` needs a date library that is not a
+  dependency yet.
 
 ## Shell and chrome
 
 **Done:** the sidebar footer lists Runtimes and Settings as proper full-width
 rows, the status bar dropped the duplicated hosts control and groups the
 all-sites buttons behind a separator, the project Services tab has its Start
-both / Restart / Stop both back alongside the per-service controls, and the
-Overview rows put their open buttons next to the value instead of at the far
-edge.
+both / Restart / Stop both back alongside the per-service controls, the Overview
+rows put their open buttons beside the value instead of at the far edge, the
+sidebar and content sit in an `h_resizable` pair, and the sidebar collapses to
+icons from a toggle in the top bar, remembered in `settings.json`.
 
 Still open:
 
-- **Resizable master–detail** — `h_resizable` so the sidebar width can be dragged,
-  with the width persisted.
-- **Collapsible sidebar** — `Sidebar` supports it; expose a toggle and remember
-  the state.
 - **Native menu bar** — the `native_menu` component, so Wisp has a real Windows
   menu (File / Project / Services / Help).
 - **First-run wizard** — `Stepper` over: set up managed hosts access, install a
   PHP version, create the first project.
 - **Tab strip styling** — the segmented `TabBar` draws a full-width container and
-  the last tab reads as its own box. Confirm whether that is the component's
-  intent or something to override.
+  the last tab reads as its own box. Confirmed by capture as the component's own
+  styling; decide whether to override it.
 
 ## Notifications
 
-`SystemNotification` for things worth seeing when the window is hidden:
-
-- a site failed to start (nginx or the worker exited),
-- the shared nginx stopped unexpectedly,
-- an update is available.
-
-Today these are in-app banners and toasts only, which are invisible in background
-mode.
+`gpui-kit` has no `SystemNotification`, so an OS notification needs a Win32
+balloon (`Shell_NotifyIcon` with `NIF_INFO`) or a toast, neither of which is
+plumbed. Today failures are in-app banners and toasts only, which are invisible in
+background mode. Decide whether to build the Win32 balloon through the tray icon,
+or to keep failures in the window and make the tray icon show that something is
+wrong.
 
 ## Tray
 
-- Add **Open logs folder** per site.
+**Done:** each site's submenu has Start, Stop, Restart, Open and Open config
+folder, and the whole menu is rebuilt from a published snapshot.
+
+Still open:
+
 - Reflect aggregate state in the icon itself (idle vs serving).
 
 ## Traps worth remembering
