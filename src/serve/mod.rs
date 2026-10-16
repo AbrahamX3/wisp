@@ -148,6 +148,23 @@ impl Supervisor {
         self.ports.remove(&id);
     }
 
+    /// Stop nginx, leaving the PHP workers running.
+    pub fn stop_nginx_only(&mut self) {
+        if let Some(version) = self.nginx_version.clone() {
+            let prefix = config::nginx_prefix(&version);
+            self.stop_nginx(&prefix);
+        }
+        self.nginx = None;
+        self.nginx_version = None;
+    }
+
+    /// Stop every PHP worker, keeping their ports and their running intent.
+    pub fn stop_workers(&mut self) {
+        for id in self.workers.keys().copied().collect::<Vec<_>>() {
+            self.stop_project(id);
+        }
+    }
+
     // ---- internals -------------------------------------------------------
 
     fn write_configs(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<Vec<i64>> {
@@ -518,6 +535,83 @@ mod tests {
         let body = body.expect("the site should respond");
         assert!(body.contains("Hello from Wisp"), "unexpected body: {body}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Runs the real sync against a real config directory, then hits each
+    /// project's domain. Point `WISP_CONFIG_DIR` at a Wisp data directory to use
+    /// it. Leaves the server running so it can be inspected.
+    /// Ignored by default: `WISP_CONFIG_DIR=... cargo test syncs_the_configured_projects -- --ignored`
+    #[test]
+    #[ignore = "runs the real sync against a real config directory"]
+    fn syncs_the_configured_projects() {
+        let Ok(dir) = std::env::var("WISP_CONFIG_DIR") else {
+            eprintln!("set WISP_CONFIG_DIR to a Wisp data directory; skipping");
+            return;
+        };
+        if !std::path::Path::new(&dir).join("wisp.db").is_file() {
+            eprintln!("no wisp.db under {dir}; skipping");
+            return;
+        }
+
+        let store = crate::db::Store::open().expect("the store should open");
+        let specs: Vec<SiteSpec> = store
+            .list_projects()
+            .expect("projects")
+            .into_iter()
+            .filter_map(|project| {
+                project.php_version.clone().map(|php| SiteSpec {
+                    id: project.id,
+                    slug: project.slug(),
+                    domain: project.domain.clone(),
+                    root: std::path::PathBuf::from(&project.root_path),
+                    php_version: php,
+                    ssl_enabled: project.ssl_enabled,
+                })
+            })
+            .collect();
+        assert!(!specs.is_empty(), "no projects with a PHP version");
+
+        let settings = crate::settings::Settings::load();
+        let mut supervisor = Supervisor::default();
+        supervisor
+            .sync(settings.active_nginx.as_deref(), &specs)
+            .expect("sync should start the server");
+
+        // Let nginx and the workers settle.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        for spec in &specs {
+            let scheme = if spec.ssl_enabled { "https" } else { "http" };
+            let port = if spec.ssl_enabled {
+                443
+            } else {
+                super::config::http_port()
+            };
+            let output = std::process::Command::new("curl.exe")
+                .args([
+                    "-skL",
+                    "-o",
+                    "NUL",
+                    "-w",
+                    "%{http_code}",
+                    "--resolve",
+                ])
+                .arg(format!("{}:{}:127.0.0.1", spec.domain, port))
+                .arg(format!("{scheme}://{}/", spec.domain))
+                .output()
+                .expect("curl should run");
+            let status = String::from_utf8_lossy(&output.stdout);
+            eprintln!("{} -> {status}", spec.domain);
+            assert!(
+                status.starts_with('2') || status.starts_with("30"),
+                "{} returned {status}",
+                spec.domain
+            );
+        }
+
+        // Stop what we started so the test does not leave processes behind.
+        supervisor.stop_all();
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
 
     /// Serves a project over HTTPS and verifies the certificate chain against

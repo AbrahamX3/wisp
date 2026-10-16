@@ -923,14 +923,6 @@ impl Wisp {
         self.sync_server(cx);
     }
 
-    fn stop_all_projects(&mut self, cx: &mut Context<Self>) {
-        if self.running.is_empty() {
-            return;
-        }
-        self.running.clear();
-        self.sync_server(cx);
-    }
-
     /// Reconcile nginx and the PHP workers with the requested set.
     fn sync_server(&mut self, cx: &mut Context<Self>) {
         if self.serve_busy {
@@ -1168,6 +1160,106 @@ impl Wisp {
                 .ok();
         })
         .detach();
+    }
+
+    // ---- service controls ------------------------------------------------
+
+    fn refresh_serve_status(&mut self, cx: &mut Context<Self>) {
+        self.serve_status = cx.global_mut::<ServerGlobal>().0.status();
+        cx.notify();
+    }
+
+    /// Start (or re-apply) the whole server: nginx plus the workers.
+    fn start_nginx(&mut self, cx: &mut Context<Self>) {
+        self.sync_server(cx);
+    }
+
+    fn stop_nginx(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        cx.global_mut::<ServerGlobal>().0.stop_nginx_only();
+        self.refresh_serve_status(cx);
+    }
+
+    fn restart_nginx(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        cx.global_mut::<ServerGlobal>().0.stop_nginx_only();
+        self.sync_server(cx);
+    }
+
+    /// Serve every project that has a PHP version set.
+    fn start_php(&mut self, cx: &mut Context<Self>) {
+        self.running = self
+            .projects
+            .iter()
+            .filter(|project| project.php_version.is_some())
+            .map(|project| project.id)
+            .collect();
+        self.sync_server(cx);
+        self.sync_hosts(cx);
+    }
+
+    fn stop_php(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        cx.global_mut::<ServerGlobal>().0.stop_workers();
+        self.refresh_serve_status(cx);
+    }
+
+    fn restart_php(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        self.force_worker_restart();
+        self.sync_server(cx);
+    }
+
+    /// Start everything: nginx and a worker for every project with PHP.
+    fn start_all(&mut self, cx: &mut Context<Self>) {
+        self.start_php(cx);
+    }
+
+    /// Stop everything: every worker and nginx.
+    fn stop_all(&mut self, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        self.running.clear();
+        {
+            let server = cx.global_mut::<ServerGlobal>();
+            server.0.stop_workers();
+            server.0.stop_nginx_only();
+        }
+        self.hosts_written.clear();
+        self.sync_hosts(cx);
+        self.refresh_serve_status(cx);
+    }
+
+    fn restart_all(&mut self, cx: &mut Context<Self>) {
+        self.stop_all(cx);
+        self.start_php(cx);
+    }
+
+    /// Restart one project's worker (used by its Restart button).
+    fn restart_project(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.serve_busy {
+            return;
+        }
+        if let Some(project) = self.projects.iter().find(|project| project.id == id) {
+            let _ = std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
+        }
+        self.sync_server(cx);
+    }
+
+    /// Delete every project's `php.ini` so the next sync restarts each worker.
+    fn force_worker_restart(&mut self) {
+        for project in &self.projects {
+            let _ = std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
+        }
     }
 
     // ---- settings toggles ------------------------------------------------
@@ -1490,7 +1582,7 @@ impl Wisp {
                             .icon(icon(IconName::Square))
                             .label("Stop all")
                             .on_click(
-                                cx.listener(|this, _, _window, cx| this.stop_all_projects(cx)),
+                                cx.listener(|this, _, _window, cx| this.stop_all(cx)),
                             )
                             .into_any_element()
                     })
@@ -1898,25 +1990,50 @@ impl Wisp {
                         .child("Applying\u{2026}"),
                 )
                 .into_any_element()
-        } else if is_running {
-            Button::new("stop-project")
-                .danger()
-                .small()
-                .icon(icon(IconName::Square))
-                .label("Stop")
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.toggle_project_running(id, cx)
-                }))
-                .into_any_element()
         } else {
-            Button::new("start-project")
-                .primary()
-                .small()
-                .icon(icon(IconName::Play))
-                .label("Start")
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.toggle_project_running(id, cx)
-                }))
+            let mut buttons: Vec<AnyElement> = Vec::new();
+            if is_running {
+                buttons.push(
+                    Button::new("stop-project")
+                        .danger()
+                        .small()
+                        .icon(icon(IconName::Square))
+                        .label("Stop")
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_project_running(id, cx)
+                        }))
+                        .into_any_element(),
+                );
+                buttons.push(
+                    Button::new("restart-project")
+                        .outline()
+                        .small()
+                        .icon(icon(IconName::RotateCcw))
+                        .label("Restart")
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.restart_project(id, cx)
+                        }))
+                        .into_any_element(),
+                );
+            } else {
+                buttons.push(
+                    Button::new("start-project")
+                        .primary()
+                        .small()
+                        .icon(icon(IconName::Play))
+                        .label("Start")
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_project_running(id, cx)
+                        }))
+                        .into_any_element(),
+                );
+            }
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(buttons)
                 .into_any_element()
         };
 
@@ -2027,6 +2144,7 @@ impl Wisp {
             column = column.child(self.vcrt_banner(vc, cx));
         }
 
+        column = column.child(self.services_card(cx));
         column = column.child(self.https_card(cx));
         column = column.child(self.php_section(cx));
         column = column.child(self.nginx_section(cx));
@@ -2040,6 +2158,42 @@ impl Wisp {
             .overflow_y_scroll()
             .child(column)
             .into_any_element()
+    }
+
+    /// nginx, PHP and "all services" controls for the Services page.
+    fn services_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let nginx_up = self.serve_status.nginx_running;
+        let workers = self.serve_status.running_projects.len();
+        let busy = self.serve_busy;
+
+        let header = section_header(
+            "Services",
+            "The whole server. Each project also has its own Start, Stop and Restart.",
+            cx,
+        );
+        let rows = div()
+            .flex()
+            .flex_col()
+            .p(px(8.))
+            .child(service_row(
+                "nginx",
+                if nginx_up { "Running" } else { "Stopped" },
+                nginx_up,
+                Service::Nginx,
+                busy,
+                cx,
+            ))
+            .child(service_row(
+                "PHP",
+                &format!("{workers} running"),
+                workers > 0,
+                Service::Php,
+                busy,
+                cx,
+            ))
+            .child(all_services_row(busy, cx));
+
+        ui::plate(cx, div().flex().flex_col().gap_1().child(header).child(rows))
     }
 
     fn https_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2377,6 +2531,170 @@ impl Render for Wisp {
                 .child(self.content(cx)),
         )
     }
+}
+
+/// Which service a control row (or its buttons) refer to.
+#[derive(Clone, Copy)]
+enum Service {
+    Nginx,
+    Php,
+}
+
+/// A service row: status dot, name, and Start / Stop / Restart.
+fn service_row(
+    label: &str,
+    status: &str,
+    running: bool,
+    service: Service,
+    busy: bool,
+    cx: &mut Context<Wisp>,
+) -> impl IntoElement {
+    let dot_color = if running {
+        cx.theme().success
+    } else {
+        cx.theme().muted_foreground
+    };
+
+    let mut actions: Vec<AnyElement> = Vec::new();
+    if running {
+        actions.push(
+            Button::new(format!("service-stop-{label}"))
+                .danger()
+                .small()
+                .icon(icon(IconName::Square))
+                .label("Stop")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _window, cx| match service {
+                    Service::Nginx => this.stop_nginx(cx),
+                    Service::Php => this.stop_php(cx),
+                }))
+                .into_any_element(),
+        );
+    } else {
+        actions.push(
+            Button::new(format!("service-start-{label}"))
+                .primary()
+                .small()
+                .icon(icon(IconName::Play))
+                .label("Start")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _window, cx| match service {
+                    Service::Nginx => this.start_nginx(cx),
+                    Service::Php => this.start_php(cx),
+                }))
+                .into_any_element(),
+        );
+    }
+    actions.push(
+        Button::new(format!("service-restart-{label}"))
+            .outline()
+            .small()
+            .icon(icon(IconName::RotateCcw))
+            .label("Restart")
+            .disabled(busy)
+            .on_click(cx.listener(move |this, _, _window, cx| match service {
+                Service::Nginx => this.restart_nginx(cx),
+                Service::Php => this.restart_php(cx),
+            }))
+            .into_any_element(),
+    );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded_lg()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(ui::dot(dot_color))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(label.to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(status.to_string()),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(actions),
+        )
+}
+
+///Start / Restart / Stop across nginx and every PHP worker.
+fn all_services_row(busy: bool, cx: &mut Context<Wisp>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded_lg()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child("All services"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("all-start")
+                        .primary()
+                        .small()
+                        .icon(icon(IconName::Play))
+                        .label("Start all")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _window, cx| this.start_all(cx))),
+                )
+                .child(
+                    Button::new("all-restart")
+                        .outline()
+                        .small()
+                        .icon(icon(IconName::RotateCcw))
+                        .label("Restart all")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _window, cx| this.restart_all(cx))),
+                )
+                .child(
+                    Button::new("all-stop")
+                        .danger()
+                        .small()
+                        .icon(icon(IconName::Square))
+                        .label("Stop all")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _window, cx| this.stop_all(cx))),
+                ),
+        )
 }
 
 /// A top-level sidebar destination.
