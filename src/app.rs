@@ -2403,28 +2403,10 @@ impl Wisp {
                 cx,
             ));
 
-        let header = SidebarHeader::new().child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .w_full()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(div().size(px(22.)).child(img(APP_ICON).size(px(22.))))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Wisp"),
-                        ),
-                )
-                .child(Input::new(&self.project_filter)),
-        );
+        // The window already shows the Wisp mark and name above, so the sidebar
+        // header is only the search field.
+        let header =
+            SidebarHeader::new().child(div().w_full().child(Input::new(&self.project_filter)));
 
         Sidebar::new("wisp-sidebar")
             .header(header)
@@ -2468,16 +2450,7 @@ impl Wisp {
         let id = project.id;
         let name = project.name.clone();
         let domain = project.domain.clone();
-        let root = project.root_path.clone();
-        let php = project
-            .php_version
-            .clone()
-            .unwrap_or_else(|| "Not set".to_string());
         let ssl = project.ssl_enabled;
-        let slug = project.slug();
-        let url = format!("{}{}", scheme_prefix(ssl), domain);
-        let config_dir = crate::config::sites().join(&slug);
-        let config_display = config_dir.to_string_lossy().to_string();
 
         let header = div()
             .flex()
@@ -2542,7 +2515,67 @@ impl Wisp {
                     ),
             );
 
-        let details = ui::section(
+        let tabs = TabBar::new("project-tabs")
+            .segmented()
+            .selected_index(self.project_tab.index())
+            .children([
+                Tab::new().label("Overview"),
+                Tab::new().label("Services"),
+                Tab::new().label("Logs"),
+                Tab::new().label("Settings"),
+            ])
+            .on_click(cx.listener(|this, index, _window, cx| {
+                let tab = ProjectTab::from_index(*index);
+                this.project_tab = tab;
+                if tab == ProjectTab::Logs {
+                    this.refresh_logs(cx);
+                }
+                cx.notify();
+            }));
+
+        // Only the tab that is showing is built: a full project page is deep
+        // enough that materialising all four would be wasteful every frame.
+        let body: AnyElement = match self.project_tab {
+            ProjectTab::Overview => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(self.project_details(project, cx))
+                .child(self.resources_card(cx))
+                .into_any_element(),
+            ProjectTab::Services => self.project_services(project, cx),
+            ProjectTab::Logs => self.logs_card(cx).into_any_element(),
+            ProjectTab::Settings => self.project_settings(project, window, cx),
+        };
+
+        div()
+            .id("content")
+            .flex()
+            .flex_col()
+            .size_full()
+            .gap_4()
+            .p(px(28.))
+            .overflow_y_scrollbar()
+            .child(header)
+            .child(tabs)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The Overview tab: the project's configuration at a glance.
+    fn project_details(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = project.root_path.clone();
+        let url = format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain);
+        let php = project
+            .php_version
+            .clone()
+            .unwrap_or_else(|| "Not set".to_string());
+        let config_display = crate::config::sites()
+            .join(project.slug())
+            .to_string_lossy()
+            .to_string();
+
+        ui::section(
             cx,
             div()
                 .flex()
@@ -2584,7 +2617,15 @@ impl Wisp {
                         })),
                     cx,
                 ))
-                .child(detail_row("HTTPS", if ssl { "Trusted certificate" } else { "Off" }, cx))
+                .child(detail_row(
+                    "HTTPS",
+                    if project.ssl_enabled {
+                        "Trusted certificate"
+                    } else {
+                        "Off"
+                    },
+                    cx,
+                ))
                 .child(detail_row("PHP", &php, cx))
                 .child(detail_row_action(
                     "Config folder",
@@ -2600,15 +2641,24 @@ impl Wisp {
                         })),
                     cx,
                 )),
-        );
+        )
+    }
 
+    /// The Services tab: this project's nginx server block and its PHP worker.
+    fn project_services(&self, project: &Project, cx: &mut Context<Self>) -> AnyElement {
+        let id = project.id;
+        let url = format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain);
+        let php = project
+            .php_version
+            .clone()
+            .unwrap_or_else(|| "Not set".to_string());
         let worker_up = self.serve_status.running_projects.contains(&id);
         let nginx_up = self.serve_status.nginx_running;
         let nginx_on = self.nginx_on.contains(&id);
         let php_on = self.php_on.contains(&id);
         let busy = self.serve_busy;
 
-        let services_header = section_header(
+        let header = section_header(
             "Services",
             "This project's nginx server block and its PHP worker.",
             cx,
@@ -2649,61 +2699,17 @@ impl Wisp {
                 busy,
                 cx,
             ));
-        let services = ui::section(
+
+        ui::section(
             cx,
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(services_header)
+                .child(header)
                 .child(rows),
-        );
-
-        let logs = self.logs_card(cx);
-
-        let tabs = TabBar::new("project-tabs")
-            .segmented()
-            .selected_index(self.project_tab.index())
-            .children([
-                Tab::new().label("Overview"),
-                Tab::new().label("Services"),
-                Tab::new().label("Logs"),
-                Tab::new().label("Settings"),
-            ])
-            .on_click(cx.listener(|this, index, _window, cx| {
-                let tab = ProjectTab::from_index(*index);
-                this.project_tab = tab;
-                if tab == ProjectTab::Logs {
-                    this.refresh_logs(cx);
-                }
-                cx.notify();
-            }));
-
-        let body: AnyElement = match self.project_tab {
-            ProjectTab::Overview => div()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(details)
-                .child(self.resources_card(cx))
-                .into_any_element(),
-            ProjectTab::Services => services.into_any_element(),
-            ProjectTab::Logs => logs.into_any_element(),
-            ProjectTab::Settings => self.project_settings(project, window, cx),
-        };
-
-        div()
-            .id("content")
-            .flex()
-            .flex_col()
-            .size_full()
-            .gap_4()
-            .p(px(28.))
-            .overflow_y_scrollbar()
-            .child(header)
-            .child(tabs)
-            .child(body)
-            .into_any_element()
+        )
+        .into_any_element()
     }
 
     /// A live CPU/RAM readout with five-minute sparklines for the Overview tab.
@@ -3144,7 +3150,6 @@ impl Wisp {
         } else {
             format!("{total} lines")
         };
-
         let header = section_header("Logs", "The tail of this project's logs.", cx);
         let toolbar = Toolbar::new("logs-toolbar")
             .contents(sources)
@@ -3702,6 +3707,10 @@ impl Render for Wisp {
             root = root.child(banner);
         }
 
+        let sidebar = self.sidebar(cx);
+        let content = self.content(window, cx);
+        let status = self.status_bar(window, cx);
+
         let page = root
             .child(
                 div()
@@ -3710,17 +3719,17 @@ impl Render for Wisp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(self.sidebar(cx))
+                    .child(sidebar)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
                             .h_full()
                             .overflow_hidden()
-                            .child(self.content(window, cx)),
+                            .child(content),
                     ),
             )
-            .child(self.status_bar(window, cx));
+            .child(status);
 
         if self.palette_open {
             page.child(self.palette_overlay(window, cx))

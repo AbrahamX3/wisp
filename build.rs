@@ -19,6 +19,8 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.svg");
     println!("cargo:rerun-if-changed=build.rs");
 
+    set_main_thread_stack();
+
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     let ico_path = out_dir.join("icon.ico");
     let tray_path = out_dir.join("tray-32.rgba");
@@ -27,6 +29,25 @@ fn main() {
 
     #[cfg(windows)]
     embed_windows_metadata(&ico_path);
+}
+
+/// Reserve a generous stack for the main thread.
+///
+/// MSVC's default is 1 MiB, which a GPUI window is not obliged to fit inside: the
+/// element tree is built by deeply nested generic builders, and a debug build
+/// keeps every one of those temporaries on the stack. Rendering a real screen was
+/// enough to exhaust it and abort with `STATUS_STACK_OVERFLOW`.
+fn set_main_thread_stack() {
+    /// 8 MiB, matching what the toolbar and sidebar rendering expects.
+    const RESERVE: u32 = 8 * 1024 * 1024;
+
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let arg = if env == "msvc" {
+        format!("/STACK:{RESERVE}")
+    } else {
+        format!("-Wl,--stack,{RESERVE}")
+    };
+    println!("cargo:rustc-link-arg-bins={arg}");
 }
 
 /// Rasterise the SVG and write the `.ico` and the tray pixels.
