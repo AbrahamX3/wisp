@@ -13,6 +13,7 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
@@ -62,6 +63,11 @@ const CATALOG_TTL_SECS: u64 = 12 * 60 * 60;
 
 /// CPU/RAM samples kept for the sparklines: 150 at 2s each is five minutes.
 const METRIC_SAMPLES: usize = 150;
+
+actions!(
+    wisp,
+    [TogglePalette, GoRuntimes, GoSettings, NewProject]
+);
 
 /// Seconds since the Unix epoch.
 fn now_unix() -> u64 {
@@ -244,6 +250,9 @@ pub struct Wisp {
     tray_sites: Vec<tray::TraySite>,
     /// CPU and RAM percentages, one per 2s sample, capped at five minutes.
     metrics: VecDeque<(f64, f64)>,
+    /// The Ctrl-K command palette and whether it is showing.
+    palette: Entity<CommandState>,
+    palette_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -260,6 +269,7 @@ impl Wisp {
         // Filters the project list; typing re-renders the sidebar.
         let project_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
         let log_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find in log"));
+        let palette = cx.new(|cx| CommandState::new(window, cx));
         let _subscriptions = vec![
             cx.subscribe_in(
                 &project_filter,
@@ -316,6 +326,8 @@ impl Wisp {
             log_scroll: ScrollHandle::default(),
             tray_sites: Vec::new(),
             metrics: VecDeque::new(),
+            palette,
+            palette_open: false,
             _subscriptions,
         };
         this.reload(cx);
@@ -2185,6 +2197,17 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child(
+                        Button::new("open-palette")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::Search))
+                            .label("Search")
+                            .tooltip("Search or run a command (Ctrl-K)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_palette(window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("new-project")
                             .primary()
                             .small()
@@ -2683,6 +2706,107 @@ impl Wisp {
                 .child(body),
         )
         .into_any_element()
+    }
+
+    /// Show or hide the command palette, focusing its field when it appears.
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// The Ctrl-K palette: destinations, project shortcuts and bulk actions.
+    fn palette_overlay(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut items: Vec<CommandItem> = vec![
+            CommandItem::new()
+                .label("Open Runtimes")
+                .icon(IconName::Server)
+                .action(Box::new(GoRuntimes)),
+            CommandItem::new()
+                .label("Open Settings")
+                .icon(IconName::Settings)
+                .action(Box::new(GoSettings)),
+            CommandItem::new()
+                .label("New project")
+                .icon(IconName::FolderPlus)
+                .action(Box::new(NewProject)),
+            CommandItem::new()
+                .label("Start all sites")
+                .icon(IconName::Play)
+                .action(Box::new(tray::StartAll)),
+            CommandItem::new()
+                .label("Stop all sites")
+                .icon(IconName::CircleStop)
+                .action(Box::new(tray::StopAll)),
+            CommandItem::new()
+                .label("Restart all sites")
+                .icon(IconName::RefreshCw)
+                .action(Box::new(tray::RestartAll)),
+        ];
+        for project in &self.projects {
+            items.push(
+                CommandItem::new()
+                    .label(format!("Open {}", project.name))
+                    .icon(IconName::Globe)
+                    .keywords([project.domain.clone()])
+                    .action(Box::new(tray::SiteAction {
+                        id: project.id,
+                        command: tray::SiteCommand::Open,
+                    })),
+            );
+        }
+
+        let on_cancel = {
+            let entity = cx.entity();
+            move |_window: &mut Window, cx: &mut App| {
+                entity.update(cx, |this, cx| {
+                    this.palette_open = false;
+                    cx.notify();
+                });
+            }
+        };
+        let on_confirm = {
+            let entity = cx.entity();
+            move |_path, _window: &mut Window, cx: &mut App| {
+                entity.update(cx, |this, cx| {
+                    this.palette_open = false;
+                    cx.notify();
+                });
+            }
+        };
+
+        let command = Command::new(&self.palette)
+            .placeholder("Search Wisp\u{2026}")
+            .items(items)
+            .on_cancel(on_cancel)
+            .on_confirm(on_confirm);
+
+        div()
+            .id("palette-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(88.))
+            .bg(hsla(0.0, 0.0, 0.0, 0.35))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _window, cx| {
+                    this.palette_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("palette-card")
+                    .w(px(560.))
+                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    .child(command),
+            )
+            .into_any_element()
     }
 
     /// The Settings tab: the project form in place, or a summary that opens it.
@@ -3477,11 +3601,25 @@ impl Render for Wisp {
         self.publish_tray(cx);
 
         let mut root = div()
+            .id("wisp-root")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
+                this.toggle_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoRuntimes, _window, cx| {
+                this.goto(Screen::Services, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoSettings, _window, cx| {
+                this.goto(Screen::Settings, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewProject, window, cx| {
+                this.open_editor(None, window, cx);
+            }))
             .child(self.top_bar(cx));
 
         if let Some(message) = self.error.clone() {
@@ -3508,24 +3646,31 @@ impl Render for Wisp {
             root = root.child(banner);
         }
 
-        root.child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_hidden()
-                .child(self.sidebar(cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .h_full()
-                        .overflow_hidden()
-                        .child(self.content(window, cx)),
-                ),
-        )
-        .child(self.status_bar(window, cx))
+        let page = root
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.sidebar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(self.content(window, cx)),
+                    ),
+            )
+            .child(self.status_bar(window, cx));
+
+        if self.palette_open {
+            page.child(self.palette_overlay(window, cx))
+        } else {
+            page
+        }
     }
 }
 

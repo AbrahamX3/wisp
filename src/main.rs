@@ -77,6 +77,7 @@ fn main() {
             fonts::install(cx);
 
             // Tray actions are ordinary GPUI actions, dispatched to the app.
+            cx.bind_keys([KeyBinding::new("ctrl-k", app::TogglePalette, None)]);
             let _ = cx.on_action(|_: &tray::OpenWindow, _cx: &mut App| {
                 platform::show_window(platform::WINDOW_TITLE, true);
             });
