@@ -178,6 +178,7 @@ pub fn php_ini(
     error_log: &Path,
     overrides: &str,
 ) -> String {
+    let lookup_dir = extension_dir.to_path_buf();
     let extension_dir = nginx_path(extension_dir);
     let error_log = nginx_path(error_log);
 
@@ -185,7 +186,7 @@ pub fn php_ini(
         "; ---- Wisp -------------------------------------------------------------\n\
          extension_dir=\"{extension_dir}\"\n"
     );
-    out.push_str(&enable_extensions(template));
+    out.push_str(&enable_extensions(template, &lookup_dir));
     out.push_str(&format!(
         "\n\
 ; ---- Wisp overrides -------------------------------------------------------\n\
@@ -218,15 +219,15 @@ max_execution_time=120\n\
 /// fails to load. Everything else the build offers is enabled.
 const DISABLED_EXTENSIONS: &[&str] = &["snmp", "pdo_firebird"];
 
-/// Uncomment the template's `;extension=` lines, so a project behaves like a
-/// full development build (intl, mbstring, curl, gd, pdo_mysql, …), except the
-/// few in [`DISABLED_EXTENSIONS`].
-fn enable_extensions(template: &str) -> String {
+/// Uncomment the template's `;extension=` lines, but only for extensions the
+/// runtime actually ships (its `ext` folder has the DLL) and that are not in
+/// [`DISABLED_EXTENSIONS`]. Older builds list extensions they do not include.
+fn enable_extensions(template: &str, extension_dir: &Path) -> String {
     let mut out = String::with_capacity(template.len());
     for line in template.lines() {
         if let Some(rest) = line.strip_prefix(";extension=") {
             let name = rest.trim();
-            if !DISABLED_EXTENSIONS.contains(&name) {
+            if !DISABLED_EXTENSIONS.contains(&name) && ships_extension(extension_dir, name) {
                 out.push_str("extension=");
                 out.push_str(name);
                 out.push('\n');
@@ -237,6 +238,12 @@ fn enable_extensions(template: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Whether the runtime's `ext` folder contains the DLL for `extension=<name>`.
+fn ships_extension(extension_dir: &Path, name: &str) -> bool {
+    extension_dir.join(format!("php_{name}.dll")).is_file()
+        || extension_dir.join(format!("{name}.dll")).is_file()
 }
 
 /// The document root for a project: `public/` when that is how the app is laid
@@ -306,25 +313,32 @@ mod tests {
 
     #[test]
     fn extensions_are_enabled_after_the_extension_dir() {
+        // A fake runtime whose ext folder ships only intl and curl.
+        let ext = std::env::temp_dir().join("wisp-ext-test");
+        let _ = std::fs::remove_dir_all(&ext);
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("php_intl.dll"), b"").unwrap();
+        std::fs::write(ext.join("php_curl.dll"), b"").unwrap();
+
         let ini = php_ini(
-            ";extension=intl\n;extension=curl\n;extension=snmp\n;extension=pdo_firebird\nmemory_limit=128M\n",
-            Path::new(r"C:\php\ext"),
+            ";extension=intl\n;extension=curl\n;extension=oci8_12c\n;extension=snmp\n;extension=pdo_firebird\nmemory_limit=128M\n",
+            &ext,
             Path::new(r"C:\logs\php-error.log"),
             "",
         );
         assert!(ini.lines().any(|line| line.trim() == "extension=intl"));
         assert!(ini.lines().any(|line| line.trim() == "extension=curl"));
         assert!(!ini.contains(";extension=intl"), "intl is uncommented");
-        // The problem extensions stay commented out.
+        // Not shipped by this build, or denylisted.
         assert!(
-            !ini.lines().any(|line| line.trim() == "extension=snmp"),
-            "snmp stays disabled"
+            !ini.lines().any(|line| line.trim() == "extension=oci8_12c"),
+            "an extension without a DLL stays off"
         );
+        assert!(!ini.lines().any(|line| line.trim() == "extension=snmp"));
         assert!(
             !ini
                 .lines()
-                .any(|line| line.trim() == "extension=pdo_firebird"),
-            "pdo_firebird stays disabled"
+                .any(|line| line.trim() == "extension=pdo_firebird")
         );
         let dir_at = ini.find("extension_dir=").expect("extension_dir is set");
         let intl_at = ini.find("extension=intl").expect("intl is enabled");
@@ -332,6 +346,8 @@ mod tests {
             dir_at < intl_at,
             "extension_dir must come before any extension"
         );
+
+        let _ = std::fs::remove_dir_all(&ext);
     }
 
     #[test]

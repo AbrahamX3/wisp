@@ -265,6 +265,7 @@ impl Wisp {
 
     fn select(&mut self, id: i64, cx: &mut Context<Self>) {
         self.selected = Some(id);
+        self.screen = Screen::Projects;
         cx.notify();
     }
 
@@ -354,7 +355,7 @@ impl Wisp {
         });
 
         let entity = cx.entity();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let php_versions = entity.read(cx).installed_php_versions();
             let Some(editor) = entity.read(cx).editor.as_ref() else {
                 return dialog;
@@ -371,7 +372,7 @@ impl Wisp {
                 .title(title)
                 .w(px(580.))
                 .close_button(true)
-                .child(editor_form(editor, &entity, error, &php_versions, cx))
+                .child(editor_form(editor, &entity, error, &php_versions, window, cx))
                 .footer(editor_footer(entity.clone(), is_new))
         });
     }
@@ -511,6 +512,7 @@ impl Wisp {
             Ok(saved_id) => {
                 self.editor = None;
                 self.selected = Some(saved_id);
+                self.screen = Screen::Projects;
                 self.reload(cx);
 
                 // If the project is running and something that affects how it is
@@ -1622,6 +1624,7 @@ impl Wisp {
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_4()
@@ -1819,68 +1822,46 @@ impl Wisp {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
+        let on_services = self.screen == Screen::Services;
 
-        let nav = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p(px(10.))
-            .child(nav_item(
-                "Projects",
-                IconName::FolderTree,
-                self.screen == Screen::Projects,
-                Screen::Projects,
-                self.projects.len(),
-                cx,
-            ))
-            .child(nav_item(
-                "Services",
-                IconName::Server,
-                self.screen == Screen::Services,
-                Screen::Services,
-                self.runtimes.len(),
-                cx,
-            ));
-
-        let body = if self.screen == Screen::Projects {
-            if self.projects.is_empty() {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .px(px(20.))
-                    .py(px(40.))
-                    .text_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("No projects yet"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Add one to serve it on a .test domain."),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .id("project-list")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p(px(10.))
-                    .overflow_y_scroll()
-                    .children(self.projects.iter().map(|project| {
-                        let is_selected = selected == Some(project.id);
-                        project_row(project, is_selected, cx)
-                    }))
-                    .into_any_element()
-            }
+        // The project list is always visible; the content pane shows the
+        // selected project. Services is a separate destination at the bottom.
+        let list = if self.projects.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .px(px(20.))
+                .py(px(30.))
+                .text_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No projects yet"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Add one to serve it on a domain."),
+                )
+                .into_any_element()
         } else {
-            div().into_any_element()
+            div()
+                .id("project-list")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p(px(10.))
+                .overflow_y_scroll()
+                .min_h(px(0.))
+                .children(self.projects.iter().map(|project| {
+                    let is_selected = selected == Some(project.id) && !on_services;
+                    project_row(project, is_selected, cx)
+                }))
+                .into_any_element()
         };
 
         div()
@@ -1892,9 +1873,38 @@ impl Wisp {
             .border_r_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().muted)
-            .child(nav)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("PROJECTS"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.projects.len().to_string()),
+                    ),
+            )
+            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(list))
             .child(div().h(px(1.)).w_full().bg(cx.theme().border))
-            .child(div().flex_1().overflow_hidden().child(body))
+            .child(div().p(px(10.)).child(nav_item(
+                "Services",
+                IconName::Server,
+                on_services,
+                Screen::Services,
+                self.runtimes.len(),
+                cx,
+            )))
     }
 
     fn content(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1946,6 +1956,7 @@ impl Wisp {
         let header = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_start()
             .justify_between()
             .gap_4()
@@ -2192,6 +2203,7 @@ impl Wisp {
         let header = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_start()
             .justify_between()
             .gap_4()
@@ -2294,6 +2306,7 @@ impl Wisp {
         let toolbar = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_3()
@@ -2332,22 +2345,22 @@ impl Wisp {
                 .child("Nothing logged yet.")
                 .into_any_element()
         } else {
+            let lines = self
+                .log_lines
+                .iter()
+                .map(|line| div().whitespace_nowrap().child(line.clone()));
             div()
                 .id("log-lines")
-                .flex()
-                .flex_col()
-                .gap_1()
+                .w_full()
+                .min_w(px(0.))
+                .h(px(220.))
+                .overflow_x_scroll()
+                .overflow_y_scroll()
                 .px(px(18.))
                 .pb(px(16.))
-                .h(px(220.))
-                .overflow_y_scroll()
                 .font_family(cx.theme().mono_font_family.clone())
                 .text_xs()
-                .children(
-                    self.log_lines
-                        .iter()
-                        .map(|line| div().whitespace_nowrap().child(line.clone())),
-                )
+                .child(div().flex().flex_col().gap_1().children(lines))
                 .into_any_element()
         };
 
@@ -2777,9 +2790,17 @@ impl Render for Wisp {
                 .flex()
                 .flex_row()
                 .flex_1()
+                .min_h(px(0.))
                 .overflow_hidden()
                 .child(self.sidebar(cx))
-                .child(self.content(cx)),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .overflow_hidden()
+                        .child(self.content(cx)),
+                ),
         )
     }
 }
@@ -3267,8 +3288,13 @@ fn editor_form(
     entity: &Entity<Wisp>,
     error: Option<String>,
     php_versions: &[String],
+    window: &mut Window,
     cx: &App,
 ) -> impl IntoElement {
+    // Keep the dialog inside the window; the form scrolls when it is taller.
+    let cap = window.bounds().size.height - px(200.);
+    let cap = if cap < px(220.) { px(220.) } else { cap };
+
     let php_label = editor
         .php_version
         .clone()
@@ -3337,7 +3363,7 @@ fn editor_form(
         .child(
             Field::new()
                 .label("Root folder")
-                .description("Point at the project root; public/ is served when it exists.")
+                .description("Public/ is served when present.")
                 .child(
                     div()
                         .flex()
@@ -3432,8 +3458,8 @@ fn editor_form(
         .child(
             Field::new()
                 .label("php.ini overrides")
-                .description("One directive per line, applied last so they win. The file is regenerated on every start.")
-                .child(Textarea::new(&editor.overrides).h(px(120.))),
+                .description("One directive per line, applied last.")
+                .child(Textarea::new(&editor.overrides).h(px(96.))),
         );
 
     if let Some(message) = error {
@@ -3446,7 +3472,11 @@ fn editor_form(
         );
     }
 
-    form
+    div()
+        .id("editor-scroll")
+        .max_h(cap)
+        .overflow_y_scroll()
+        .child(form)
 }
 
 /// The dialog footer: Cancel and Save.
