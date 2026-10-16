@@ -27,6 +27,7 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
@@ -95,6 +96,35 @@ enum Screen {
     Projects,
     Services,
     Settings,
+}
+
+/// Which pane of a project's detail is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectTab {
+    Overview,
+    Services,
+    Logs,
+    Settings,
+}
+
+impl ProjectTab {
+    fn index(self) -> usize {
+        match self {
+            ProjectTab::Overview => 0,
+            ProjectTab::Services => 1,
+            ProjectTab::Logs => 2,
+            ProjectTab::Settings => 3,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => ProjectTab::Services,
+            2 => ProjectTab::Logs,
+            3 => ProjectTab::Settings,
+            _ => ProjectTab::Overview,
+        }
+    }
 }
 
 /// Process-wide owner of nginx and the PHP workers, so the app-quit hook can
@@ -196,6 +226,8 @@ pub struct Wisp {
     /// Which log the project detail shows, and its tail.
     log_kind: LogKind,
     log_lines: Vec<String>,
+    /// Which pane of a project's detail is showing.
+    project_tab: ProjectTab,
     /// Filters the sidebar's project list.
     project_filter: Entity<InputState>,
     /// Log search, follow and scroll state.
@@ -268,6 +300,7 @@ impl Wisp {
             log_kind: LogKind::Php,
             log_lines: Vec::new(),
             project_filter,
+            project_tab: ProjectTab::Overview,
             log_filter,
             log_case: false,
             log_follow: true,
@@ -316,6 +349,11 @@ impl Wisp {
     }
 
     fn select(&mut self, id: i64, cx: &mut Context<Self>) {
+        // A new project starts back on Overview, and any in-flight edit is lost.
+        if self.selected != Some(id) {
+            self.project_tab = ProjectTab::Overview;
+            self.editor = None;
+        }
         self.selected = Some(id);
         self.screen = Screen::Projects;
         cx.notify();
@@ -405,6 +443,13 @@ impl Wisp {
             error: None,
             _subscriptions: vec![app_sub, domain_sub],
         });
+
+        if existing.is_some() {
+            // Editing an existing project renders in place on its Settings tab.
+            self.project_tab = ProjectTab::Settings;
+            cx.notify();
+            return;
+        }
 
         let entity = cx.entity();
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -2196,15 +2241,15 @@ impl Wisp {
             .footer(footer)
     }
 
-    fn content(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.screen {
-            Screen::Projects => self.projects_content(cx),
+            Screen::Projects => self.projects_content(window, cx),
             Screen::Services => self.services_content(cx),
             Screen::Settings => self.settings_content(cx),
         }
     }
 
-    fn projects_content(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn projects_content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(project) = self.selected_project() else {
             return div()
                 .flex()
@@ -2425,18 +2470,184 @@ impl Wisp {
 
         let logs = self.logs_card(cx);
 
+        let tabs = TabBar::new("project-tabs")
+            .segmented()
+            .selected_index(self.project_tab.index())
+            .children([
+                Tab::new().label("Overview"),
+                Tab::new().label("Services"),
+                Tab::new().label("Logs"),
+                Tab::new().label("Settings"),
+            ])
+            .on_click(cx.listener(|this, index, _window, cx| {
+                let tab = ProjectTab::from_index(*index);
+                this.project_tab = tab;
+                if tab == ProjectTab::Logs {
+                    this.refresh_logs(cx);
+                }
+                cx.notify();
+            }));
+
+        let body: AnyElement = match self.project_tab {
+            ProjectTab::Overview => details.into_any_element(),
+            ProjectTab::Services => services.into_any_element(),
+            ProjectTab::Logs => logs.into_any_element(),
+            ProjectTab::Settings => self.project_settings(project, window, cx),
+        };
+
         div()
             .id("content")
             .flex()
             .flex_col()
             .size_full()
-            .gap_6()
+            .gap_4()
             .p(px(28.))
             .overflow_y_scrollbar()
             .child(header)
-            .child(details)
-            .child(services)
-            .child(logs)
+            .child(tabs)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The Settings tab: the project form in place, or a summary that opens it.
+    fn project_settings(
+        &self,
+        project: &Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(editor) = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.id == Some(project.id))
+        {
+            let entity = cx.entity();
+            let error = editor.error.clone();
+            let php_versions = self.installed_php_versions();
+            return div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(editor_form(
+                    editor,
+                    &entity,
+                    error,
+                    &php_versions,
+                    window,
+                    cx,
+                ))
+                .child(inline_editor_footer(entity))
+                .into_any_element();
+        }
+
+        let id = project.id;
+        let php = project
+            .php_version
+            .clone()
+            .unwrap_or_else(|| "Not set".to_string());
+        let overrides = project.php_ini_overrides.clone();
+
+        let summary = ui::section(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .p(px(18.))
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Project settings"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Name, folder, domain, PHP version and HTTPS are edited together."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            Button::new("settings-edit")
+                                .primary()
+                                .small()
+                                .icon(icon(IconName::SquarePen))
+                                .label("Edit project")
+                                .on_click({
+                                    let entity = cx.entity();
+                                    move |_, window, cx| {
+                                        let existing = entity
+                                            .read(cx)
+                                            .projects
+                                            .iter()
+                                            .find(|p| p.id == id)
+                                            .cloned();
+                                        entity.update(cx, |this, cx| {
+                                            this.open_editor(existing, window, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("settings-remove")
+                                .danger()
+                                .small()
+                                .icon(icon(IconName::Trash))
+                                .label("Remove")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_delete(id, window, cx)
+                                })),
+                        ),
+                )
+                .child(detail_row("PHP", &php, cx)),
+        );
+
+        let ini = ui::section(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .p(px(18.))
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("php.ini overrides"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Appended last, so these win over the generated values."),
+                )
+                .child(
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .text_color(if overrides.trim().is_empty() {
+                            cx.theme().muted_foreground
+                        } else {
+                            cx.theme().foreground
+                        })
+                        .child(if overrides.trim().is_empty() {
+                            "None yet.".to_string()
+                        } else {
+                            overrides
+                        }),
+                ),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(summary)
+            .child(ini)
             .into_any_element()
     }
 
@@ -3134,7 +3345,7 @@ impl Render for Wisp {
                         .min_w(px(0.))
                         .h_full()
                         .overflow_hidden()
-                        .child(self.content(cx)),
+                        .child(self.content(window, cx)),
                 ),
         )
         .child(self.status_bar(window, cx))
@@ -4072,6 +4283,36 @@ fn editor_footer(entity: Entity<Wisp>, is_new: bool) -> impl IntoElement {
             if saved {
                 window.close_dialog(cx);
             }
+        });
+
+    div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .gap_2()
+        .child(cancel)
+        .child(save)
+}
+
+/// The Save/Cancel row when the project form renders inline on Settings.
+fn inline_editor_footer(entity: Entity<Wisp>) -> impl IntoElement {
+    let cancel = Button::new("editor-cancel-inline")
+        .label("Cancel")
+        .outline()
+        .on_click({
+            let entity = entity.clone();
+            move |_, _, cx| {
+                entity.update(cx, |this, cx| this.cancel_editor(cx));
+            }
+        });
+
+    let save = Button::new("editor-save-inline")
+        .label("Save changes")
+        .primary()
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |this, cx| {
+                this.save_editor(cx);
+            });
         });
 
     div()
