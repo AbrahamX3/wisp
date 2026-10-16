@@ -201,18 +201,27 @@ max_execution_time=120\n\
     out
 }
 
+/// Extensions Wisp deliberately leaves disabled: `snmp` needs external MIB files
+/// and spews warnings, and `pdo_firebird` ships without its client library and
+/// fails to load. Everything else the build offers is enabled.
+const DISABLED_EXTENSIONS: &[&str] = &["snmp", "pdo_firebird"];
+
 /// Uncomment the template's `;extension=` lines, so a project behaves like a
-/// full development build (intl, mbstring, curl, gd, pdo_mysql, …).
+/// full development build (intl, mbstring, curl, gd, pdo_mysql, …), except the
+/// few in [`DISABLED_EXTENSIONS`].
 fn enable_extensions(template: &str) -> String {
     let mut out = String::with_capacity(template.len());
     for line in template.lines() {
-        match line.strip_prefix(";extension=") {
-            Some(rest) => {
+        if let Some(rest) = line.strip_prefix(";extension=") {
+            let name = rest.trim();
+            if !DISABLED_EXTENSIONS.contains(&name) {
                 out.push_str("extension=");
-                out.push_str(rest.trim_start());
+                out.push_str(name);
+                out.push('\n');
+                continue;
             }
-            None => out.push_str(line),
         }
+        out.push_str(line);
         out.push('\n');
     }
     out
@@ -284,14 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn extensions_are_enabled_after_the_extension_dir() {        let ini = php_ini(
-            ";extension=intl\n;extension=curl\nmemory_limit=128M\n",
+    fn extensions_are_enabled_after_the_extension_dir() {
+        let ini = php_ini(
+            ";extension=intl\n;extension=curl\n;extension=snmp\n;extension=pdo_firebird\nmemory_limit=128M\n",
             Path::new(r"C:\php\ext"),
             Path::new(r"C:\logs\php-error.log"),
         );
-        assert!(ini.contains("extension=intl"));
-        assert!(ini.contains("extension=curl"));
-        assert!(!ini.contains(";extension=intl"));
+        assert!(ini.lines().any(|line| line.trim() == "extension=intl"));
+        assert!(ini.lines().any(|line| line.trim() == "extension=curl"));
+        assert!(!ini.contains(";extension=intl"), "intl is uncommented");
+        // The problem extensions stay commented out.
+        assert!(
+            !ini.lines().any(|line| line.trim() == "extension=snmp"),
+            "snmp stays disabled"
+        );
+        assert!(
+            !ini
+                .lines()
+                .any(|line| line.trim() == "extension=pdo_firebird"),
+            "pdo_firebird stays disabled"
+        );
         let dir_at = ini.find("extension_dir=").expect("extension_dir is set");
         let intl_at = ini.find("extension=intl").expect("intl is enabled");
         assert!(

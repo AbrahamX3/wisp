@@ -65,6 +65,8 @@ pub struct Supervisor {
     workers: HashMap<i64, Worker>,
     /// Allocated FastCGI ports, stable while a project keeps running.
     ports: HashMap<i64, u16>,
+    /// Whether the one-time sweep of workers left by a previous run has run.
+    swept: bool,
 }
 
 impl Supervisor {
@@ -108,9 +110,16 @@ impl Supervisor {
             return Err(ServeError::Missing(format!("nginx {version} is not installed.")));
         }
 
-        self.write_configs(&prefix, sites)?;
+        // A previous run may have been killed without stopping its workers,
+        // leaving them holding ports and stale config. Clear them once.
+        if !self.swept {
+            sweep_orphans();
+            self.swept = true;
+        }
+
+        let restart = self.write_configs(&prefix, sites)?;
         self.ensure_nginx(version, &prefix)?;
-        self.reconcile_workers(sites)
+        self.reconcile_workers(sites, &restart)
     }
 
     /// Stop everything (used on exit).
@@ -134,9 +143,10 @@ impl Supervisor {
 
     // ---- internals -------------------------------------------------------
 
-    fn write_configs(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<()> {
+    fn write_configs(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<Vec<i64>> {
         let vhosts = config::vhosts_dir(prefix);
         std::fs::create_dir_all(&vhosts)?;
+        let mut restart = Vec::new();
 
         // Drop vhosts for projects that are no longer running.
         let wanted: HashSet<&str> = sites.iter().map(|site| site.slug.as_str()).collect();
@@ -173,15 +183,19 @@ impl Supervisor {
             .render();
             std::fs::write(vhosts.join(format!("{}.conf", site.slug)), vhost)?;
 
-            self.write_php_ini(site)?;
+            if self.write_php_ini(site)? {
+                // The worker holds its ini in memory, so it must be restarted.
+                restart.push(site.id);
+            }
         }
 
         std::fs::create_dir_all(config::conf_dir(prefix))?;
         std::fs::write(config::main_config_path(prefix), config::main_config())?;
-        Ok(())
+        Ok(restart)
     }
 
-    fn write_php_ini(&self, site: &SiteSpec) -> Result<()> {
+    /// Write the per-project `php.ini`, returning whether it actually changed.
+    fn write_php_ini(&self, site: &SiteSpec) -> Result<bool> {
         let runtime_dir = runtime::install_dir(RuntimeKind::Php, &site.php_version);
         let template =
             std::fs::read_to_string(runtime_dir.join("php.ini-development")).unwrap_or_default();
@@ -189,14 +203,18 @@ impl Supervisor {
         let dir = config::site_dir(&site.slug);
         std::fs::create_dir_all(&dir)?;
         let error_log = dir.join("logs").join("php-error.log");
-        std::fs::write(
-            dir.join("php.ini"),
-            config::php_ini(&template, &extension_dir, &error_log),
-        )?;
-        Ok(())
+
+        let path = dir.join("php.ini");
+        let contents = config::php_ini(&template, &extension_dir, &error_log);
+        let changed = match std::fs::read_to_string(&path) {
+            Ok(existing) => existing != contents,
+            Err(_) => true,
+        };
+        std::fs::write(&path, contents)?;
+        Ok(changed)
     }
 
-    fn reconcile_workers(&mut self, sites: &[SiteSpec]) -> Result<()> {
+    fn reconcile_workers(&mut self, sites: &[SiteSpec], restart: &[i64]) -> Result<()> {
         let wanted: HashSet<i64> = sites.iter().map(|site| site.id).collect();
         let stale: Vec<i64> = self
             .workers
@@ -213,10 +231,11 @@ impl Supervisor {
                 .workers
                 .get_mut(&site.id)
                 .is_some_and(|worker| process::is_running(&mut worker.child));
-            if alive {
+            // An alive worker is kept unless its config changed underneath it.
+            if alive && !restart.contains(&site.id) {
                 continue;
             }
-            self.workers.remove(&site.id);
+            self.stop_project(site.id);
             let port = self.port_for(site.id);
             let child = self.spawn_worker(site, port)?;
             self.workers.insert(site.id, Worker { child, port });
@@ -310,9 +329,38 @@ impl Supervisor {
     }
 }
 
+/// Kill `php-cgi` workers left behind by a previous run, so they do not hold
+/// ports and stale configuration. Only processes whose command line points at
+/// Wisp's own sites directory are touched.
+fn sweep_orphans() {
+    let needle = crate::config::sites().to_string_lossy().to_string();
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='php-cgi.exe'\" \
+         | Where-Object {{ $_.CommandLine -like '*{needle}*' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
+    let powershell = system32()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let args = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script,
+    ];
+    let _ = process::spawn(&powershell, &args, &[], None);
+}
+
+fn system32() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+}
+
 /// A localhost port the OS says is free.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+fn free_port() -> u16 {    std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|listener| listener.local_addr().ok())
         .map_or(9070, |addr| addr.port())
