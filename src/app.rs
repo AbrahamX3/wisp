@@ -2542,13 +2542,6 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child(
-                        // The kit's own toggle, which draws the right icon for
-                        // the side and state instead of a fixed one.
-                        SidebarToggleButton::new()
-                            .collapsed(self.sidebar_collapsed)
-                            .on_click(cx.listener(|this, _, _window, cx| this.toggle_sidebar(cx))),
-                    )
-                    .child(
                         Button::new("open-palette")
                             .ghost()
                             .small()
@@ -2721,10 +2714,28 @@ impl Wisp {
                     .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Settings, cx))),
             );
 
-        // The window already shows the Wisp mark and name above, so the sidebar
-        // header is only the search field.
-        let header =
-            SidebarHeader::new().child(div().w_full().child(Input::new(&self.project_filter)));
+        // The header is the search field with the collapse toggle beside it, the
+        // way a standard sidebar carries its own toggle. Collapsed, there is no
+        // room for a field, so it is dropped rather than squashed into the icon
+        // strip and the toggle is left centred on its own.
+        let mut header_row = div().flex().flex_row().items_center().gap_2().w_full();
+        if self.sidebar_collapsed {
+            header_row = header_row.justify_center();
+        } else {
+            header_row = header_row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(Input::new(&self.project_filter)),
+            );
+        }
+        let header = SidebarHeader::new().child(
+            header_row.child(
+                SidebarToggleButton::new()
+                    .collapsed(self.sidebar_collapsed)
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_sidebar(cx))),
+            ),
+        );
 
         Sidebar::new("wisp-sidebar")
             .collapsible(SidebarCollapsible::Icon)
