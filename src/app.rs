@@ -297,6 +297,7 @@ pub struct Wisp {
     log_filter: Entity<InputState>,
     log_case: bool,
     log_follow: bool,
+    log_wrap: bool,
     log_match: usize,
     log_scroll: ScrollHandle,
     /// The last set of sites published to the tray, to avoid needless rebuilds.
@@ -379,6 +380,7 @@ impl Wisp {
             log_filter,
             log_case: false,
             log_follow: true,
+            log_wrap: false,
             log_match: 0,
             log_scroll: ScrollHandle::default(),
             tray_sites: Vec::new(),
@@ -3367,6 +3369,21 @@ impl Wisp {
                             cx.notify();
                         }))
                     })
+                    .child({
+                        let button = Button::new("log-wrap")
+                            .small()
+                            .label("Wrap")
+                            .tooltip("Wrap long lines instead of scrolling sideways");
+                        let button = if self.log_wrap {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        };
+                        button.on_click(cx.listener(|this, _, _window, cx| {
+                            this.log_wrap = !this.log_wrap;
+                            cx.notify();
+                        }))
+                    })
                     .child(
                         Button::new("log-folder")
                             .ghost()
@@ -3401,10 +3418,7 @@ impl Wisp {
             let lines: Vec<AnyElement> = visible
                 .iter()
                 .map(|(_, line)| {
-                    div()
-                        .whitespace_nowrap()
-                        .child((*line).clone())
-                        .into_any_element()
+                    log_line(line, &needle, self.log_case, self.log_wrap, cx)
                 })
                 .collect();
 
@@ -5039,6 +5053,81 @@ fn descends_from(
     false
 }
 
+/// One log line, with every hit on the search term emphasised.
+fn log_line(text: &str, needle: &str, case_sensitive: bool, wrap: bool, cx: &App) -> AnyElement {
+    let line = div().flex().flex_row().flex_wrap();
+    let line = if wrap { line } else { line.whitespace_nowrap() };
+
+    if needle.is_empty() {
+        return line.child(text.to_string()).into_any_element();
+    }
+
+    let characters: Vec<char> = text.chars().collect();
+    let mut segments: Vec<AnyElement> = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in find_ranges(text, needle, case_sensitive) {
+        if start > cursor {
+            segments.push(
+                div()
+                    .child(characters[cursor..start].iter().collect::<String>())
+                    .into_any_element(),
+            );
+        }
+        segments.push(
+            div()
+                .rounded_sm()
+                .bg(cx.theme().accent)
+                .text_color(cx.theme().primary)
+                .child(characters[start..end].iter().collect::<String>())
+                .into_any_element(),
+        );
+        cursor = end;
+    }
+    if cursor < characters.len() {
+        segments.push(
+            div()
+                .child(characters[cursor..].iter().collect::<String>())
+                .into_any_element(),
+        );
+    }
+
+    line.children(segments).into_any_element()
+}
+
+/// Every occurrence of `needle` in `text`, as character ranges.
+///
+/// Matching is on characters rather than bytes, because lowercasing can change
+/// a string's byte length and the ranges have to slice the original text back
+/// out for display.
+fn find_ranges(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let haystack: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = needle.chars().collect();
+    if pattern.is_empty() || pattern.len() > haystack.len() {
+        return ranges;
+    }
+
+    let mut at = 0;
+    while at + pattern.len() <= haystack.len() {
+        let hit = (0..pattern.len()).all(|offset| {
+            let left = haystack[at + offset];
+            let right = pattern[offset];
+            if case_sensitive {
+                left == right
+            } else {
+                left.to_lowercase().eq(right.to_lowercase())
+            }
+        });
+        if hit {
+            ranges.push((at, at + pattern.len()));
+            at += pattern.len();
+        } else {
+            at += 1;
+        }
+    }
+    ranges
+}
+
 fn cx_error() -> Hsla {    rgb(0xEF4444).into()
 }
 
@@ -5250,8 +5339,9 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
 #[cfg(test)]
 mod tests {
     use super::{
-        descends_from, domain_is_hand_edited, is_newer, measure_services, merge_samples,
-        push_capped, service_config_changed, should_offer_update, ServiceSample, REPOSITORY_URL,
+        descends_from, domain_is_hand_edited, find_ranges, is_newer, measure_services,
+        merge_samples, push_capped, service_config_changed, should_offer_update, ServiceSample,
+        REPOSITORY_URL,
     };
     use crate::update::{REPO_NAME, REPO_OWNER};
     use std::collections::{HashMap, VecDeque};
@@ -5463,5 +5553,43 @@ mod tests {
 
     fn pid(value: u32) -> sysinfo::Pid {
         sysinfo::Pid::from_u32(value)
+    }
+
+    // ---- log search ------------------------------------------------------
+
+    #[test]
+    fn a_search_term_is_located_wherever_it_appears() {
+        assert_eq!(find_ranges("nginx error nginx", "nginx", true), vec![(0, 5), (12, 17)]);
+        assert_eq!(find_ranges("nothing here", "nginx", true), vec![]);
+        assert_eq!(find_ranges("", "nginx", true), vec![]);
+        assert_eq!(find_ranges("nginx", "", true), vec![]);
+    }
+
+    #[test]
+    fn an_insensitive_search_matches_but_keeps_the_original_spelling() {
+        let text = "PHP Fatal error: Uncaught Error";
+        let ranges = find_ranges(text, "error", false);
+        assert_eq!(ranges.len(), 2);
+
+        // The ranges slice the original text, so the casing survives.
+        let characters: Vec<char> = text.chars().collect();
+        let first: String = characters[ranges[0].0..ranges[0].1].iter().collect();
+        assert_eq!(first, "error");
+        let second: String = characters[ranges[1].0..ranges[1].1].iter().collect();
+        assert_eq!(second, "Error");
+    }
+
+    #[test]
+    fn a_case_sensitive_search_skips_a_different_casing() {
+        assert_eq!(find_ranges("Error error", "error", true), vec![(6, 11)]);
+        assert_eq!(find_ranges("Error error", "error", false).len(), 2);
+    }
+
+    #[test]
+    fn a_pattern_longer_than_the_line_is_not_a_match() {
+        assert_eq!(find_ranges("err", "error", true), vec![]);
+        assert_eq!(find_ranges("erro", "error", true), vec![]);
+        // A partial tail must not match either.
+        assert_eq!(find_ranges("xerr", "error", true), vec![]);
     }
 }
