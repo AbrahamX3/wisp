@@ -350,6 +350,8 @@ pub struct Wisp {
     /// A folder chosen in the native picker, applied to the editor on next render
     /// (which is where a `Window` is available).
     pending_root: Option<String>,
+    /// An icon picked in the file dialog, applied on the next render.
+    pending_icon: Option<std::path::PathBuf>,
     /// Which log the project detail shows, and its tail.
     log_kind: LogKind,
     log_lines: Vec<String>,
@@ -448,6 +450,7 @@ impl Wisp {
             elevation_busy: false,
             hosts_written: Vec::new(),
             pending_root: None,
+            pending_icon: None,
             log_kind: LogKind::Php,
             log_lines: Vec::new(),
             project_filter,
@@ -797,19 +800,49 @@ impl Wisp {
     }
 
     /// Open the native file picker for the project's icon.
+    ///
+    /// Like the folder picker, the dialog runs on its own thread and comes back
+    /// through the entity: a modal pumped from inside a click handler re-enters
+    /// GPUI's event loop, and the second one to do it aborts the process.
     fn choose_icon(&mut self, cx: &mut Context<Self>) {
-        let Some(picked) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"])
-            .set_title("Choose a project icon")
-            .pick_file()
-        else {
+        if self.editor.is_none() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"])
+                .set_title("Choose a project icon")
+                .pick_file();
+            let _ = sender.send(picked);
+        });
+
+        cx.spawn(async move |entity, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async move { receiver.recv().ok().flatten() })
+                .await;
+            if let Some(image) = picked {
+                entity
+                    .update(cx, |this, cx| {
+                        this.pending_icon = Some(image);
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Apply an image chosen in the picker to the editor.
+    fn apply_pending_icon(&mut self) {
+        let Some(image) = self.pending_icon.take() else {
             return;
         };
         if let Some(editor) = self.editor.as_mut() {
-            editor.icon = Some(picked.to_string_lossy().to_string());
-            editor.icon_source = Some(picked);
+            editor.icon = Some(image.to_string_lossy().to_string());
+            editor.icon_source = Some(image);
         }
-        cx.notify();
     }
 
     /// Drop the project's icon, falling back to the generated squircle.
@@ -872,7 +905,8 @@ impl Wisp {
     }
 
     /// Apply a folder chosen in the picker to the editor's root input.
-    fn apply_pending_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {        let Some(path) = self.pending_root.take() else {
+    fn apply_pending_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_root.take() else {
             return;
         };
         if let Some(editor) = self.editor.as_ref() {
@@ -4412,6 +4446,7 @@ impl Render for Wisp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         flush_toasts(&mut self.toasts, window, cx);
         self.apply_pending_root(window, cx);
+        self.apply_pending_icon();
         self.publish_tray(cx);
 
         let mut root = div()
