@@ -1639,65 +1639,67 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child({
-                        let mut buttons: Vec<AnyElement> = Vec::new();
-                        if self.serve_busy {
-                            buttons.push(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(Spinner::new().small())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Applying\u{2026}"),
-                                    )
-                                    .into_any_element(),
-                            );
-                        } else if self.running.is_empty() {
-                            buttons.push(
-                                Button::new("start-all")
-                                    .outline()
-                                    .small()
-                                    .icon(icon(IconName::Play))
-                                    .label("Start all sites")
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.start_all(cx)),
-                                    )
-                                    .into_any_element(),
-                            );
-                        } else {
-                            buttons.push(
-                                Button::new("restart-all")
-                                    .outline()
-                                    .small()
-                                    .icon(icon(IconName::RotateCcw))
-                                    .label("Restart all")
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.restart_all(cx)),
-                                    )
-                                    .into_any_element(),
-                            );
-                            buttons.push(
-                                Button::new("stop-all")
-                                    .danger()
-                                    .small()
-                                    .icon(icon(IconName::Square))
-                                    .label("Stop all")
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.stop_all(cx)),
-                                    )
-                                    .into_any_element(),
-                            );
-                        }
+                        let any_stopped = self
+                            .projects
+                            .iter()
+                            .any(|project| {
+                                project.php_version.is_some() && !self.running.contains(&project.id)
+                            });
+                        let any_running = !self.running.is_empty();
+                        let busy = self.serve_busy;
+
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .children(buttons)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("All sites"),
+                            )
+                            .child(
+                                Button::new("start-all")
+                                    .outline()
+                                    .small()
+                                    .icon(icon(IconName::Play))
+                                    .label("Start")
+                                    .tooltip("Start every project and nginx")
+                                    .disabled(busy || !any_stopped)
+                                    .on_click(
+                                        cx.listener(|this, _, _window, cx| this.start_all(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("restart-all")
+                                    .outline()
+                                    .small()
+                                    .icon(icon(IconName::RotateCcw))
+                                    .label("Restart")
+                                    .tooltip("Restart every project's worker")
+                                    .disabled(busy || !any_running)
+                                    .on_click(
+                                        cx.listener(|this, _, _window, cx| this.restart_all(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("stop-all")
+                                    .danger()
+                                    .small()
+                                    .icon(icon(IconName::Square))
+                                    .label("Stop")
+                                    .tooltip("Stop every project and nginx")
+                                    .disabled(busy || !any_running)
+                                    .on_click(
+                                        cx.listener(|this, _, _window, cx| this.stop_all(cx)),
+                                    ),
+                            )
+                            .child(if busy {
+                                Spinner::new().small().into_any_element()
+                            } else {
+                                div().into_any_element()
+                            })
                     })
                     .child(
                         Button::new("new-project")
