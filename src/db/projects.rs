@@ -311,6 +311,7 @@ mod store_tests {
     /// private temp directory and environment variables are process-global.
     #[test]
     fn create_update_and_delete_a_project() {
+        let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("wisp-store-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("WISP_CONFIG_DIR", &dir);

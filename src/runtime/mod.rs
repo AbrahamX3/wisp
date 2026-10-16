@@ -118,6 +118,7 @@ mod tests {
     #[test]
     #[ignore = "downloads from the network"]
     fn installs_and_removes_nginx_end_to_end() {
+        let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join("wisp-nginx-e2e");
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("WISP_CONFIG_DIR", &root);
@@ -145,6 +146,7 @@ mod tests {
     #[test]
     #[ignore = "downloads ~33 MB from the network"]
     fn installs_php_and_finds_the_fastcgi_binary() {
+        let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join("wisp-php-e2e");
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("WISP_CONFIG_DIR", &root);

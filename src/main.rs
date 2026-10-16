@@ -18,7 +18,10 @@ mod platform;
 mod runtime;
 mod serve;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod tray;
+mod tls;
 mod ui;
 mod update;
 mod vcrt;

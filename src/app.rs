@@ -32,6 +32,7 @@ use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::serve::{self, SiteSpec};
 use crate::settings::{Settings, ThemePreference};
+use crate::tls;
 use crate::tray;
 use crate::ui;
 use crate::update;
@@ -117,6 +118,7 @@ pub struct Wisp {
     serve_status: serve::Status,
     serve_error: Option<String>,
     serve_busy: bool,
+    trust_busy: bool,
 }
 
 impl Wisp {
@@ -147,6 +149,7 @@ impl Wisp {
             serve_status: serve::Status::default(),
             serve_error: None,
             serve_busy: false,
+            trust_busy: false,
         };
         this.reload(cx);
         this.reload_runtimes(cx);
@@ -687,8 +690,7 @@ impl Wisp {
         cx.notify();
     }
 
-    fn install_vcrt(&mut self, cx: &mut Context<Self>) {
-        match vcrt::launch_installer() {
+    fn install_vcrt(&mut self, cx: &mut Context<Self>) {        match vcrt::launch_installer() {
             Ok(()) => self.push_toast(
                 ToastKind::Success,
                 "The Visual C++ installer is opening. Restart Wisp when it finishes.".to_string(),
@@ -754,6 +756,7 @@ impl Wisp {
                 domain: project.domain.clone(),
                 root: PathBuf::from(&project.root_path),
                 php_version: php,
+                ssl_enabled: project.ssl_enabled,
             });
         }
         Ok(specs)
@@ -813,6 +816,42 @@ impl Wisp {
                             this.serve_error = None;
                         }
                         Err(error) => this.serve_error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Trust Wisp's local CA in the current user's root store, off the UI thread
+    /// because Windows shows a confirmation dialog.
+    fn trust_ca(&mut self, cx: &mut Context<Self>) {
+        if self.trust_busy {
+            return;
+        }
+        self.trust_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { tls::trust_ca() })
+                .await;
+            entity
+                .update(cx, |this, cx| {
+                    this.trust_busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.settings.ca_trusted = true;
+                            this.settings.save();
+                            this.push_toast(
+                                ToastKind::Success,
+                                "Wisp's certificate is trusted \u{2014} https:// will work in your browser."
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => this.push_toast(ToastKind::Error, error.to_string()),
                     }
                     cx.notify();
                 })
@@ -1618,6 +1657,7 @@ impl Wisp {
             column = column.child(self.vcrt_banner(vc, cx));
         }
 
+        column = column.child(self.https_card(cx));
         column = column.child(self.php_section(cx));
         column = column.child(self.nginx_section(cx));
 
@@ -1632,8 +1672,80 @@ impl Wisp {
             .into_any_element()
     }
 
-    fn vcrt_banner(&self, vc: u16, cx: &mut Context<Self>) -> impl IntoElement {
-        let family = if vc >= 17 {
+    fn https_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let trusted = self.settings.ca_trusted;
+
+        let action: AnyElement = if self.trust_busy {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new().small())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Trusting\u{2026}"),
+                )
+                .into_any_element()
+        } else if trusted {
+            badge("Trusted", cx).into_any_element()
+        } else {
+            Button::new("trust-ca")
+                .primary()
+                .small()
+                .label("Trust certificate")
+                .on_click(cx.listener(|this, _, _window, cx| this.trust_ca(cx)))
+                .into_any_element()
+        };
+
+        let subtitle = if trusted {
+            "Wisp's certificate is trusted on this account."
+        } else {
+            "Trust Wisp's certificate so https:// works in your browser."
+        };
+
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .p(px(18.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(icon(IconName::ShieldCheck).text_color(brand::accent()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Local HTTPS"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(subtitle),
+                                ),
+                        ),
+                )
+                .child(action),
+        )
+    }
+
+    fn vcrt_banner(&self, vc: u16, cx: &mut Context<Self>) -> impl IntoElement {        let family = if vc >= 17 {
             "Visual C++ 2015\u{2013}2022 x64"
         } else {
             "Visual C++ 2015\u{2013}2019 x64"

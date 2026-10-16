@@ -26,6 +26,10 @@ pub enum ServeError {
     /// nginx exited as soon as it was started (usually a port already in use).
     #[error("{0}")]
     Start(String),
+
+    /// A certificate could not be created.
+    #[error("{0}")]
+    Tls(#[from] crate::tls::TlsError),
 }
 
 pub type Result<T> = std::result::Result<T, ServeError>;
@@ -38,6 +42,7 @@ pub struct SiteSpec {
     pub domain: String,
     pub root: PathBuf,
     pub php_version: String,
+    pub ssl_enabled: bool,
 }
 
 /// A snapshot of what is actually running.
@@ -151,12 +156,19 @@ impl Supervisor {
             let log_dir = config::site_logs(&site.slug);
             std::fs::create_dir_all(&log_dir)?;
 
+            let tls = if site.ssl_enabled {
+                Some(crate::tls::issue(&site.domain)?)
+            } else {
+                None
+            };
+
             let vhost = config::Vhost {
                 domain: &site.domain,
                 docroot: &docroot,
                 port,
                 listen_port: config::http_port(),
                 log_dir: &log_dir,
+                tls: tls.as_ref(),
             }
             .render();
             std::fs::write(vhosts.join(format!("{}.conf", site.slug)), vhost)?;
@@ -376,6 +388,7 @@ mod tests {
     #[test]
     #[ignore = "starts real processes and downloads runtimes"]
     fn serves_a_project_over_http() {
+        let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join("wisp-serve-e2e");
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("WISP_CONFIG_DIR", &root);
@@ -398,6 +411,7 @@ mod tests {
             domain: "demo.test".to_string(),
             root: site,
             php_version: "8.3.35".to_string(),
+            ssl_enabled: false,
         };
 
         let mut supervisor = Supervisor::default();
@@ -411,14 +425,76 @@ mod tests {
         let body = ureq::get(&url)
             .header("Host", "demo.test")
             .call()
-            .expect("the site should respond")
-            .body_mut()
-            .read_to_string()
-            .expect("a response body");
+            .and_then(|mut response| response.body_mut().read_to_string());
+
+        // Tear down before asserting, so a failure cannot orphan processes.
+        supervisor.stop_all();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let body = body.expect("the site should respond");
         assert!(body.contains("Hello from Wisp"), "unexpected body: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Serves a project over HTTPS and verifies the certificate chain against
+    /// the generated CA with curl (so the hostname/SAN is checked too).
+    /// Ignored by default; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "starts real processes and downloads runtimes"]
+    fn serves_https_with_a_valid_chain() {
+        let _guard = crate::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join("wisp-serve-tls");
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("WISP_CONFIG_DIR", &root);
+
+        ensure_nginx("1.27.0");
+        ensure_php("8.3.35");
+
+        let site = root.join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(site.join("index.php"), "<?php echo 'Secure hello';").unwrap();
+
+        let spec = SiteSpec {
+            id: 1,
+            slug: "demo".to_string(),
+            domain: "demo.test".to_string(),
+            root: site,
+            php_version: "8.3.35".to_string(),
+            ssl_enabled: true,
+        };
+
+        let mut supervisor = Supervisor::default();
+        supervisor
+            .sync(Some("1.27.0"), &[spec])
+            .expect("sync should start https");
+
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        // Windows curl uses Schannel, which refuses a private CA it cannot
+        // check for revocation; `--ssl-no-revoke` skips that unrelated check
+        // while still verifying the signature and hostname.
+        let output = std::process::Command::new("curl.exe")
+            .args([
+                "-s",
+                "--ssl-no-revoke",
+                "--resolve",
+                "demo.test:443:127.0.0.1",
+                "--cacert",
+            ])
+            .arg(crate::tls::ca_cert())
+            .arg("https://demo.test/")
+            .output();
 
         supervisor.stop_all();
         std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let output = output.expect("curl should run");
+        let body = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            body.contains("Secure hello"),
+            "curl said: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

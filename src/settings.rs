@@ -53,6 +53,10 @@ pub struct Settings {
     /// serves every project, so only one version runs at a time.
     #[serde(default)]
     pub active_nginx: Option<String>,
+    /// Whether Wisp's local certificate authority has been added to the current
+    /// user's trusted root store. A hint for the UI; trusting is idempotent.
+    #[serde(default)]
+    pub ca_trusted: bool,
 }
 
 impl Settings {
