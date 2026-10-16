@@ -59,6 +59,14 @@ pub struct Status {
     pub running_projects: Vec<i64>,
 }
 
+/// A process Wisp started, and what it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tracked {
+    /// The project this process serves, or `None` for the shared nginx.
+    pub project: Option<i64>,
+    pub pid: u32,
+}
+
 struct Worker {
     child: Child,
     #[allow(dead_code)]
@@ -77,6 +85,31 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// The live processes Wisp started, so a sampler can measure them.
+    ///
+    /// PIDs change whenever a worker is restarted, so callers must re-read this
+    /// rather than cache it.
+    pub fn tracked(&mut self) -> Vec<Tracked> {
+        let mut tracked = Vec::new();
+        if self.nginx.as_mut().is_some_and(process::is_running) {
+            if let Some(pid) = self.nginx.as_ref().map(Child::id) {
+                tracked.push(Tracked {
+                    project: None,
+                    pid,
+                });
+            }
+        }
+        for (id, worker) in self.workers.iter_mut() {
+            if process::is_running(&mut worker.child) {
+                tracked.push(Tracked {
+                    project: Some(*id),
+                    pid: worker.child.id(),
+                });
+            }
+        }
+        tracked
+    }
+
     /// Reap exited processes and report what is still alive.
     pub fn status(&mut self) -> Status {
         let nginx_running = self
@@ -611,6 +644,27 @@ mod tests {
 
         // Let nginx and the workers settle.
         std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        // The resource sampler reads exactly this: one entry for the shared
+        // nginx and one per running project, each with a live pid.
+        let mut tracked = supervisor.tracked();
+        tracked.sort_by_key(|entry| entry.project);
+        assert_eq!(
+            tracked.iter().filter(|entry| entry.project.is_none()).count(),
+            1,
+            "the shared nginx should be tracked once: {tracked:?}"
+        );
+        for spec in &specs {
+            assert!(
+                tracked.iter().any(|entry| entry.project == Some(spec.id)),
+                "project {} should be tracked: {tracked:?}",
+                spec.id
+            );
+        }
+        assert!(
+            tracked.iter().all(|entry| entry.pid != 0),
+            "every tracked process should have a pid"
+        );
 
         for spec in &specs {
             let scheme = if spec.ssl_enabled { "https" } else { "http" };

@@ -5,6 +5,7 @@
 //! and the primary action, and nothing else carries colour.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -173,6 +174,26 @@ impl RuntimeTab {
 /// stop them, and the background sync can move it in and out.
 pub struct ServerGlobal(pub serve::Supervisor);
 
+/// The processes Wisp started, published by the status poll.
+///
+/// The metrics sampler runs on the background executor, so it cannot reach into
+/// the supervisor; it reads this instead. PIDs change on every worker restart,
+/// which is why this is republished rather than cached.
+#[derive(Clone, Default)]
+pub struct TrackedProcesses(pub Arc<Mutex<Vec<serve::Tracked>>>);
+
+impl Global for TrackedProcesses {}
+
+/// One service's latest resource use, with the history behind its sparkline.
+struct ServiceSample {
+    /// The project this belongs to, or `None` for the shared nginx.
+    project: Option<i64>,
+    cpu: f64,
+    ram_bytes: u64,
+    cpu_history: VecDeque<f64>,
+    ram_history: VecDeque<f64>,
+}
+
 impl Global for ServerGlobal {}
 
 /// Which log file the project detail is showing.
@@ -280,8 +301,10 @@ pub struct Wisp {
     log_scroll: ScrollHandle,
     /// The last set of sites published to the tray, to avoid needless rebuilds.
     tray_sites: Vec<tray::TraySite>,
-    /// CPU and RAM percentages, one per 2s sample, capped at five minutes.
-    metrics: VecDeque<(f64, f64)>,
+    /// The last sample per running service, and the machine totals, with the
+    /// history behind their sparklines.
+    service_metrics: Vec<ServiceSample>,
+    machine_metrics: VecDeque<(f64, f64)>,
     /// The Ctrl-K command palette and whether it is showing.
     palette: Entity<CommandState>,
     palette_open: bool,
@@ -359,7 +382,8 @@ impl Wisp {
             log_match: 0,
             log_scroll: ScrollHandle::default(),
             tray_sites: Vec::new(),
-            metrics: VecDeque::new(),
+            service_metrics: Vec::new(),
+            machine_metrics: VecDeque::new(),
             palette,
             palette_open: false,
             runtime_tab: RuntimeTab::Php,
@@ -1091,7 +1115,13 @@ impl Wisp {
                     if this.serve_busy {
                         return;
                     }
-                    let status = cx.global_mut::<ServerGlobal>().0.status();
+                    let (status, tracked) = {
+                        let supervisor = &mut cx.global_mut::<ServerGlobal>().0;
+                        (supervisor.status(), supervisor.tracked())
+                    };
+                    if let Ok(mut slot) = cx.global::<TrackedProcesses>().0.lock() {
+                        *slot = tracked;
+                    }
                     if status.nginx_running != this.serve_status.nginx_running
                         || status.running_projects != this.serve_status.running_projects
                     {
@@ -1457,26 +1487,36 @@ impl Wisp {
         .detach();
     }
 
-    /// Sample CPU and memory every other second, keeping five minutes of history.
+    /// Sample what Wisp is running, every other second, plus the machine.
     fn spawn_metrics_poll(cx: &mut Context<Self>) {
+        let tracked = cx.global::<TrackedProcesses>().0.clone();
         cx.spawn(async move |entity, cx| {
             let mut system = sysinfo::System::new();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(2000))
                     .await;
+
+                let wanted = tracked
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or_default();
+
                 system.refresh_cpu_usage();
                 system.refresh_memory();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
                 let cpu = system.global_cpu_usage() as f64;
                 let total = system.total_memory();
-                let used = system.used_memory();
                 let ram = if total == 0 {
                     0.0
                 } else {
-                    used as f64 / total as f64 * 100.0
+                    system.used_memory() as f64 / total as f64 * 100.0
                 };
+                let samples = measure_services(&system, &wanted);
+
                 let applied = entity.update(cx, |this, cx| {
-                    this.push_metrics(cpu, ram);
+                    this.push_metrics(samples, cpu, ram);
                     cx.notify();
                 });
                 if applied.is_err() {
@@ -1487,12 +1527,19 @@ impl Wisp {
         .detach();
     }
 
-    /// Add one sample, dropping the oldest once the window is full.
-    fn push_metrics(&mut self, cpu: f64, ram: f64) {
-        if self.metrics.len() == METRIC_SAMPLES {
-            self.metrics.pop_front();
+    /// Fold one round of samples into the histories the sparklines draw.
+    fn push_metrics(
+        &mut self,
+        samples: Vec<(Option<i64>, f64, u64)>,
+        machine_cpu: f64,
+        machine_ram: f64,
+    ) {
+        merge_samples(&mut self.service_metrics, samples);
+
+        if self.machine_metrics.len() == METRIC_SAMPLES {
+            self.machine_metrics.pop_front();
         }
-        self.metrics.push_back((cpu, ram));
+        self.machine_metrics.push_back((machine_cpu, machine_ram));
     }
 
     /// Move between search hits, scrolling the log towards the new one.
@@ -2549,7 +2596,7 @@ impl Wisp {
                 .flex_col()
                 .gap_4()
                 .child(self.project_details(project, cx))
-                .child(self.resources_card(cx))
+                .child(self.resources_card(Some(project.id), cx))
                 .into_any_element(),
             ProjectTab::Services => self.project_services(project, cx),
             ProjectTab::Logs => self.logs_card(window, cx).into_any_element(),
@@ -2772,30 +2819,56 @@ impl Wisp {
         .into_any_element()
     }
 
-    /// A live CPU/RAM readout with five-minute sparklines for the Overview tab.
-    fn resources_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (cpu, ram) = self.metrics.back().copied().unwrap_or((0.0, 0.0));
-        let cpu_values: Vec<f64> = self.metrics.iter().map(|(cpu, _)| *cpu).collect();
-        let ram_values: Vec<f64> = self.metrics.iter().map(|(_, ram)| *ram).collect();
-
+    /// What Wisp is running, with the machine underneath it as context.
+    ///
+    /// `only` narrows the card to one project, which is what the Overview tab
+    /// wants; `None` lists every service Wisp started.
+    fn resources_card(&self, only: Option<i64>, cx: &mut Context<Self>) -> AnyElement {
         let header = section_header(
             "Resources",
-            "This machine, sampled every two seconds for the last five minutes.",
+            "The processes Wisp started, sampled every two seconds.",
             cx,
         );
 
-        let mut body = div().flex().flex_col().gap_3().p(px(18.));
-        if self.metrics.is_empty() {
+        let shown: Vec<&ServiceSample> = self
+            .service_metrics
+            .iter()
+            .filter(|sample| only.is_none() || sample.project == only)
+            .collect();
+
+        let mut body = div().flex().flex_col().gap_4().p(px(18.));
+        if shown.is_empty() {
             body = body.child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Measuring\u{2026}"),
+                    .child(match only {
+                        Some(_) => "This project is not running, so it is using nothing.",
+                        None => "Nothing is running yet. Start a site to see what it costs.",
+                    }),
             );
+        } else {
+            for sample in shown {
+                let (name, detail) = self.service_name(sample.project);
+                body = body.child(service_row(&name, &detail, sample, cx));
+            }
         }
-        body = body
-            .child(resource_row("CPU", cpu, "cpu-spark", cpu_values, cx))
-            .child(resource_row("RAM", ram, "ram-spark", ram_values, cx));
+
+        // Machine context, so a heavy site can be told apart from a busy PC.
+        let (cpu, ram) = self.machine_metrics.back().copied().unwrap_or((0.0, 0.0));
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "This machine: CPU {cpu:.1}% \u{00b7} RAM {ram:.1}%"
+                )),
+        );
 
         ui::section(
             cx,
@@ -2807,6 +2880,23 @@ impl Wisp {
                 .child(body),
         )
         .into_any_element()
+    }
+
+    /// What a tracked service should be called: nginx, or the project it serves.
+    fn service_name(&self, project: Option<i64>) -> (String, String) {
+        let Some(id) = project else {
+            return ("nginx".to_string(), "shared server".to_string());
+        };
+        match self.projects.iter().find(|project| project.id == id) {
+            Some(project) => (
+                project.name.clone(),
+                match &project.php_version {
+                    Some(version) => format!("php-cgi {version}"),
+                    None => "php-cgi".to_string(),
+                },
+            ),
+            None => ("php-cgi".to_string(), String::new()),
+        }
     }
 
     /// Show or hide the command palette, focusing its field when it appears.
@@ -3128,7 +3218,7 @@ impl Wisp {
             RuntimeTab::Nginx => self.nginx_section(cx).into_any_element(),
             RuntimeTab::Https => self.https_card(cx).into_any_element(),
             RuntimeTab::Hosts => self.hosting_card(cx).into_any_element(),
-            RuntimeTab::Resources => self.resources_card(cx),
+            RuntimeTab::Resources => self.resources_card(None, cx),
         };
 
         div()
@@ -4473,49 +4563,121 @@ fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
         )
 }
 
-/// A metric row: name, current value, and a sparkline of its recent history.
-fn resource_row(
+/// One service: what it is, and what it is costing right now.
+fn service_row(name: &str, detail: &str, sample: &ServiceSample, cx: &App) -> AnyElement {
+    let key = sample
+        .project
+        .map_or_else(|| "nginx".to_string(), |id| id.to_string());
+    let cpu_max = sample.cpu_history.iter().copied().fold(100.0_f64, f64::max);
+    let ram_max = sample.ram_history.iter().copied().fold(1.0_f64, f64::max);
+    let megabytes = sample.ram_bytes as f64 / (1024.0 * 1024.0);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(ui::dot(cx.theme().primary))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(name.to_string()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(detail.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_4()
+                .child(service_meter(
+                    "CPU",
+                    &format!("{:.1}%", sample.cpu),
+                    format!("cpu-{key}"),
+                    sample.cpu_history.iter().copied().collect(),
+                    cpu_max,
+                    cx.theme().primary,
+                    cx,
+                ))
+                .child(service_meter(
+                    "RAM",
+                    &format!("{megabytes:.1} MB"),
+                    format!("ram-{key}"),
+                    sample.ram_history.iter().copied().collect(),
+                    ram_max,
+                    cx.theme().warning,
+                    cx,
+                )),
+        )
+        .into_any_element()
+}
+
+/// `label  value  sparkline`, one metric of one service.
+fn service_meter(
     label: &str,
-    value: f64,
-    id: &'static str,
+    value: &str,
+    id: String,
     values: Vec<f64>,
+    max: f64,
+    color: Hsla,
     cx: &App,
-) -> impl IntoElement {
-    let color = cx.theme().primary;
+) -> AnyElement {
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_4()
+        .gap_2()
+        .flex_1()
+        .min_w(px(220.))
         .child(
             div()
-                .w(px(48.))
+                .w(px(34.))
                 .flex_shrink(0.0)
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
                 .child(label.to_string()),
         )
         .child(
             div()
-                .w(px(64.))
+                .w(px(74.))
                 .flex_shrink(0.0)
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{value:.1}%")),
+                .text_xs()
+                .child(value.to_string()),
         )
         .child(
-            div().flex_1().h(px(40.)).child(
-                AreaChart::new(values.into_iter().enumerate())
-                    .id(id)
-                    .x(|(index, _)| index.to_string())
-                    .y(|(_, value)| *value)
-                    .stroke(color)
-                    .x_axis(false)
-                    .y_axis(false)
-                    .grid(false)
-                    .y_domain(0.0, 100.0),
-            ),
+            div()
+                .flex_1()
+                .min_w(px(80.))
+                .h(px(28.))
+                .child(metric_sparkline(id, values, max, color)),
         )
+        .into_any_element()
+}
+
+/// A sparkline over a `0..max` domain.
+fn metric_sparkline(id: String, values: Vec<f64>, max: f64, color: Hsla) -> impl IntoElement {
+    AreaChart::new(values.into_iter().enumerate())
+        .id(id)
+        .x(|(index, _)| index.to_string())
+        .y(|(_, value)| *value)
+        .stroke(color)
+        .x_axis(false)
+        .y_axis(false)
+        .grid(false)
+        .y_domain(0.0, if max <= 0.0 { 1.0 } else { max })
 }
 
 /// The body of the create/edit dialog.
@@ -4789,8 +4951,95 @@ fn runtime_count_suffix(count: usize, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn cx_error() -> Hsla {
-    rgb(0xEF4444).into()
+/// Push onto a capped history, dropping the oldest sample once it is full.
+fn push_capped(history: &mut VecDeque<f64>, value: f64) {
+    if history.len() == METRIC_SAMPLES {
+        history.pop_front();
+    }
+    history.push_back(value);
+}
+
+/// CPU (as a percentage of one core) and memory for each tracked process tree.
+///
+/// A tree is measured whole, because nginx forks its workers and their cost
+/// belongs to the server the user turned on, not to a stray child process.
+fn measure_services(
+    system: &sysinfo::System,
+    wanted: &[serve::Tracked],
+) -> Vec<(Option<i64>, f64, u64)> {
+    let processes = system.processes();
+    let parent_of = |pid: sysinfo::Pid| {
+        processes
+            .get(&pid)
+            .and_then(sysinfo::Process::parent)
+    };
+
+    wanted
+        .iter()
+        .map(|tracked| {
+            let root = sysinfo::Pid::from_u32(tracked.pid);
+            let mut cpu = 0.0;
+            let mut ram = 0_u64;
+            for (pid, process) in processes {
+                if !descends_from(&parent_of, *pid, root) {
+                    continue;
+                }
+                cpu += process.cpu_usage() as f64;
+                ram += process.memory();
+            }
+            (tracked.project, cpu, ram)
+        })
+        .collect()
+}
+
+/// Fold one round of samples into the histories the sparklines draw.
+///
+/// A service that is still running keeps its history; a restarted one starts
+/// again, so the line does not jump across the restart.
+fn merge_samples(existing: &mut Vec<ServiceSample>, samples: Vec<(Option<i64>, f64, u64)>) {
+    let mut fresh = Vec::with_capacity(samples.len());
+    for (project, cpu, ram_bytes) in samples {
+        let (mut cpu_history, mut ram_history) = existing
+            .iter()
+            .find(|sample| sample.project == project)
+            .map(|sample| (sample.cpu_history.clone(), sample.ram_history.clone()))
+            .unwrap_or_default();
+        push_capped(&mut cpu_history, cpu);
+        push_capped(&mut ram_history, ram_bytes as f64);
+        fresh.push(ServiceSample {
+            project,
+            cpu,
+            ram_bytes,
+            cpu_history,
+            ram_history,
+        });
+    }
+    *existing = fresh;
+}
+
+/// Whether `pid` is `root` or one of its descendants.
+///
+/// The walk is bounded so a cycle in a corrupt process table cannot hang the
+/// sampler.
+fn descends_from(
+    parent_of: &dyn Fn(sysinfo::Pid) -> Option<sysinfo::Pid>,
+    pid: sysinfo::Pid,
+    root: sysinfo::Pid,
+) -> bool {
+    let mut current = Some(pid);
+    for _ in 0..64 {
+        let Some(pid) = current else {
+            return false;
+        };
+        if pid == root {
+            return true;
+        }
+        current = parent_of(pid);
+    }
+    false
+}
+
+fn cx_error() -> Hsla {    rgb(0xEF4444).into()
 }
 
 fn scheme_prefix(ssl: bool) -> &'static str {
@@ -5000,8 +5249,12 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_is_hand_edited, is_newer, service_config_changed, should_offer_update, REPOSITORY_URL};
+    use super::{
+        descends_from, domain_is_hand_edited, is_newer, measure_services, merge_samples,
+        push_capped, service_config_changed, should_offer_update, ServiceSample, REPOSITORY_URL,
+    };
     use crate::update::{REPO_NAME, REPO_OWNER};
+    use std::collections::{HashMap, VecDeque};
 
     #[test]
     fn a_cached_version_newer_than_ours_is_offered() {
@@ -5104,5 +5357,111 @@ mod tests {
         let mut after = before.clone();
         after.root_path = r"C:\Sites\other".to_string();
         assert!(service_config_changed(&before, &after));
+    }
+
+    // ---- the resource sampler -------------------------------------------
+
+    #[test]
+    fn a_capped_history_drops_the_oldest_sample() {
+        let mut history = VecDeque::new();
+        for value in 0..super::METRIC_SAMPLES + 10 {
+            push_capped(&mut history, value as f64);
+        }
+        assert_eq!(history.len(), super::METRIC_SAMPLES);
+        // The first ten were pushed out, so the window now starts at 10.
+        assert_eq!(history.front().copied(), Some(10.0));
+    }
+
+    #[test]
+    fn a_process_descends_from_itself_and_its_ancestors() {
+        // 3 -> 2 -> 1, and 9 standing on its own.
+        let table: HashMap<u32, u32> = [(2_u32, 1_u32), (3, 2)].into_iter().collect();
+        let parent_of = |pid: sysinfo::Pid| {
+            table.get(&pid.as_u32()).copied().map(sysinfo::Pid::from_u32)
+        };
+
+        assert!(descends_from(&parent_of, pid(1), pid(1)));
+        assert!(descends_from(&parent_of, pid(3), pid(1)));
+        assert!(descends_from(&parent_of, pid(2), pid(1)));
+        assert!(!descends_from(&parent_of, pid(9), pid(1)));
+        assert!(!descends_from(&parent_of, pid(1), pid(3)));
+    }
+
+    #[test]
+    fn a_cycle_in_the_process_table_does_not_hang_the_walk() {
+        let table: HashMap<u32, u32> = [(1_u32, 2_u32), (2, 1)].into_iter().collect();
+        let parent_of = |pid: sysinfo::Pid| {
+            table.get(&pid.as_u32()).copied().map(sysinfo::Pid::from_u32)
+        };
+
+        assert!(!descends_from(&parent_of, pid(1), pid(7)));
+    }
+
+    /// The measurement end to end: our own test process is a real one, so the
+    /// sampler should find it and attribute memory to it.
+    #[test]
+    fn measuring_a_real_process_reports_its_memory() {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+        let tracked = vec![crate::serve::Tracked {
+            project: Some(7),
+            pid: std::process::id(),
+        }];
+        let measured = measure_services(&system, &tracked);
+
+        assert_eq!(measured.len(), 1);
+        let (project, cpu, ram) = measured[0];
+        assert_eq!(project, Some(7));
+        assert!(ram > 0, "our own process should have some memory");
+        assert!(cpu >= 0.0);
+    }
+
+    /// A pid that is not running costs nothing, rather than panicking.
+    #[test]
+    fn measuring_a_dead_process_reports_nothing() {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+        // PIDs are 32-bit on Windows but a very high one is never live here.
+        let tracked = vec![crate::serve::Tracked {
+            project: None,
+            pid: u32::MAX - 3,
+        }];
+        let measured = measure_services(&system, &tracked);
+
+        assert_eq!(measured, vec![(None, 0.0, 0)]);
+    }
+
+    /// A service that keeps running keeps its sparkline history; one that went
+    /// away does not.
+    #[test]
+    fn history_follows_the_service_that_is_still_running() {
+        let mut history = VecDeque::new();
+        push_capped(&mut history, 4.0);
+        let existing = ServiceSample {
+            project: Some(1),
+            cpu: 4.0,
+            ram_bytes: 1024,
+            cpu_history: history.clone(),
+            ram_history: history,
+        };
+        let mut kept = vec![existing];
+        merge_samples(
+            &mut kept,
+            vec![(Some(1), 9.0, 2048), (None, 1.0, 512)],
+        );
+
+        assert_eq!(kept.len(), 2);
+        let project = &kept[0];
+        assert_eq!(project.cpu, 9.0);
+        assert_eq!(project.cpu_history.len(), 2, "the old sample is kept");
+        assert_eq!(project.cpu_history.front().copied(), Some(4.0));
+        // nginx appeared for the first time, so it has a single point.
+        assert_eq!(kept[1].cpu_history.len(), 1);
+    }
+
+    fn pid(value: u32) -> sysinfo::Pid {
+        sysinfo::Pid::from_u32(value)
     }
 }

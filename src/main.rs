@@ -64,6 +64,7 @@ fn main() {
             cx.set_app_identity("com.abraham.wisp", "Wisp");
             cx.set_global(tray::TrayState::default());
             cx.set_global(app::ServerGlobal(serve::Supervisor::default()));
+            cx.set_global(app::TrackedProcesses::default());
 
             // Stop nginx and the PHP workers on the way out, so nothing is left
             // holding port 80 or a FastCGI port.
