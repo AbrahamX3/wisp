@@ -21,6 +21,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
+use gpui_kit::component::separator::Separator;
+use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -1702,6 +1704,177 @@ impl Wisp {
 
     // ---- chrome ----------------------------------------------------------
 
+    /// The window status bar: ambient state on the left, the current project in
+    /// the middle, ambient notices and the global site controls on the right.
+    ///
+    /// The bar never wraps, so what it includes is chosen from the window width
+    /// rather than left to clip.
+    fn status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let width = window.bounds().size.width;
+        let wide = width >= px(1120.);
+        let compact = width >= px(940.);
+
+        let nginx_up = self.serve_status.nginx_running;
+        let workers = self.serve_status.running_projects.len();
+        let desired = self.php_on.len();
+
+        let state_dot = |on: bool, cx: &App| {
+            ui::dot(if on {
+                cx.theme().success
+            } else {
+                cx.theme().muted_foreground
+            })
+        };
+
+        // Left: the shared server and the workers.
+        let nginx_label = match (&self.settings.active_nginx, nginx_up) {
+            (Some(version), true) if wide => format!("nginx {version}"),
+            (Some(_), false) if wide => "nginx stopped".to_string(),
+            _ => "nginx".to_string(),
+        };
+        let php_label = if wide {
+            format!("PHP {workers} of {desired}")
+        } else {
+            format!("PHP {workers}/{desired}")
+        };
+
+        let mut bar = StatusBar::new()
+            .left(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(state_dot(nginx_up, cx))
+                    .child(nginx_label),
+            )
+            .left(Separator::vertical())
+            .left(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(state_dot(workers > 0, cx))
+                    .child(php_label),
+            );
+
+        // Center: the selected project, ellipsised rather than clipped.
+        if let Some(project) = self.selected_project() {
+            let serving = self.nginx_on.contains(&project.id);
+            let state = if serving { "serving" } else { "stopped" };
+            let text = if wide {
+                format!(
+                    "{} \u{00b7} {} {}{}",
+                    project.name,
+                    state,
+                    scheme_prefix(project.ssl_enabled),
+                    project.domain
+                )
+            } else {
+                format!("{} \u{00b7} {state}", project.name)
+            };
+            bar = bar.child(div().text_ellipsis().overflow_hidden().child(text));
+        }
+
+        // Right: ambient notices.
+        let hosts = match self.mode {
+            ControlMode::Elevated => "elevated",
+            ControlMode::Task => "no-prompt",
+            ControlMode::Uac => "asks",
+        };
+        let hosts_label = if wide {
+            format!("Hosts: {hosts}")
+        } else {
+            hosts.to_string()
+        };
+        bar = bar.right(
+            Button::new("status-hosts")
+                .ghost()
+                .xsmall()
+                .icon(icon(IconName::ShieldCheck))
+                .label(hosts_label)
+                .tooltip("How Wisp writes the hosts file")
+                .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Settings, cx))),
+        );
+
+        if let Some(version) = self.settings.available_version.clone() {
+            bar = bar.right(
+                Button::new("status-update")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon(IconName::Download))
+                    .label(format!("v{version}"))
+                    .tooltip("An update is available")
+                    .on_click(cx.listener(|this, _, _window, cx| this.goto(Screen::Settings, cx))),
+            );
+        }
+
+        // Global site controls, condensed rather than hidden.
+        let any_running = !self.nginx_on.is_empty() || !self.php_on.is_empty();
+        let any_stopped = self
+            .projects
+            .iter()
+            .any(|project| project.php_version.is_some() && !self.is_on(project.id));
+        let busy = self.serve_busy;
+
+        let (start, restart, stop) = if wide {
+            ("Start all", "Restart all", "Stop all")
+        } else {
+            ("Start", "Restart", "Stop")
+        };
+        let labels = if compact {
+            Some((start, restart, stop))
+        } else {
+            None
+        };
+
+        let site_button = |id: &str,
+                           icon_name: IconName,
+                           label: &str,
+                           tip: &str,
+                           enabled: bool,
+                           action: fn(&mut Wisp, &mut Context<Wisp>)| {
+            let mut button = Button::new(id.to_string())
+                .ghost()
+                .xsmall()
+                .icon(icon(icon_name))
+                .tooltip(tip.to_string())
+                .disabled(busy || !enabled);
+            if let Some((_, _, _)) = labels {
+                button = button.label(label.to_string());
+            }
+            let action: fn(&mut Wisp, &mut Context<Wisp>) = action;
+            button.on_click(cx.listener(move |this, _, _window, cx| action(this, cx)))
+        };
+
+        bar.right(site_button(
+            "status-start-all",
+            IconName::Play,
+            labels.map_or("", |l| l.0),
+            "Start every project and nginx",
+            any_stopped,
+            Wisp::start_all,
+        ))
+        .right(site_button(
+            "status-restart-all",
+            IconName::RotateCcw,
+            labels.map_or("", |l| l.1),
+            "Restart every project's worker",
+            any_running,
+            Wisp::restart_all,
+        ))
+        .right(site_button(
+            "status-stop-all",
+            IconName::Square,
+            labels.map_or("", |l| l.2),
+            "Stop every project and nginx",
+            any_running,
+            Wisp::stop_all,
+        ))
+        .into_any_element()
+    }
+
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -1739,66 +1912,6 @@ impl Wisp {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child({
-                        let any_stopped = self.projects.iter().any(|project| {
-                            project.php_version.is_some() && !self.is_on(project.id)
-                        });
-                        let any_running = !self.nginx_on.is_empty() || !self.php_on.is_empty();
-                        let busy = self.serve_busy;
-
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("All sites"),
-                            )
-                            .child(
-                                Button::new("start-all")
-                                    .outline()
-                                    .small()
-                                    .icon(icon(IconName::Play))
-                                    .label("Start")
-                                    .tooltip("Start every project and nginx")
-                                    .disabled(busy || !any_stopped)
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.start_all(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("restart-all")
-                                    .outline()
-                                    .small()
-                                    .icon(icon(IconName::RotateCcw))
-                                    .label("Restart")
-                                    .tooltip("Restart every project's worker")
-                                    .disabled(busy || !any_running)
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.restart_all(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("stop-all")
-                                    .danger()
-                                    .small()
-                                    .icon(icon(IconName::Square))
-                                    .label("Stop")
-                                    .tooltip("Stop every project and nginx")
-                                    .disabled(busy || !any_running)
-                                    .on_click(
-                                        cx.listener(|this, _, _window, cx| this.stop_all(cx)),
-                                    ),
-                            )
-                            .child(if busy {
-                                Spinner::new().small().into_any_element()
-                            } else {
-                                div().into_any_element()
-                            })
-                    })
                     .child(
                         Button::new("new-project")
                             .primary()
@@ -2851,6 +2964,7 @@ impl Render for Wisp {
                         .child(self.content(cx)),
                 ),
         )
+        .child(self.status_bar(window, cx))
     }
 }
 
