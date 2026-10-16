@@ -25,8 +25,10 @@ use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem as _, SidebarMenu,
+    SidebarMenuItem,
 };
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
@@ -305,6 +307,8 @@ pub struct Wisp {
     projects: Vec<Project>,
     selected: Option<i64>,
     editor: Option<EditorState>,
+    /// Whether the sidebar is collapsed to its icons.
+    sidebar_collapsed: bool,
     /// The php.ini editor, when it is open.
     ini_editor: Option<IniEditor>,
     /// A persistent problem (e.g. the database could not be opened).
@@ -403,6 +407,7 @@ impl Wisp {
         let log_follow = settings.log_follow.unwrap_or(true);
         let log_wrap = settings.log_wrap.unwrap_or(false);
         let log_case = settings.log_case.unwrap_or(false);
+        let sidebar_collapsed = settings.sidebar_collapsed.unwrap_or(false);
 
         let mut this = Self {
             theme: settings.theme,            settings,
@@ -414,6 +419,7 @@ impl Wisp {
             selected: None,
             editor: None,
             ini_editor: None,
+            sidebar_collapsed,
             error,
             screen: Screen::Projects,
             runtimes: Vec::new(),
@@ -2499,6 +2505,14 @@ impl Wisp {
                     .items_center()
                     .gap_2()
                     .child(
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::PanelLeft))
+                            .tooltip("Show or hide the project list")
+                            .on_click(cx.listener(|this, _, _window, cx| this.toggle_sidebar(cx))),
+                    )
+                    .child(
                         Button::new("open-palette")
                             .ghost()
                             .small()
@@ -2677,6 +2691,8 @@ impl Wisp {
             SidebarHeader::new().child(div().w_full().child(Input::new(&self.project_filter)));
 
         Sidebar::new("wisp-sidebar")
+            .collapsible(SidebarCollapsible::Icon)
+            .collapsed(self.sidebar_collapsed)
             .header(header)
             .child(SidebarGroup::new("Projects").child(menu))
             .footer(nav.render("sidebar-nav", window, cx))
@@ -3109,6 +3125,14 @@ impl Wisp {
             ),
             None => ("php-cgi".to_string(), String::new()),
         }
+    }
+
+    /// Collapse or expand the sidebar, and remember the choice.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.settings.sidebar_collapsed = Some(self.sidebar_collapsed);
+        self.settings.save();
+        cx.notify();
     }
 
     /// Show or hide the command palette, focusing its field when it appears.
@@ -4204,14 +4228,18 @@ impl Render for Wisp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(sidebar)
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h_full()
-                            .overflow_hidden()
-                            .child(content),
+                        // The sidebar can be dragged wider, and collapses to
+                        // icons from the toggle in the top bar.
+                        h_resizable("wisp-shell")
+                            .child(resizable_panel().child(sidebar))
+                            .child(resizable_panel().child(
+                                div()
+                                    .min_w(px(0.))
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(content),
+                            )),
                     ),
             )
             .child(status);
@@ -4848,11 +4876,13 @@ fn detail_row_action(
                 .child(label.to_string()),
         )
         .child(
-            // Sized to its text so the button sits beside the value rather than
-            // being pushed to the far edge; a long value wraps inside the cap.
+            // Sized to its text so the button sits beside the value, but free to
+            // shrink below that so a long path wraps inside the card instead of
+            // pushing the button off the edge.
             div()
-                .flex_shrink(0.0)
-                .max_w(px(520.))
+                .flex_shrink(1.0)
+                .min_w(px(0.))
+                .overflow_hidden()
                 .text_sm()
                 .whitespace_normal()
                 .child(value.to_string()),

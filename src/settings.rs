@@ -66,6 +66,9 @@ pub struct Settings {
     /// Log viewer: match the search term case-sensitively.
     #[serde(default)]
     pub log_case: Option<bool>,
+    /// Whether the sidebar is collapsed to its icons.
+    #[serde(default)]
+    pub sidebar_collapsed: Option<bool>,
 }
 
 impl Settings {
