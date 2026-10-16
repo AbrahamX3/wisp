@@ -2568,73 +2568,76 @@ impl Wisp {
             );
         }
 
-        // Global site controls, condensed rather than hidden.
-        let any_running = !self.nginx_on.is_empty() || !self.php_on.is_empty();
-        let any_stopped = self
-            .projects
-            .iter()
-            .any(|project| project.php_version.is_some() && !self.is_on(project.id));
-        let busy = self.serve_busy;
+        // The centre of the bar names the selected project, so these act on it
+        // rather than on every site. There is no need to say "all" when the bar
+        // already says which. Everything at once stays on the tray menu and in
+        // the palette, where a bulk command belongs.
+        let mut controls = div().flex().flex_row().items_center().gap_1();
 
-        let (start, restart, stop) = if wide {
-            ("Start all", "Restart all", "Stop all")
-        } else {
-            ("Start", "Restart", "Stop")
-        };
-        let labels = if compact {
-            Some((start, restart, stop))
-        } else {
-            None
-        };
+        if let Some(project) = self.selected_project() {
+            let id = project.id;
+            let name = project.name.clone();
+            let (serving, worker) = self.project_state(id);
+            let any_up = serving || worker;
+            let busy = self.serve_busy;
+            let labelled = compact;
 
-        let site_button = |id: &str,
-                           icon_name: IconName,
-                           label: &str,
-                           tip: &str,
-                           enabled: bool,
-                           action: fn(&mut Wisp, &mut Context<Wisp>)| {
-            let mut button = Button::new(id.to_string())
-                .ghost()
-                .xsmall()
-                .icon(icon(icon_name))
-                .tooltip(tip.to_string())
-                .disabled(busy || !enabled);
-            if let Some((_, _, _)) = labels {
-                button = button.label(label.to_string());
-            }
-            let action: fn(&mut Wisp, &mut Context<Wisp>) = action;
-            button.on_click(cx.listener(move |this, _, _window, cx| action(this, cx)))
-        };
+            let button = |element_id: &'static str,
+                              icon_name: IconName,
+                              label: &'static str,
+                              tip: String,
+                              enabled: bool| {
+                let button = Button::new(element_id)
+                    .ghost()
+                    .xsmall()
+                    .icon(icon(icon_name))
+                    .tooltip(tip)
+                    .disabled(busy || !enabled);
+                if labelled {
+                    button.label(label)
+                } else {
+                    button
+                }
+            };
 
-        let controls = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(site_button(
-                "status-start-all",
-                IconName::Play,
-                labels.map_or("", |l| l.0),
-                "Start every project and nginx",
-                any_stopped,
-                Wisp::start_all,
-            ))
-            .child(site_button(
-                "status-restart-all",
-                IconName::RotateCcw,
-                labels.map_or("", |l| l.1),
-                "Restart every project's worker",
-                any_running,
-                Wisp::restart_all,
-            ))
-            .child(site_button(
-                "status-stop-all",
-                IconName::Square,
-                labels.map_or("", |l| l.2),
-                "Stop every project and nginx",
-                any_running,
-                Wisp::stop_all,
-            ));
+            controls = controls
+                .child(
+                    button(
+                        "status-start",
+                        IconName::Play,
+                        "Start",
+                        format!("Start {name}"),
+                        !(serving && worker),
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.set_project(id, true, cx)
+                    })),
+                )
+                .child(
+                    button(
+                        "status-restart",
+                        IconName::RotateCcw,
+                        "Restart",
+                        format!("Restart {name}"),
+                        any_up,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.restart_project(id, cx)
+                    })),
+                )
+                .child(
+                    button(
+                        "status-stop",
+                        IconName::Square,
+                        "Stop",
+                        format!("Stop {name}"),
+                        any_up,
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.set_project(id, false, cx)
+                    })),
+                );
+        }
 
         bar.right(Separator::vertical())
             .right(controls)
