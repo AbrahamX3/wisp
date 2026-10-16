@@ -137,6 +137,38 @@ impl ProjectTab {
     }
 }
 
+/// Which pane of the Runtimes screen is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeTab {
+    Php,
+    Nginx,
+    Https,
+    Hosts,
+    Resources,
+}
+
+impl RuntimeTab {
+    fn index(self) -> usize {
+        match self {
+            RuntimeTab::Php => 0,
+            RuntimeTab::Nginx => 1,
+            RuntimeTab::Https => 2,
+            RuntimeTab::Hosts => 3,
+            RuntimeTab::Resources => 4,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => RuntimeTab::Nginx,
+            2 => RuntimeTab::Https,
+            3 => RuntimeTab::Hosts,
+            4 => RuntimeTab::Resources,
+            _ => RuntimeTab::Php,
+        }
+    }
+}
+
 /// Process-wide owner of nginx and the PHP workers, so the app-quit hook can
 /// stop them, and the background sync can move it in and out.
 pub struct ServerGlobal(pub serve::Supervisor);
@@ -253,6 +285,8 @@ pub struct Wisp {
     /// The Ctrl-K command palette and whether it is showing.
     palette: Entity<CommandState>,
     palette_open: bool,
+    /// Which pane of the Runtimes screen is showing.
+    runtime_tab: RuntimeTab,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -328,6 +362,7 @@ impl Wisp {
             metrics: VecDeque::new(),
             palette,
             palette_open: false,
+            runtime_tab: RuntimeTab::Php,
             _subscriptions,
         };
         this.reload(cx);
@@ -3007,19 +3042,40 @@ impl Wisp {
             column = column.child(self.vcrt_banner(vc, cx));
         }
 
-        column = column.child(self.https_card(cx));
-        column = column.child(self.hosting_card(cx));
-        column = column.child(self.php_section(cx));
-        column = column.child(self.nginx_section(cx));
+        let tabs = TabBar::new("runtime-tabs")
+            .segmented()
+            .selected_index(self.runtime_tab.index())
+            .children([
+                Tab::new().label("PHP"),
+                Tab::new().label("nginx"),
+                Tab::new().label("HTTPS"),
+                Tab::new().label("Hosts"),
+                Tab::new().label("Resources"),
+            ])
+            .on_click(cx.listener(|this, index, _window, cx| {
+                this.runtime_tab = RuntimeTab::from_index(*index);
+                cx.notify();
+            }));
+
+        let body: AnyElement = match self.runtime_tab {
+            RuntimeTab::Php => self.php_section(cx).into_any_element(),
+            RuntimeTab::Nginx => self.nginx_section(cx).into_any_element(),
+            RuntimeTab::Https => self.https_card(cx).into_any_element(),
+            RuntimeTab::Hosts => self.hosting_card(cx).into_any_element(),
+            RuntimeTab::Resources => self.resources_card(cx),
+        };
 
         div()
             .id("services")
             .flex()
             .flex_col()
             .size_full()
+            .gap_4()
             .p(px(28.))
             .overflow_y_scrollbar()
             .child(column)
+            .child(tabs)
+            .child(body)
             .into_any_element()
     }
 
