@@ -22,6 +22,7 @@ use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
@@ -2048,7 +2049,7 @@ impl Wisp {
                 .flex_col()
                 .gap_1()
                 .p(px(10.))
-                .overflow_y_scroll()
+                .overflow_y_scrollbar()
                 .min_h(px(0.))
                 .children(self.projects.iter().map(|project| {
                     let is_selected = selected == Some(project.id) && !on_services;
@@ -2351,7 +2352,7 @@ impl Wisp {
             .size_full()
             .gap_6()
             .p(px(28.))
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(header)
             .child(details)
             .child(services)
@@ -2426,7 +2427,7 @@ impl Wisp {
             .flex_col()
             .size_full()
             .p(px(28.))
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(column)
             .into_any_element()
     }
@@ -2516,8 +2517,7 @@ impl Wisp {
                 .w_full()
                 .min_w(px(0.))
                 .h(px(220.))
-                .overflow_x_scroll()
-                .overflow_y_scroll()
+                .overflow_scrollbar()
                 .px(px(18.))
                 .pb(px(16.))
                 .font_family(cx.theme().mono_font_family.clone())
@@ -3932,7 +3932,7 @@ fn editor_form(
     div()
         .id("editor-scroll")
         .max_h(cap)
-        .overflow_y_scroll()
+        .overflow_y_scrollbar()
         .child(form)
 }
 
