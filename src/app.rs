@@ -35,7 +35,6 @@ use gpui_kit::component::sidebar::{
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -3613,45 +3612,77 @@ impl Wisp {
         })
         .collect();
 
-        let mut levels: Vec<AnyElement> = LogLevel::for_kind(current)
-            .iter()
-            .map(|level| {
-                let level = *level;
-                let button = Button::new(format!("log-level-{}", level.label()))
-                    .small()
-                    .label(level.label());
-                let button = if level == self.log_level {
-                    button.primary()
-                } else {
-                    button.outline()
-                };
-                button
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.log_level = level;
-                        this.log_match = 0;
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-        levels.insert(0, Separator::vertical().into_any_element());
+        let leading: Vec<AnyElement> = sources;
 
         let count = if matching {
-            format!("{} of {} lines", self.log_match.saturating_add(1).min(shown), shown)
+            format!(
+                "{} of {} lines",
+                self.log_match.saturating_add(1).min(shown),
+                shown
+            )
         } else {
             format!("{total} lines")
         };
-        let leading: Vec<AnyElement> = sources.into_iter().chain(levels).collect();
+        // One button rather than a chip per level: the toolbar has to hold the
+        // search, the navigation and the toggles too, and they were being
+        // pushed off the edge.
+        let level_button = {
+            let current_level = self.log_level;
+            let entity = cx.entity();
+            Button::new("log-level")
+                .outline()
+                .small()
+                .label(current_level.label())
+                .tooltip("Filter by level or status")
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    let mut menu = menu.check_side(Side::Right);
+                    for level in LogLevel::for_kind(current).iter().copied() {
+                        let entity = entity.clone();
+                        let is_current = level == current_level;
+                        menu = menu.item(
+                            PopupMenuItem::new(level.label())
+                                .checked(is_current)
+                                .on_click(move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.log_level = level;
+                                        this.log_match = 0;
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+        };
+
         let header = section_header("Logs", "The tail of this project's logs.", cx);
-        let toolbar = Toolbar::new("logs-toolbar")
-            .contents(leading)
-            .content(
+        // Laid out here rather than through Toolbar: the log has more controls
+        // than fit on one line, and wrapping them onto a second is better than
+        // pushing the search box off the edge.
+        let toolbar = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(px(18.))
+            .pb(px(10.))
+            .child(
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(div().w(px(220.)).child(Input::new(&self.log_filter)))
+                    .children(leading)
+                    .child(level_button),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(180.)).child(Input::new(&self.log_filter)))
                     .child({
                         let button = Button::new("log-case")
                             .small()
@@ -3822,7 +3853,7 @@ impl Wisp {
                 .flex_col()
                 .gap_1()
                 .child(header)
-                .child(div().px(px(18.)).pb(px(6.)).child(toolbar))
+                .child(toolbar)
                 .child(body),
         )
     }
