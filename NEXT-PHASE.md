@@ -29,9 +29,7 @@ and case choice persisted in `settings.json`.
 
 Still open:
 
-- **Row stripe is barely visible** — `list_hover` turned out to be very subtle as
-  a row background. Needs a token with more presence, or a separator between
-  rows instead.
+- Nothing else yet.
 
 ## php.ini editor
 
@@ -54,13 +52,8 @@ project's domain with how long ago its certificate was issued.
 
 Still open:
 
-- **`DataTable`** for the version lists — deliberately not done. `DataTable`
-  needs a full `TableDelegate` implementation per table, and the rows gained the
-  information that mattered (progress, install state) without it. Revisit if the
-  lists grow columns.
-- Nothing reads the certificates themselves (issuer, expiry); only file ages are
-  shown, because parsing `not_after` needs a date library that is not a
-  dependency yet.
+- Nothing reads the certificates themselves beyond expiry — issuer and key type
+  are not shown.
 
 ## Shell and chrome
 
@@ -102,11 +95,29 @@ Still open:
 
 ## Traps worth remembering
 
+- **A `ResizablePanelGroup` splits space evenly unless a panel asks for a size.**
+  Leaving `resizable_panel()` bare gave the sidebar half the window. Use
+  `.size(...)` (and `.size_range(...)`) the way the component documents.
+- **The theme's surface tokens are all close to each other.** `muted`, `accent`,
+  `background` and a translucent overlay were each indistinguishable from the
+  card's `secondary` when used as a row background. Derive a shade from the
+  colour you are sitting on instead. When a fill seems not to paint, try one
+  garish colour first: it separates "wrong colour" from "not painting" in one
+  build.
+- **Never nest a scroll region inside another.** The log pane sized itself and
+  scrolled inside the page's scroll region, so the wheel moved both.
+- **`PrintWindow` with `PW_RENDERFULLCONTENT` captures a GPUI window's own
+  pixels**, even when it is behind another window.
+  `scripts/capture-window.ps1` does this, which is how the sidebar width, the
+  log overflow and the stripe were all caught without grabbing the screen.
 - **PowerShell splices over a function range can eat the next one.** Twice now,
   replacing a method by line range removed methods that sat between the start
   and the assumed end (`hosting_card`, then `toggle_palette` and
   `palette_overlay`). After any range edit, grep for the neighbouring method
   names before building.
+- **Watch out for paths you guess.** Deleting `certs\domains\<domain>` when the
+  real layout is `certs\<domain>` silently did nothing, which made a
+  certificate fix look broken for a whole build cycle.
 - **Force-killing Wisp leaks nginx.** `Stop-Process -Force` skips the app-quit
   hook that stops nginx and the workers, so `nginx.exe` keeps ports 80 and 443 and
   the next start fails with a confusing sync error. The supervisor sweeps orphans
