@@ -6,6 +6,8 @@ FastCGI worker per project.
 
 Built in Rust with [GPUI Kit](https://gpui-kit.com).
 
+See [NEXT-PHASE.md](NEXT-PHASE.md) for what is still open.
+
 > **Status:** the shell, the icon pipeline, settings/tray/autostart/update, SQLite
 > project storage with the projects UI, the Services page (PHP/nginx runtimes with
 > install, update and uninstall), serving per project (generated nginx vhosts plus
