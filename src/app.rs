@@ -13,7 +13,7 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::form::{Field, Form};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -99,6 +99,7 @@ enum LogKind {
     Access,
     Errors,
     Php,
+    Worker,
 }
 
 impl LogKind {
@@ -107,6 +108,7 @@ impl LogKind {
             LogKind::Access => "Access",
             LogKind::Errors => "Errors",
             LogKind::Php => "PHP",
+            LogKind::Worker => "Worker",
         }
     }
 
@@ -115,6 +117,7 @@ impl LogKind {
             LogKind::Access => "access.log",
             LogKind::Errors => "error.log",
             LogKind::Php => "php-error.log",
+            LogKind::Worker => "php-cgi.log",
         }
     }
 }
@@ -133,6 +136,8 @@ struct EditorState {
     domain_auto: bool,
     php_version: Option<String>,
     ssl_enabled: bool,
+    /// Extra `php.ini` directives, one per line, appended last.
+    overrides: Entity<TextareaState>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -280,7 +285,7 @@ impl Wisp {
             .map(ProjectDraft::from_project)
             .unwrap_or_else(|| ProjectDraft {
                 ssl_enabled: true,
-                php_ini_overrides: "{}".to_string(),
+                php_ini_overrides: String::new(),
                 ..Default::default()
             });
 
@@ -305,6 +310,11 @@ impl Wisp {
             InputState::new(window, cx)
                 .placeholder("my-app")
                 .default_value(domain_label)
+        });
+        let overrides = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("upload_max_filesize = 128M\nmax_execution_time = 300")
+                .default_value(draft.php_ini_overrides.clone())
         });
 
         // The domain mirrors the app name until the user edits it directly.
@@ -338,6 +348,7 @@ impl Wisp {
             domain_auto: existing.is_none(),
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
+            overrides,
             error: None,
             _subscriptions: vec![app_sub, domain_sub],
         });
@@ -481,7 +492,7 @@ impl Wisp {
             ),
             php_version: editor.php_version.clone(),
             ssl_enabled: editor.ssl_enabled,
-            php_ini_overrides: "{}".to_string(),
+            php_ini_overrides: editor.overrides.read(cx).value().to_string(),
         };
         let id = editor.id;
         let before = id.and_then(|id| self.projects.iter().find(|p| p.id == id).cloned());
@@ -957,6 +968,7 @@ impl Wisp {
                 root: PathBuf::from(&project.root_path),
                 php_version: php,
                 ssl_enabled: project.ssl_enabled,
+                php_ini_overrides: project.php_ini_overrides.clone(),
             });
         }
         Ok(specs)
@@ -2253,8 +2265,10 @@ impl Wisp {
             .flex_row()
             .items_center()
             .gap_2()
-            .children([LogKind::Access, LogKind::Errors, LogKind::Php].into_iter().map(
-                |kind| {
+            .children(
+                [LogKind::Access, LogKind::Errors, LogKind::Php, LogKind::Worker]
+                    .into_iter()
+                    .map(|kind| {
                     let button = Button::new(format!("log-{}", kind.label()))
                         .small()
                         .label(kind.label());
@@ -3414,6 +3428,12 @@ fn editor_form(
                         });
                     })
             }),
+        )
+        .child(
+            Field::new()
+                .label("php.ini overrides")
+                .description("One directive per line, applied last so they win. The file is regenerated on every start.")
+                .child(Textarea::new(&editor.overrides).h(px(120.))),
         );
 
     if let Some(message) = error {

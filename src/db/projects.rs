@@ -61,7 +61,11 @@ impl ProjectDraft {
             domain: project.domain.clone(),
             php_version: project.php_version.clone(),
             ssl_enabled: project.ssl_enabled,
-            php_ini_overrides: project.php_ini_overrides.clone(),
+            php_ini_overrides: if project.php_ini_overrides.trim() == "{}" {
+                String::new()
+            } else {
+                project.php_ini_overrides.clone()
+            },
         }
     }
 
@@ -74,8 +78,10 @@ impl ProjectDraft {
             self.app_name = slugify(&self.name);
         }
         self.app_name = slugify(&self.app_name);
-        if self.php_ini_overrides.trim().is_empty() {
-            self.php_ini_overrides = "{}".to_string();
+        self.php_ini_overrides = self.php_ini_overrides.trim().to_string();
+        // Older records stored an empty JSON object; treat it as "none".
+        if self.php_ini_overrides == "{}" {
+            self.php_ini_overrides.clear();
         }
 
         if self.name.is_empty() {

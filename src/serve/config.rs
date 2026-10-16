@@ -167,12 +167,17 @@ server {{
 }
 
 /// Build a per-project `php.ini` from the runtime's `php.ini-development`
-/// template: enable every extension the build offers, and append the
-/// development overrides Wisp wants.
+/// template: enable every extension the build offers, append the development
+/// overrides Wisp wants, then the project's own directives last so they win.
 ///
 /// `extension_dir` must be set before any `extension=` line, or PHP cannot find
 /// the DLLs, so it goes at the very top, ahead of the template.
-pub fn php_ini(template: &str, extension_dir: &Path, error_log: &Path) -> String {
+pub fn php_ini(
+    template: &str,
+    extension_dir: &Path,
+    error_log: &Path,
+    overrides: &str,
+) -> String {
     let extension_dir = nginx_path(extension_dir);
     let error_log = nginx_path(error_log);
 
@@ -198,6 +203,13 @@ post_max_size=64M\n\
 max_execution_time=120\n\
 ",
     ));
+
+    let overrides = overrides.trim();
+    if !overrides.is_empty() {
+        out.push_str("\n; ---- Project overrides ------------------------------------------------\n");
+        out.push_str(overrides);
+        out.push('\n');
+    }
     out
 }
 
@@ -298,6 +310,7 @@ mod tests {
             ";extension=intl\n;extension=curl\n;extension=snmp\n;extension=pdo_firebird\nmemory_limit=128M\n",
             Path::new(r"C:\php\ext"),
             Path::new(r"C:\logs\php-error.log"),
+            "",
         );
         assert!(ini.lines().any(|line| line.trim() == "extension=intl"));
         assert!(ini.lines().any(|line| line.trim() == "extension=curl"));
@@ -327,6 +340,7 @@ mod tests {
             "memory_limit=128M\n",
             Path::new(r"C:\php\ext"),
             Path::new(r"C:\logs\php-error.log"),
+            "upload_max_filesize = 256M\nmemory_limit = 1G\n",
         );
         // The override must win, which means appearing later in the file.
         let template_at = ini.find("memory_limit=128M").unwrap();
@@ -335,6 +349,11 @@ mod tests {
         assert!(ini.contains(r#"extension_dir="C:/php/ext""#));
         assert!(ini.contains("cgi.fix_pathinfo=0"));
         assert!(ini.contains(r#"error_log="C:/logs/php-error.log""#));
+
+        // The project's own directives come after everything and therefore win.
+        let project_at = ini.find("memory_limit = 1G").unwrap();
+        assert!(project_at > override_at, "project overrides come last");
+        assert!(ini.contains("upload_max_filesize = 256M"));
     }
 
     #[test]
@@ -376,6 +395,7 @@ mod tests {
             &template,
             &dir.join("ext"),
             &std::env::temp_dir().join("wisp-error.log"),
+            "",
         );
         let ini_path = std::env::temp_dir().join("wisp-generated-php.ini");
         std::fs::write(&ini_path, ini).unwrap();

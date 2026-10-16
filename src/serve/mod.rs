@@ -44,6 +44,8 @@ pub struct SiteSpec {
     pub root: PathBuf,
     pub php_version: String,
     pub ssl_enabled: bool,
+    /// Raw `php.ini` directives the project adds, appended last.
+    pub php_ini_overrides: String,
 }
 
 /// A snapshot of what is actually running.
@@ -229,7 +231,7 @@ impl Supervisor {
         let error_log = dir.join("logs").join("php-error.log");
 
         let path = dir.join("php.ini");
-        let contents = config::php_ini(&template, &extension_dir, &error_log);
+        let contents = config::php_ini(&template, &extension_dir, &error_log, &site.php_ini_overrides);
         let changed = match std::fs::read_to_string(&path) {
             Ok(existing) => existing != contents,
             Err(_) => true,
@@ -513,6 +515,7 @@ mod tests {
             root: site,
             php_version: "8.3.35".to_string(),
             ssl_enabled: false,
+            php_ini_overrides: String::new(),
         };
 
         let mut supervisor = Supervisor::default();
@@ -566,6 +569,7 @@ mod tests {
                     root: std::path::PathBuf::from(&project.root_path),
                     php_version: php,
                     ssl_enabled: project.ssl_enabled,
+                    php_ini_overrides: project.php_ini_overrides.clone(),
                 })
             })
             .collect();
@@ -639,6 +643,7 @@ mod tests {
             root: site,
             php_version: "8.3.35".to_string(),
             ssl_enabled: true,
+            php_ini_overrides: String::new(),
         };
 
         let mut supervisor = Supervisor::default();
