@@ -7,11 +7,11 @@ FastCGI worker per project.
 Built in Rust with [GPUI Kit](https://gpui-kit.com).
 
 > **Status:** the shell, the icon pipeline, settings/tray/autostart/update, SQLite
-> project storage with the projects UI, the Services page (PHP/nginx catalog with
-> install, update and uninstall), serving projects (generated nginx vhosts plus a
-> per-project php-cgi worker), local HTTPS with a per-domain certificate
-> authority, and `.test` hosts entries via an elevated helper are in place. The
-> log viewer is next.
+> project storage with the projects UI, the Services page (PHP/nginx runtimes with
+> install, update and uninstall), serving per project (generated nginx vhosts plus
+> a per-project php-cgi worker with its own php.ini), local HTTPS with a
+> per-domain certificate authority, `.test` hosts entries via an elevated helper,
+> and a per-project log viewer are in place.
 
 ## What it will do
 

@@ -31,6 +31,7 @@ use crate::db::{self, InstalledRuntime, Project, ProjectDraft, Store};
 use crate::elevation::{self, ActionOutcome, ControlMode};
 use crate::helper_task::{self, TaskError};
 use crate::hosts;
+use crate::logs;
 use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::serve::{self, SiteSpec};
@@ -92,6 +93,32 @@ pub struct ServerGlobal(pub serve::Supervisor);
 
 impl Global for ServerGlobal {}
 
+/// Which log file the project detail is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogKind {
+    Access,
+    Errors,
+    Php,
+}
+
+impl LogKind {
+    fn label(self) -> &'static str {
+        match self {
+            LogKind::Access => "Access",
+            LogKind::Errors => "Errors",
+            LogKind::Php => "PHP",
+        }
+    }
+
+    fn file(self) -> &'static str {
+        match self {
+            LogKind::Access => "access.log",
+            LogKind::Errors => "error.log",
+            LogKind::Php => "php-error.log",
+        }
+    }
+}
+
 /// The create/edit dialog's live state. `id` is `None` while creating.
 struct EditorState {
     id: Option<i64>,
@@ -149,6 +176,9 @@ pub struct Wisp {
     /// A folder chosen in the native picker, applied to the editor on next render
     /// (which is where a `Window` is available).
     pending_root: Option<String>,
+    /// Which log the project detail shows, and its tail.
+    log_kind: LogKind,
+    log_lines: Vec<String>,
 }
 
 impl Wisp {
@@ -185,6 +215,8 @@ impl Wisp {
             elevation_busy: false,
             hosts_written: Vec::new(),
             pending_root: None,
+            log_kind: LogKind::Php,
+            log_lines: Vec::new(),
         };
         this.reload(cx);
         // Show the first project on launch rather than an empty pane.
@@ -194,6 +226,7 @@ impl Wisp {
         this.reload_runtimes(cx);
         this.load_catalog(cx);
         Self::spawn_status_poll(cx);
+        Self::spawn_log_poll(cx);
         Self::spawn_mode_probe(cx);
 
         Self::spawn_auto_update_check(cx);
@@ -1175,6 +1208,59 @@ impl Wisp {
         .detach();
     }
 
+    // ---- logs ------------------------------------------------------------
+
+    fn selected_log_path(&self) -> Option<PathBuf> {
+        let project = self.selected_project()?;
+        Some(serve::config::site_logs(&project.slug()).join(self.log_kind.file()))
+    }
+
+    /// Re-read the selected log's tail.
+    fn refresh_logs(&mut self, cx: &mut Context<Self>) {
+        let lines = match self.selected_log_path() {
+            Some(path) => logs::tail(&path, 256 * 1024, 400),
+            None => Vec::new(),
+        };
+        if lines != self.log_lines {
+            self.log_lines = lines;
+            cx.notify();
+        }
+    }
+
+    /// Poll the selected project's log while the Projects screen is open.
+    fn spawn_log_poll(cx: &mut Context<Self>) {
+        cx.spawn(async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(2000))
+                    .await;
+                let applied = entity.update(cx, |this, cx| {
+                    if this.screen == Screen::Projects {
+                        this.refresh_logs(cx);
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn clear_log(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_log_path() {
+            let _ = std::fs::write(&path, "");
+        }
+        self.refresh_logs(cx);
+    }
+
+    fn open_log_folder(&mut self, cx: &mut Context<Self>) {
+        if let Some(slug) = self.selected_project().map(|project| project.slug()) {
+            let path = serve::config::site_logs(&slug).to_string_lossy().to_string();
+            self.open_folder(&path, cx);
+        }
+    }
+
     // ---- service controls ------------------------------------------------
 
     fn refresh_serve_status(&mut self, cx: &mut Context<Self>) {
@@ -2089,6 +2175,8 @@ impl Wisp {
                 ),
         );
 
+        let logs = self.logs_card(cx);
+
         div()
             .id("content")
             .flex()
@@ -2100,6 +2188,7 @@ impl Wisp {
             .child(header)
             .child(details)
             .child(services)
+            .child(logs)
             .into_any_element()
     }
 
@@ -2171,6 +2260,110 @@ impl Wisp {
             .overflow_y_scroll()
             .child(column)
             .into_any_element()
+    }
+
+    /// The selected project's log tail, with a file picker and controls.
+    fn logs_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.log_kind;
+        let picker = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .children([LogKind::Access, LogKind::Errors, LogKind::Php].into_iter().map(
+                |kind| {
+                    let button = Button::new(format!("log-{}", kind.label()))
+                        .small()
+                        .label(kind.label());
+                    let button = if kind == current {
+                        button.primary()
+                    } else {
+                        button.outline()
+                    };
+                    button
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            if this.log_kind != kind {
+                                this.log_kind = kind;
+                                this.log_lines.clear();
+                                this.refresh_logs(cx);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                },
+            ));
+
+        let header = section_header("Logs", "The tail of this project's logs.", cx);
+        let toolbar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px(px(18.))
+            .pb(px(10.))
+            .child(picker)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("log-folder")
+                            .outline()
+                            .small()
+                            .icon(icon(IconName::FolderOpen))
+                            .label("Folder")
+                            .on_click(cx.listener(|this, _, _window, cx| this.open_log_folder(cx))),
+                    )
+                    .child(
+                        Button::new("log-clear")
+                            .outline()
+                            .small()
+                            .label("Clear")
+                            .on_click(cx.listener(|this, _, _window, cx| this.clear_log(cx))),
+                    ),
+            );
+
+        let body = if self.log_lines.is_empty() {
+            div()
+                .px(px(18.))
+                .pb(px(16.))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Nothing logged yet.")
+                .into_any_element()
+        } else {
+            div()
+                .id("log-lines")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px(px(18.))
+                .pb(px(16.))
+                .h(px(220.))
+                .overflow_y_scroll()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_xs()
+                .children(
+                    self.log_lines
+                        .iter()
+                        .map(|line| div().whitespace_nowrap().child(line.clone())),
+                )
+                .into_any_element()
+        };
+
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(header)
+                .child(toolbar)
+                .child(body),
+        )
     }
 
     fn https_card(&self, cx: &mut Context<Self>) -> impl IntoElement {

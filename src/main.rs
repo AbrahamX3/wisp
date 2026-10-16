@@ -18,6 +18,7 @@ mod elevation;
 mod fonts;
 mod helper_task;
 mod hosts;
+mod logs;
 mod platform;
 mod runtime;
 mod serve;
