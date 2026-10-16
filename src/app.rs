@@ -2552,7 +2552,7 @@ impl Wisp {
                 .child(self.resources_card(cx))
                 .into_any_element(),
             ProjectTab::Services => self.project_services(project, cx),
-            ProjectTab::Logs => self.logs_card(cx).into_any_element(),
+            ProjectTab::Logs => self.logs_card(window, cx).into_any_element(),
             ProjectTab::Settings => self.project_settings(project, window, cx),
         };
 
@@ -3146,7 +3146,11 @@ impl Wisp {
     }
 
     /// The selected project's logs: source, search, follow and a bounded tail.
-    fn logs_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn logs_card(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The log fills what is left of the window instead of a fixed box, so the
+        // space below the card belongs to the log rather than to nobody.
+        let available = window.bounds().size.height - px(330.);
+        let height = if available < px(240.) { px(240.) } else { available };
         let current = self.log_kind;
         let raw = self.log_filter.read(cx).value().to_string();
         let needle = if self.log_case {
@@ -3240,7 +3244,7 @@ impl Wisp {
                         Button::new("log-prev")
                             .ghost()
                             .xsmall()
-                            .icon(icon(IconName::ChevronRight))
+                            .icon(icon(IconName::ChevronLeft))
                             .tooltip("Previous match")
                             .disabled(!matching)
                             .on_click(cx.listener(|this, _, _window, cx| this.step_log_match(false, cx))),
@@ -3315,20 +3319,30 @@ impl Wisp {
                 .collect();
 
             div()
-                .relative()
-                .w_full()
-                .h(px(240.))
+                .px(px(18.))
+                .pb(px(18.))
                 .child(
                     div()
-                        .id("log-lines")
-                        .track_scroll(&self.log_scroll)
-                        .overflow_y_scroll()
-                        .size_full()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_xs()
-                        .children(lines),
+                        .relative()
+                        .w_full()
+                        .h(height)
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .id("log-lines")
+                                .track_scroll(&self.log_scroll)
+                                .overflow_y_scroll()
+                                .size_full()
+                                .px(px(12.))
+                                .py(px(10.))
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_xs()
+                                .children(lines),
+                        )
+                        .vertical_scrollbar(&self.log_scroll),
                 )
-                .vertical_scrollbar(&self.log_scroll)
                 .into_any_element()
         };
 
@@ -4423,13 +4437,16 @@ fn detail_row_action(
                 .child(label.to_string()),
         )
         .child(
+            // Sized to its text so the button sits beside the value rather than
+            // being pushed to the far edge; a long value wraps inside the cap.
             div()
-                .flex_1()
+                .flex_shrink(0.0)
+                .max_w(px(520.))
                 .text_sm()
                 .whitespace_normal()
                 .child(value.to_string()),
         )
-        .child(action)
+        .child(div().flex_shrink_0().child(action))
 }
 
 /// A `label  value` row, the label muted and fixed-width.
