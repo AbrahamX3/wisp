@@ -18,6 +18,9 @@ use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::setting::{
+    SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
+};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -84,6 +87,7 @@ enum UpdateState {
 enum Screen {
     Projects,
     Services,
+    Settings,
 }
 
 /// Process-wide owner of nginx and the PHP workers, so the app-quit hook can
@@ -1376,10 +1380,42 @@ impl Wisp {
         }
     }
 
+    fn set_hosting_control(&mut self, wanted: bool, cx: &mut Context<Self>) {        if wanted {
+            self.setup_elevated(cx);
+        } else {
+            self.remove_elevated(cx);
+        }
+    }
+
+    // ---- settings page ---------------------------------------------------
+
+    fn settings_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let settings = SettingsView::new("wisp-settings").pages([
+            general_settings_page(&entity),
+            hosting_settings_page(&entity, self),
+            updates_settings_page(&entity, self),
+            about_settings_page(),
+        ]);
+
+        div()
+            .id("settings")
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_w(px(0.))
+            .p(px(28.))
+            .child(settings)
+            .into_any_element()
+    }
+
     // ---- settings toggles ------------------------------------------------
 
     fn toggle_background(&mut self, cx: &mut Context<Self>) {
-        let wanted = !self.settings.background;
+        self.set_background(!self.settings.background, cx);
+    }
+
+    fn set_background(&mut self, wanted: bool, cx: &mut Context<Self>) {
         if wanted {
             if let Err(error) = tray::install(cx) {
                 self.push_toast(
@@ -1407,7 +1443,10 @@ impl Wisp {
     }
 
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
-        let wanted = !self.autostart;
+        self.set_autostart(!self.autostart, cx);
+    }
+
+    fn set_autostart(&mut self, wanted: bool, cx: &mut Context<Self>) {
         match autostart::set(wanted) {
             Ok(()) => {
                 self.autostart = wanted;
@@ -1437,6 +1476,18 @@ impl Wisp {
         self.settings.theme = pref;
         self.settings.save();
         apply_theme(pref, Some(window), cx);
+        cx.notify();
+    }
+
+    /// The same, from the Settings page, where there is no window to hand.
+    fn set_theme_pref(&mut self, pref: ThemePreference, cx: &mut Context<Self>) {
+        if self.theme == pref {
+            return;
+        }
+        self.theme = pref;
+        self.settings.theme = pref;
+        self.settings.save();
+        apply_theme(pref, None, cx);
         cx.notify();
     }
 
@@ -1851,6 +1902,7 @@ impl Wisp {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
         let on_services = self.screen == Screen::Services;
+        let on_settings = self.screen == Screen::Settings;
 
         // The project list is always visible; the content pane shows the
         // selected project. Services is a separate destination at the bottom.
@@ -1925,20 +1977,36 @@ impl Wisp {
             )
             .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(list))
             .child(div().h(px(1.)).w_full().bg(cx.theme().border))
-            .child(div().p(px(10.)).child(nav_item(
-                "Services",
-                IconName::Server,
-                on_services,
-                Screen::Services,
-                self.runtimes.len(),
-                cx,
-            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p(px(10.))
+                    .child(nav_item(
+                        "Runtimes",
+                        IconName::Server,
+                        on_services,
+                        Screen::Services,
+                        self.runtimes.len(),
+                        cx,
+                    ))
+                    .child(nav_item(
+                        "Settings",
+                        IconName::Settings,
+                        on_settings,
+                        Screen::Settings,
+                        0,
+                        cx,
+                    )),
+            )
     }
 
     fn content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.screen {
             Screen::Projects => self.projects_content(cx),
             Screen::Services => self.services_content(cx),
+            Screen::Settings => self.settings_content(cx),
         }
     }
 
@@ -2784,6 +2852,225 @@ impl Render for Wisp {
                 ),
         )
     }
+}
+
+/// The shortest name for a theme preference, as stored in settings.
+fn theme_name(pref: ThemePreference) -> &'static str {
+    match pref {
+        ThemePreference::System => "system",
+        ThemePreference::Light => "light",
+        ThemePreference::Dark => "dark",
+    }
+}
+
+fn theme_from_name(name: &str) -> ThemePreference {
+    match name {
+        "light" => ThemePreference::Light,
+        "dark" => ThemePreference::Dark,
+        _ => ThemePreference::System,
+    }
+}
+
+/// Appearance and startup.
+fn general_settings_page(entity: &Entity<Wisp>) -> SettingPage {
+    let theme_read = entity.clone();
+    let theme_write = entity.clone();
+    let background_read = entity.clone();
+    let background_write = entity.clone();
+    let autostart_read = entity.clone();
+    let autostart_write = entity.clone();
+
+    SettingPage::new("General")
+        .icon(icon(IconName::Settings))
+        .description("Appearance and how Wisp starts.")
+        .group(
+            SettingGroup::new()
+                .title("Appearance")
+                .item(
+                    SettingItem::new(
+                        "Theme",
+                        SettingField::dropdown(
+                            vec![
+                                (SharedString::from("system"), SharedString::from("System")),
+                                (SharedString::from("light"), SharedString::from("Light")),
+                                (SharedString::from("dark"), SharedString::from("Dark")),
+                            ],
+                            move |cx: &App| {
+                                SharedString::from(theme_name(theme_read.read(cx).settings.theme))
+                            },
+                            move |value: SharedString, cx: &mut App| {
+                                let pref = theme_from_name(value.as_ref());
+                                theme_write.update(cx, |this, cx| this.set_theme_pref(pref, cx));
+                            },
+                        ),
+                    )
+                    .description("System follows Windows."),
+                )
+                .item(
+                    SettingItem::new(
+                        "Run in background",
+                        SettingField::switch(
+                            move |cx: &App| background_read.read(cx).settings.background,
+                            move |value: bool, cx: &mut App| {
+                                background_write.update(cx, |this, cx| this.set_background(value, cx));
+                            },
+                        ),
+                    )
+                    .description("Closing the window keeps Wisp in the tray."),
+                ),
+        )
+        .group(
+            SettingGroup::new()
+                .title("Startup")
+                .item(
+                    SettingItem::new(
+                        "Start with Windows",
+                        SettingField::switch(
+                            move |cx: &App| autostart_read.read(cx).autostart,
+                            move |value: bool, cx: &mut App| {
+                                autostart_write.update(cx, |this, cx| this.set_autostart(value, cx));
+                            },
+                        ),
+                    )
+                    .description("Opens Wisp when you sign in."),
+                ),
+        )
+}
+
+/// The hosts-file elevated control.
+fn hosting_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
+    let mode = wisp.mode;
+    let read = entity.clone();
+    let write = entity.clone();
+    let folder = entity.clone();
+
+    SettingPage::new("Hosting")
+        .icon(icon(IconName::ShieldCheck))
+        .description("How Wisp writes the Windows hosts file for local domains.")
+        .group(
+            SettingGroup::new()
+                .title("Hosts file")
+                .item(
+                    SettingItem::new(
+                        "No-prompt control",
+                        SettingField::switch(
+                            move |cx: &App| read.read(cx).mode == ControlMode::Task,
+                            move |value: bool, cx: &mut App| {
+                                write.update(cx, |this, cx| this.set_hosting_control(value, cx));
+                            },
+                        ),
+                    )
+                    .description(match mode {
+                        ControlMode::Elevated => "Wisp is running elevated, so nothing prompts.",
+                        ControlMode::Task => "Set up once \u{2014} hosts changes never prompt.",
+                        ControlMode::Uac => "Wisp asks once, then sets this up automatically.",
+                    })
+                    .disabled(mode == ControlMode::Elevated),
+                )
+                .item(SettingItem::render({
+                    let entity = folder.clone();
+                    move |_options, _window, _cx| {
+                        Button::new("settings-open-config")
+                            .outline()
+                            .small()
+                            .icon(icon(IconName::FolderOpen))
+                            .label("Open config folder")
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        let path = crate::config::root().to_string_lossy().to_string();
+                                        this.open_folder(&path, cx);
+                                    });
+                                }
+                            })
+                    }
+                })),
+        )
+}
+
+/// Version and updates.
+fn updates_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let available = wisp.settings.available_version.clone();
+    let check = entity.clone();
+    let install = entity.clone();
+
+    let mut items = vec![
+        SettingItem::render(move |_options, _window, _cx| {
+            div().text_sm().child(format!("Wisp v{version}"))
+        }),
+        SettingItem::render(move |_options, _window, _cx| {
+            Button::new("settings-check-updates")
+                .outline()
+                .small()
+                .icon(icon(IconName::RefreshCw))
+                .label("Check for updates")
+                .on_click({
+                    let entity = check.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.check_updates(cx, true));
+                    }
+                })
+        }),
+    ];
+    if let Some(version) = available {
+        items.push(SettingItem::render({
+            let entity = install.clone();
+            move |_options, _window, _cx| {
+                Button::new("settings-install-update")
+                    .primary()
+                    .small()
+                    .icon(icon(IconName::Download))
+                    .label(format!("Install v{version}"))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| this.install_update(cx));
+                        }
+                    })
+            }
+        }));
+    }
+
+    SettingPage::new("Updates")
+        .icon(icon(IconName::Download))
+        .description("Wisp updates itself from GitHub Releases.")
+        .group(SettingGroup::new().title("Version").items(items))
+}
+
+/// Version, source and license.
+fn about_settings_page() -> SettingPage {
+    SettingPage::new("About")
+        .icon(icon(IconName::Info))
+        .description(env!("CARGO_PKG_DESCRIPTION"))
+        .group(
+            SettingGroup::new().title("Wisp").item(SettingItem::render(
+                |_options, _window, cx| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                        )
+                        .child(
+                            Link::new("about-repository")
+                                .href(REPOSITORY_URL)
+                                .text_sm()
+                                .child(repository_label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{} licensed", env!("CARGO_PKG_LICENSE"))),
+                        )
+                },
+            )),
+        )
 }
 
 /// A top-level sidebar destination.
