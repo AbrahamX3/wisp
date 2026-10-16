@@ -25,6 +25,8 @@ pub enum SiteCommand {
     Stop,
     Restart,
     Open,
+    /// Show the folder holding this site's logs and generated config.
+    OpenFiles,
 }
 
 /// A command from a site's tray submenu, carrying which site it refers to.
@@ -169,6 +171,13 @@ fn site_submenu(site: &TraySite) -> MenuItem {
             SiteAction {
                 id,
                 command: SiteCommand::Open,
+            },
+        ),
+        MenuItem::action(
+            "Open config folder",
+            SiteAction {
+                id,
+                command: SiteCommand::OpenFiles,
             },
         ),
     ];

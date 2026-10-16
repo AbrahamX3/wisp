@@ -1946,6 +1946,16 @@ impl Wisp {
                     }
                 }
                 tray::SiteCommand::Restart => self.restart_service(id, true, cx),
+                tray::SiteCommand::OpenFiles => {
+                    let dir = self
+                        .projects
+                        .iter()
+                        .find(|project| project.id == id)
+                        .map(|project| serve::config::site_dir(&project.slug()));
+                    if let Some(dir) = dir {
+                        self.open_folder(&dir.to_string_lossy(), cx);
+                    }
+                }
                 tray::SiteCommand::Open => {
                     let url = self
                         .projects
@@ -3517,7 +3527,13 @@ impl Wisp {
         let body: AnyElement = match self.runtime_tab {
             RuntimeTab::Php => self.php_section(cx).into_any_element(),
             RuntimeTab::Nginx => self.nginx_section(cx).into_any_element(),
-            RuntimeTab::Https => self.https_card(cx).into_any_element(),
+            RuntimeTab::Https => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(self.https_card(cx))
+                .child(self.certificates_card(cx))
+                .into_any_element(),
             RuntimeTab::Hosts => div()
                 .flex()
                 .flex_col()
@@ -3872,6 +3888,54 @@ impl Wisp {
                 .text_color(cx.theme().muted_foreground)
                 .child("Wisp has not written its block yet. Starting a site adds it.")
                 .into_any_element(),
+        };
+
+        ui::section(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(header)
+                .child(div().px(px(18.)).pb(px(18.)).child(body)),
+        )
+        .into_any_element()
+    }
+
+    /// The certificates Wisp has issued, and how long ago.
+    fn certificates_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let header = section_header(
+            "Certificates",
+            "One per domain, issued by Wisp's own authority.",
+            cx,
+        );
+
+        let rows: Vec<AnyElement> = self
+            .projects
+            .iter()
+            .map(|project| {
+                let paths = tls::paths_for(&project.domain);
+                let age = if paths.is_ready() {
+                    std::fs::metadata(&paths.cert)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .map_or_else(|| "issued".to_string(), |age| human_age(age.as_secs()))
+                } else {
+                    "not issued yet".to_string()
+                };
+                detail_row(&project.domain, &age, cx).into_any_element()
+            })
+            .collect();
+
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("No projects yet, so nothing has been issued.")
+                .into_any_element()
+        } else {
+            div().flex().flex_col().gap_3().children(rows).into_any_element()
         };
 
         ui::section(
@@ -5884,6 +5948,21 @@ fn find_ranges(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, us
         }
     }
     ranges
+}
+
+/// A rough age, in the units a person would say it in.
+fn human_age(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    match seconds {
+        s if s < MINUTE => "just now".to_string(),
+        s if s < HOUR => format!("{} min ago", s / MINUTE),
+        s if s < DAY => format!("{} h ago", s / HOUR),
+        s if s < 30 * DAY => format!("{} days ago", s / DAY),
+        s => format!("{} months ago", s / (30 * DAY)),
+    }
 }
 
 /// The `# wisp:start … # wisp:end` block as it is on disk, if there is one.
