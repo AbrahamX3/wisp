@@ -82,6 +82,19 @@ Still open:
   the last tab reads as its own box. Confirmed by capture as the component's own
   styling; decide whether to override it.
 
+## Links and log text
+
+Anything naming a place to go is a link: the project's domain in the header, the
+root/domain/config rows on the Overview, the address a service serves, the
+certificate list, and the status bar. Folders resolve through `file:///` URLs.
+
+Still open:
+
+- **Paths inside log lines are not links.** A PHP stack trace is full of file
+  paths and they are the most useful thing in it; making them clickable means
+  splitting each line into text and path runs, which the match highlighter is
+  already halfway to doing.
+
 ## Notifications
 
 `gpui-kit` has no `SystemNotification`, so an OS notification needs a Win32
