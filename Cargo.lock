@@ -8651,6 +8651,7 @@ dependencies = [
  "rfd",
  "runas",
  "rusqlite",
+ "schemars",
  "self_update",
  "serde",
  "serde_json",

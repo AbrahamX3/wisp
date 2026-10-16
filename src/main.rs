@@ -84,6 +84,24 @@ fn main() {
                 tray::remove(cx);
                 cx.quit();
             });
+            let _ = cx.on_action(|action: &tray::SiteAction, cx: &mut App| {
+                tray::dispatch(
+                    tray::TrayRequest::Site {
+                        id: action.id,
+                        command: action.command,
+                    },
+                    cx,
+                );
+            });
+            let _ = cx.on_action(|_: &tray::StartAll, cx: &mut App| {
+                tray::dispatch(tray::TrayRequest::All(tray::AllCommand::Start), cx);
+            });
+            let _ = cx.on_action(|_: &tray::StopAll, cx: &mut App| {
+                tray::dispatch(tray::TrayRequest::All(tray::AllCommand::Stop), cx);
+            });
+            let _ = cx.on_action(|_: &tray::RestartAll, cx: &mut App| {
+                tray::dispatch(tray::TrayRequest::All(tray::AllCommand::Restart), cx);
+            });
 
             let settings = settings::Settings::load();
             app::apply_theme(settings.theme, None, cx);

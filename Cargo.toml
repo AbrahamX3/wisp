@@ -13,9 +13,10 @@ gpui-kit = "0.7.3"
 # System tray for "run in background". Purpose-built for GPUI: tray events are
 # posted onto GPUI's own foreground executor rather than a second event loop.
 # The `gpui-kit` feature selects the `gpui-pre` backend we already depend on.
-gpui-tray = { version = "0.1", default-features = false, features = ["gpui-kit"] }
+gpui-tray = { version = "0.1", default-features = false, features = ["gpui-kit", "menu-state"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+schemars = { version = "1", default-features = false, features = ["std", "indexmap2", "derive"] }
 serde_json = "1"
 thiserror = "2"
 # Self-update from GitHub Releases (see .github/workflows/release.yml).

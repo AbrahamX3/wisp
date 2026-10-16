@@ -236,6 +236,8 @@ pub struct Wisp {
     log_follow: bool,
     log_match: usize,
     log_scroll: ScrollHandle,
+    /// The last set of sites published to the tray, to avoid needless rebuilds.
+    tray_sites: Vec<tray::TraySite>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -306,6 +308,7 @@ impl Wisp {
             log_follow: true,
             log_match: 0,
             log_scroll: ScrollHandle::default(),
+            tray_sites: Vec::new(),
             _subscriptions,
         };
         this.reload(cx);
@@ -320,6 +323,14 @@ impl Wisp {
         Self::spawn_mode_probe(cx);
 
         Self::spawn_auto_update_check(cx);
+
+        // The tray's menu reads this, and its actions come back to `handle_tray`.
+        cx.set_global(tray::TrayMenuData::default());
+        let weak = cx.weak_entity();
+        cx.set_global(tray::TrayHooks(Some(Box::new(move |request, cx| {
+            let _ = weak.update(cx, |this, cx| this.handle_tray(request, cx));
+        }))));
+
         this
     }
 
@@ -1512,6 +1523,82 @@ impl Wisp {
             }
         }
         self.sync_server(cx);
+    }
+
+    /// Act on a request from the tray. The window owns the running state, so all
+    /// tray commands funnel through here rather than the supervisor directly.
+    fn handle_tray(&mut self, request: tray::TrayRequest, cx: &mut Context<Self>) {
+        match request {
+            tray::TrayRequest::Site { id, command } => match command {
+                tray::SiteCommand::Start => {
+                    if !self.php_on.contains(&id) {
+                        self.toggle_php(id, cx);
+                    }
+                    if !self.nginx_on.contains(&id) {
+                        self.toggle_nginx(id, cx);
+                    }
+                }
+                tray::SiteCommand::Stop => {
+                    if self.nginx_on.contains(&id) {
+                        self.toggle_nginx(id, cx);
+                    }
+                    if self.php_on.contains(&id) {
+                        self.toggle_php(id, cx);
+                    }
+                }
+                tray::SiteCommand::Restart => self.restart_service(id, true, cx),
+                tray::SiteCommand::Open => {
+                    let url = self
+                        .projects
+                        .iter()
+                        .find(|project| project.id == id)
+                        .map(|project| {
+                            format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain)
+                        });
+                    if let Some(url) = url {
+                        self.open_domain(url, cx);
+                    }
+                }
+            },
+            tray::TrayRequest::All(command) => match command {
+                tray::AllCommand::Start => self.start_all(cx),
+                tray::AllCommand::Stop => self.stop_all(cx),
+                tray::AllCommand::Restart => self.restart_all(cx),
+            },
+        }
+        cx.notify();
+    }
+
+    /// Push the current site list to the tray, rebuilding the menu when it moved.
+    fn publish_tray(&mut self, cx: &mut Context<Self>) {
+        let sites: Vec<tray::TraySite> = self
+            .projects
+            .iter()
+            .map(|project| {
+                let id = project.id;
+                let nginx = self.nginx_on.contains(&id);
+                let php = self.php_on.contains(&id);
+                tray::TraySite {
+                    id,
+                    name: project.name.clone(),
+                    url: format!(
+                        "{}{}",
+                        scheme_prefix(project.ssl_enabled),
+                        project.domain
+                    ),
+                    running: nginx && php,
+                    partial: nginx || php,
+                }
+            })
+            .collect();
+
+        if sites != self.tray_sites {
+            self.tray_sites = sites;
+            cx.set_global(tray::TrayMenuData {
+                sites: self.tray_sites.clone(),
+            });
+            tray::refresh(cx);
+        }
     }
 
     /// Delete every project's `php.ini` so the next sync restarts each worker.
@@ -3298,6 +3385,7 @@ impl Render for Wisp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         flush_toasts(&mut self.toasts, window, cx);
         self.apply_pending_root(window, cx);
+        self.publish_tray(cx);
 
         let mut root = div()
             .flex()
