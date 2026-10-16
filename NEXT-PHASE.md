@@ -95,6 +95,22 @@ Still open:
   splitting each line into text and path runs, which the match highlighter is
   already halfway to doing.
 
+## Commit identity and signing
+
+- Commit as the machine's configured identity, `Abraham <abrahamramos.info@gmail.com>`.
+  **Never invent an email.** `noreply@github.com` is GitHub's *own* address, so
+  anything committed with it is attributed to `web-flow` rather than to the
+  author, and T3 Code's `t3code@users.noreply.github.com` is the same trap in a
+  different form.
+- `commit.gpgsign = true` with `gpg.format = ssh` and
+  `user.signingkey = ~/.ssh/gh_key.pub`. GitHub only marks a commit **Verified**
+  when the signature is valid *and* that key is registered on the account as a
+  **signing** key — a key added for authentication does not count.
+- **A history rewrite strips signatures.** `git filter-branch`, `rebase` and
+  friends rewrite commit objects, and SSH signatures are part of the object, so
+  every rewritten commit comes back unsigned and Github shows it Unverified.
+  Re-sign after any rewrite.
+
 ## Notifications
 
 `gpui-kit` has no `SystemNotification`, so an OS notification needs a Win32
