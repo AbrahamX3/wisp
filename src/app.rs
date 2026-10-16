@@ -1464,6 +1464,29 @@ impl Wisp {
         self.nginx_on.contains(&id) || self.php_on.contains(&id)
     }
 
+    /// How a project's two services are actually doing: `(nginx, worker)`.
+    ///
+    /// Read from the observed status rather than from the requested sets. The
+    /// request can sit ahead of or behind reality — it is what was asked for,
+    /// not what is running — and an indicator claiming "running" while nothing
+    /// is running is worse than no indicator at all.
+    fn project_state(&self, id: i64) -> (bool, bool) {
+        let serving = self.serve_status.nginx_running && self.nginx_on.contains(&id);
+        let worker = self.serve_status.running_projects.contains(&id);
+        (serving, worker)
+    }
+
+    /// The colour a project's status dot takes: both up, one up, or neither.
+    fn state_color(&self, nginx: bool, worker: bool, cx: &App) -> Hsla {
+        if nginx && worker {
+            cx.theme().success
+        } else if nginx || worker {
+            cx.theme().warning
+        } else {
+            cx.theme().muted_foreground
+        }
+    }
+
     /// The specs for the projects the user asked to serve or run.
     fn site_specs(&self) -> std::result::Result<Vec<SiteSpec>, String> {
         let mut specs = Vec::new();
@@ -2794,15 +2817,8 @@ impl Wisp {
         } else {
             for project in &visible {
                 let active = selected == Some(project.id) && !on_runtimes && !on_settings;
-                let serving = self.nginx_on.contains(&project.id);
-                let worker = self.php_on.contains(&project.id);
-                let color = if serving && worker {
-                    cx.theme().success
-                } else if serving || worker {
-                    cx.theme().warning
-                } else {
-                    cx.theme().muted_foreground
-                };
+                let (serving, worker) = self.project_state(project.id);
+                let color = self.state_color(serving, worker, cx);
                 menu = menu.child(project_entry(
                     project,
                     active,
@@ -2897,6 +2913,7 @@ impl Wisp {
         let name = project.name.clone();
         let domain = project.domain.clone();
         let ssl = project.ssl_enabled;
+        let (serving, worker) = self.project_state(project.id);
         // The domain is the one thing here worth clicking, and it is a link
         // rather than a button beside it. Edit and Remove live on the Settings
         // tab, where they are needed once rather than always.
@@ -2923,7 +2940,7 @@ impl Wisp {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(ui::dot(cx.theme().primary))
+                            .child(ui::dot(self.state_color(serving, worker, cx)))
                             .child(
                                 Link::new("header-domain")
                                     .href(format!("{}{}", scheme_prefix(ssl), domain))
@@ -3052,9 +3069,10 @@ impl Wisp {
             .unwrap_or_else(|| "Not set".to_string());
         let worker_up = self.serve_status.running_projects.contains(&id);
         let nginx_up = self.serve_status.nginx_running;
-        let nginx_on = self.nginx_on.contains(&id);
-        let php_on = self.php_on.contains(&id);
         let busy = self.serve_busy;
+        // Observed, not requested: these drive both the dot and whether a
+        // control is offered, so they have to describe reality.
+        let (nginx_on, php_on) = self.project_state(id);
 
         let header = div()
             .flex()
