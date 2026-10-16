@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS projects (
     php_version        TEXT,
     ssl_enabled        INTEGER NOT NULL DEFAULT 1,
     php_ini_overrides  TEXT    NOT NULL DEFAULT '{}',
+    icon_path          TEXT,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
 );
@@ -79,6 +80,11 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let conn = self.connect()?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release. ALTER is the only way to add a column
+        // to an existing table, and the error when it is already present is the
+        // "already applied" signal.
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN icon_path TEXT", []);
+
         // Older records stored a placeholder empty object for "no overrides",
         // which would be appended to php.ini as `{}` and break it.
         conn.execute(

@@ -243,6 +243,10 @@ struct EditorState {
     ssl_enabled: bool,
     /// Extra `php.ini` directives, one per line, appended last.
     overrides: Entity<TextareaState>,
+    /// The project's chosen icon, or `None` for the generated one.
+    icon: Option<String>,
+    /// A file picked from disk this session, copied into place on save.
+    icon_source: Option<std::path::PathBuf>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -602,6 +606,8 @@ impl Wisp {
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
             overrides,
+            icon: existing.as_ref().and_then(|project| project.icon_path.clone()),
+            icon_source: None,
             error: None,
             _subscriptions: vec![app_sub, domain_sub],
         });
@@ -788,6 +794,50 @@ impl Wisp {
         }
     }
 
+    /// Open the native file picker for the project's icon.
+    fn choose_icon(&mut self, cx: &mut Context<Self>) {
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"])
+            .set_title("Choose a project icon")
+            .pick_file()
+        else {
+            return;
+        };
+        if let Some(editor) = self.editor.as_mut() {
+            editor.icon = Some(picked.to_string_lossy().to_string());
+            editor.icon_source = Some(picked);
+        }
+        cx.notify();
+    }
+
+    /// Drop the project's icon, falling back to the generated squircle.
+    fn remove_icon(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.icon = None;
+            editor.icon_source = None;
+        }
+        cx.notify();
+    }
+
+    /// Copy a picked image next to the project's generated config under a token
+    /// name, returning where it landed.
+    fn adopt_icon(
+        source: &std::path::Path,
+        slug: &str,
+    ) -> std::io::Result<String> {
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let destination = project_icon_path(slug, &random_token(), &extension);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, &destination)?;
+        Ok(destination.to_string_lossy().to_string())
+    }
+
     /// Open the native folder picker. The result arrives asynchronously, so it
     /// is stashed and applied on the next render, where a `Window` is available.
     fn browse_root(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -861,7 +911,12 @@ impl Wisp {
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
-        let draft = ProjectDraft {
+        let id = editor.id;
+        let previous = id.and_then(|id| self.projects.iter().find(|p| p.id == id).cloned());
+        let icon_source = editor.icon_source.clone();
+        let chosen_icon = editor.icon.clone();
+
+        let mut draft = ProjectDraft {
             name: editor.name.read(cx).value().to_string(),
             app_name: editor.app_name.read(cx).value().to_string(),
             root_path: editor.root_path.read(cx).value().to_string(),
@@ -873,9 +928,26 @@ impl Wisp {
             php_version: editor.php_version.clone(),
             ssl_enabled: editor.ssl_enabled,
             php_ini_overrides: editor.overrides.read(cx).value().to_string(),
+            icon_path: chosen_icon,
         };
-        let id = editor.id;
-        let before = id.and_then(|id| self.projects.iter().find(|p| p.id == id).cloned());
+
+        // A file picked this session is copied in under a token name; anything
+        // it replaces is deleted once the record points at the new one, so
+        // replacing an icon does not leave the old file behind.
+        if let Some(source) = icon_source {
+            match Self::adopt_icon(&source, &db::slugify(&draft.app_name)) {
+                Ok(path) => draft.icon_path = Some(path),
+                Err(error) => {
+                    self.set_editor_error(
+                        format!("Could not save that image: {error}"),
+                        cx,
+                    );
+                    return false;
+                }
+            }
+        }
+
+        let before = previous;
 
         let Some(store) = &self.store else {
             self.set_editor_error("The project database is unavailable.".to_string(), cx);
@@ -892,6 +964,12 @@ impl Wisp {
                 self.editor = None;
                 self.selected = Some(saved_id);
                 self.screen = Screen::Projects;
+                // The icon the record no longer points at is no longer wanted.
+                if let Some(previous) = before.as_ref().and_then(|p| p.icon_path.clone()) {
+                    if Some(&previous) != draft.icon_path.as_ref() {
+                        let _ = std::fs::remove_file(previous);
+                    }
+                }
                 self.reload(cx);
 
                 // If the project is running and something that affects how it is
@@ -2785,26 +2863,34 @@ impl Wisp {
         // tab, where they are needed once rather than always.
         let header = div()
             .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_2xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(name),
-            )
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(project_icon(project, px(44.)))
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
+                    .flex_col()
                     .gap_2()
-                    .child(ui::dot(cx.theme().primary))
                     .child(
-                        Link::new("header-domain")
-                            .href(format!("{}{}", scheme_prefix(ssl), domain))
-                            .text_sm()
-                            .child(format!("{}{}", scheme_prefix(ssl), domain)),
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(ui::dot(cx.theme().primary))
+                            .child(
+                                Link::new("header-domain")
+                                    .href(format!("{}{}", scheme_prefix(ssl), domain))
+                                    .text_sm()
+                                    .child(format!("{}{}", scheme_prefix(ssl), domain)),
+                            ),
                     ),
             );
 
@@ -5555,6 +5641,64 @@ fn editor_form(
     let mut form = Form::new()
         .child(
             Field::new()
+                .label("Icon")
+                .description("A squircle built from the name is used until you pick an image.")
+                .child({
+                    let entity = entity.clone();
+                    let current = editor.icon.clone();
+                    let name = editor.name.read(cx).value().to_string();
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(match current.as_deref() {
+                            Some(path) if std::path::Path::new(path).is_file() => {
+                                let path = SharedString::from(path.to_string());
+                                div()
+                                    .size(px(44.))
+                                    .flex_shrink_0()
+                                    .rounded(px(13.))
+                                    .overflow_hidden()
+                                    .child(img(path).size(px(44.)))
+                                    .into_any_element()
+                            }
+                            _ => generated_icon(&name, px(44.)),
+                        })
+                        .child(
+                            Button::new("choose-icon")
+                                .outline()
+                                .small()
+                                .icon(icon(IconName::FolderOpen))
+                                .label(if current.is_some() {
+                                    "Replace image"
+                                } else {
+                                    "Choose image"
+                                })
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_, _window, cx| {
+                                        entity.update(cx, |this, cx| this.choose_icon(cx));
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("remove-icon")
+                                .ghost()
+                                .small()
+                                .label("Use generated")
+                                .disabled(current.is_none())
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_, _window, cx| {
+                                        entity.update(cx, |this, cx| this.remove_icon(cx));
+                                    }
+                                }),
+                        )
+                }),
+        )
+        .child(
+            Field::new()
                 .label("Name")
                 .description("How the project is labelled in Wisp.")
                 .child(Input::new(&editor.name)),
@@ -6019,6 +6163,93 @@ fn managed_hosts_block() -> Option<String> {
     Some(rest[..end + hosts::END.len()].to_string())
 }
 
+/// A short token for a saved icon's filename, so replacing an icon never
+/// collides with a cached image under the same name.
+fn random_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let tick = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{tick:x}")
+}
+
+/// Where a project's chosen icon is kept: with its generated config, under a
+/// token name.
+fn project_icon_path(slug: &str, token: &str, extension: &str) -> std::path::PathBuf {
+    serve::config::site_dir(slug)
+        .join(format!("icon-{token}.{extension}"))
+}
+
+/// A stable hue for a name, so a project's generated icon keeps its colour.
+fn stable_hue(name: &str) -> f32 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % 360) as f32 / 360.0
+}
+
+/// The generated icon: a squircle in a colour derived from the name, carrying
+/// the name's first letter.
+///
+/// Used whenever a project has not chosen an image, which is why adding the
+/// feature needs nothing written for projects that already exist: their icon is
+/// drawn from what is already known about them.
+fn generated_icon(name: &str, size: Pixels) -> AnyElement {
+    let side = f32::from(size);
+    let letter = name
+        .trim()
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let hue = stable_hue(name);
+
+    div()
+        .size(size)
+        .flex_shrink_0()
+        .rounded(px(side * 0.3))
+        .bg(hsla(hue, 0.45, 0.42, 1.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(side * 0.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(hsla(hue, 0.25, 0.97, 1.0))
+        .child(letter)
+        .into_any_element()
+}
+
+/// A project's icon: the image it chose, when that file is still there, and the
+/// generated squircle otherwise.
+fn project_icon(project: &Project, size: Pixels) -> AnyElement {
+    let chosen = project
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter(|path| std::path::Path::new(path).is_file());
+
+    match chosen {
+        Some(path) => {
+            let path = SharedString::from(path.to_string());
+            div()
+                .size(size)
+                .flex_shrink_0()
+                .rounded(px(f32::from(size) * 0.3))
+                .overflow_hidden()
+                .child(img(path).size(size))
+                .into_any_element()
+        }
+        None => generated_icon(&project.name, size),
+    }
+}
+
+/// The error colour, for the few places a raw token is right.
 fn cx_error() -> Hsla {    rgb(0xEF4444).into()
 }
 
@@ -6299,6 +6530,7 @@ mod tests {
 
     fn project(name: &str) -> crate::db::Project {
         crate::db::Project {
+            icon_path: None,
             id: 1,
             name: name.to_string(),
             app_name: "my-app".to_string(),

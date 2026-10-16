@@ -21,6 +21,9 @@ pub struct Project {
     pub ssl_enabled: bool,
     /// Per-project `php.ini` overrides, as a JSON object string.
     pub php_ini_overrides: String,
+    /// The icon this project chose, if any. Empty means the generated
+    /// squircle is used, so existing projects need nothing written for them.
+    pub icon_path: Option<String>,
     /// Record timestamps, surfaced once the detail view grows a history.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -49,12 +52,15 @@ pub struct ProjectDraft {
     pub php_version: Option<String>,
     pub ssl_enabled: bool,
     pub php_ini_overrides: String,
+    /// The chosen icon, carried through the form.
+    pub icon_path: Option<String>,
 }
 
 impl ProjectDraft {
     /// From an existing project, for the edit form.
     pub fn from_project(project: &Project) -> Self {
         Self {
+            icon_path: project.icon_path.clone(),
             name: project.name.clone(),
             app_name: project.app_name.clone(),
             root_path: project.root_path.clone(),
@@ -108,7 +114,7 @@ impl Store {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT id, name, app_name, root_path, domain, php_version,
-                    ssl_enabled, php_ini_overrides, created_at, updated_at
+                    ssl_enabled, php_ini_overrides, created_at, updated_at, icon_path
              FROM projects ORDER BY name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], row_to_project)?;
@@ -126,8 +132,8 @@ impl Store {
         conn.execute(
             "INSERT INTO projects
                 (name, app_name, root_path, domain, php_version,
-                 ssl_enabled, php_ini_overrides, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                 ssl_enabled, php_ini_overrides, icon_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?9, ?8, ?8)",
             rusqlite::params![
                 draft.name,
                 draft.app_name,
@@ -137,6 +143,7 @@ impl Store {
                 draft.ssl_enabled as i64,
                 draft.php_ini_overrides,
                 now,
+                draft.icon_path,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -153,7 +160,7 @@ impl Store {
             "UPDATE projects SET
                 name = ?2, app_name = ?3, root_path = ?4, domain = ?5,
                 php_version = ?6, ssl_enabled = ?7, php_ini_overrides = ?8,
-                updated_at = ?9
+                icon_path = ?10, updated_at = ?9
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -165,6 +172,7 @@ impl Store {
                 draft.ssl_enabled as i64,
                 draft.php_ini_overrides,
                 now_unix(),
+                draft.icon_path,
             ],
         )?;
         Ok(())
@@ -208,6 +216,7 @@ fn row_to_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         php_version: row.get("php_version")?,
         ssl_enabled: row.get::<_, i64>("ssl_enabled")? != 0,
         php_ini_overrides: row.get("php_ini_overrides")?,
+        icon_path: row.get("icon_path")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -343,6 +352,7 @@ mod store_tests {
 
     fn draft(name: &str, domain: &str) -> ProjectDraft {
         ProjectDraft {
+            icon_path: None,
             name: name.to_string(),
             app_name: String::new(),
             root_path: r"C:\Sites\example".to_string(),
