@@ -35,6 +35,7 @@ use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::serve::{self, SiteSpec};
 use crate::settings::{Settings, ThemePreference};
+use crate::shell;
 use crate::tls;
 use crate::tray;
 use crate::ui;
@@ -100,6 +101,9 @@ struct EditorState {
     domain: Entity<InputState>,
     /// The suffix chosen next to the domain label, e.g. `.test`.
     domain_suffix: String,
+    /// While true, the domain label mirrors the app name; typing in the domain
+    /// turns it off.
+    domain_auto: bool,
     php_version: Option<String>,
     ssl_enabled: bool,
     error: Option<String>,
@@ -183,6 +187,10 @@ impl Wisp {
             pending_root: None,
         };
         this.reload(cx);
+        // Show the first project on launch rather than an empty pane.
+        if this.selected.is_none() {
+            this.selected = this.projects.first().map(|project| project.id);
+        }
         this.reload_runtimes(cx);
         this.load_catalog(cx);
         Self::spawn_status_poll(cx);
@@ -266,14 +274,22 @@ impl Wisp {
                 .default_value(domain_label)
         });
 
-        // Deriving the domain from the app name while the domain is still empty
-        // gives a sensible default without fighting a manual edit.
-        let subscription = cx.subscribe_in(
+        // The domain mirrors the app name until the user edits it directly.
+        let app_sub = cx.subscribe_in(
             &app_name,
             window,
             |this, _state, event, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.sync_domain(window, cx);
+                }
+            },
+        );
+        let domain_sub = cx.subscribe_in(
+            &domain,
+            window,
+            |this, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.note_domain_edit(cx);
                 }
             },
         );
@@ -285,10 +301,12 @@ impl Wisp {
             root_path,
             domain,
             domain_suffix,
+            // An existing project keeps its own domain; a new one follows along.
+            domain_auto: existing.is_none(),
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
             error: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![app_sub, domain_sub],
         });
 
         let entity = cx.entity();
@@ -314,22 +332,36 @@ impl Wisp {
         });
     }
 
-    /// Fill the domain from the app name while the domain is still untouched.
+    /// Mirror the app name into the domain while the domain is still automatic.
     fn sync_domain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
-        let domain_is_empty = editor.domain.read(cx).value().trim().is_empty();
-        if !domain_is_empty {
+        if !editor.domain_auto {
             return;
         }
         let slug = db::slugify(&editor.app_name.read(cx).value());
-        if slug.is_empty() {
-            return;
-        }
         editor
             .domain
             .update(cx, |state, cx| state.set_value(slug, window, cx));
+    }
+
+    /// Stop auto-filling the domain once the user types their own.
+    fn note_domain_edit(&mut self, cx: &mut Context<Self>) {
+        let (typed, expected) = {
+            let Some(editor) = self.editor.as_ref() else {
+                return;
+            };
+            (
+                editor.domain.read(cx).value().to_string(),
+                db::slugify(&editor.app_name.read(cx).value()),
+            )
+        };
+        if domain_is_hand_edited(&typed, &expected) {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.domain_auto = false;
+            }
+        }
     }
 
     /// Open the native folder picker. The result arrives asynchronously, so it
@@ -364,8 +396,7 @@ impl Wisp {
     }
 
     /// Apply a folder chosen in the picker to the editor's root input.
-    fn apply_pending_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.pending_root.take() else {
+    fn apply_pending_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {        let Some(path) = self.pending_root.take() else {
             return;
         };
         if let Some(editor) = self.editor.as_ref() {
@@ -373,6 +404,27 @@ impl Wisp {
                 .root_path
                 .update(cx, |state, cx| state.set_value(path, window, cx));
         }
+    }
+
+    /// Reveal a folder in File Explorer, warning if it is not there.
+    fn open_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !std::path::Path::new(path).is_dir() {
+            self.push_toast(
+                ToastKind::Warning,
+                format!("That folder is not there: {path}"),
+            );
+        } else if let Err(error) = shell::open_folder(path) {
+            self.push_toast(ToastKind::Error, error.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Open a project's domain in the default browser.
+    fn open_domain(&mut self, url: String, cx: &mut Context<Self>) {
+        if let Err(error) = shell::open_url(&url) {
+            self.push_toast(ToastKind::Error, error.to_string());
+        }
+        cx.notify();
     }
 
     fn cancel_editor(&mut self, cx: &mut Context<Self>) {
@@ -1433,7 +1485,7 @@ impl Wisp {
                         div().into_any_element()
                     } else {
                         Button::new("stop-all")
-                            .ghost()
+                            .danger()
                             .small()
                             .icon(icon(IconName::Square))
                             .label("Stop all")
@@ -1688,6 +1740,9 @@ impl Wisp {
             .unwrap_or_else(|| "Not set".to_string());
         let ssl = project.ssl_enabled;
         let slug = project.slug();
+        let url = format!("{}{}", scheme_prefix(ssl), domain);
+        let config_dir = crate::config::sites().join(&slug);
+        let config_display = config_dir.to_string_lossy().to_string();
 
         let header = div()
             .flex()
@@ -1741,7 +1796,7 @@ impl Wisp {
                     )
                     .child(
                         Button::new("delete-project")
-                            .ghost()
+                            .danger()
                             .small()
                             .icon(icon(IconName::Trash))
                             .label("Remove")
@@ -1765,11 +1820,50 @@ impl Wisp {
                         .text_color(cx.theme().muted_foreground)
                         .child("PROJECT"),
                 )
-                .child(detail_row("Root folder", &root, cx))
-                .child(detail_row("Domain", &format!("{}{}", scheme_prefix(ssl), domain), cx))
+                .child(detail_row_action(
+                    "Root folder",
+                    &root,
+                    Button::new("open-root")
+                        .ghost()
+                        .small()
+                        .icon(icon(IconName::FolderOpen))
+                        .tooltip("Open in Explorer")
+                        .on_click(cx.listener({
+                            let path = root.clone();
+                            move |this, _, _window, cx| this.open_folder(&path, cx)
+                        })),
+                    cx,
+                ))
+                .child(detail_row_action(
+                    "Domain",
+                    &url,
+                    Button::new("open-url")
+                        .ghost()
+                        .small()
+                        .icon(icon(IconName::ExternalLink))
+                        .tooltip("Open in browser")
+                        .on_click(cx.listener({
+                            let url = url.clone();
+                            move |this, _, _window, cx| this.open_domain(url.clone(), cx)
+                        })),
+                    cx,
+                ))
                 .child(detail_row("HTTPS", if ssl { "Trusted certificate" } else { "Off" }, cx))
                 .child(detail_row("PHP", &php, cx))
-                .child(detail_row("Config folder", &format!("sites/{slug}"), cx)),
+                .child(detail_row_action(
+                    "Config folder",
+                    &config_display,
+                    Button::new("open-config")
+                        .ghost()
+                        .small()
+                        .icon(icon(IconName::FolderTree))
+                        .tooltip("Open in Explorer")
+                        .on_click(cx.listener({
+                            let path = config_display.clone();
+                            move |this, _, _window, cx| this.open_folder(&path, cx)
+                        })),
+                    cx,
+                )),
         );
 
         let is_running = self.serve_status.running_projects.contains(&id);
@@ -1806,7 +1900,7 @@ impl Wisp {
                 .into_any_element()
         } else if is_running {
             Button::new("stop-project")
-                .outline()
+                .danger()
                 .small()
                 .icon(icon(IconName::Square))
                 .label("Stop")
@@ -2439,7 +2533,7 @@ fn php_row(
                     badge("Up to date", cx).into_any_element(),
                     Button::new(format!("php-remove-{line}"))
                         .small()
-                        .ghost()
+                        .danger()
                         .label("Uninstall")
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.uninstall_runtime(RuntimeKind::Php, version.clone(), cx)
@@ -2462,7 +2556,7 @@ fn php_row(
                         .into_any_element(),
                     Button::new(format!("php-remove2-{line}"))
                         .small()
-                        .ghost()
+                        .danger()
                         .label("Uninstall")
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.uninstall_runtime(RuntimeKind::Php, remove_version.clone(), cx)
@@ -2554,7 +2648,7 @@ fn nginx_row(
             active_or_use,
             Button::new(format!("nginx-remove-{version}"))
                 .small()
-                .ghost()
+                .danger()
                 .label("Uninstall")
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.uninstall_runtime(RuntimeKind::Nginx, remove_version.clone(), cx)
@@ -2668,6 +2762,36 @@ fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> imp
             div().w(px(3.)).into_any_element()
         })
         .child(core)
+}
+
+/// A `label  value` row with a trailing action (e.g. open in Explorer).
+fn detail_row_action(
+    label: &str,
+    value: &str,
+    action: impl IntoElement,
+    cx: &App,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .w(px(120.))
+                .flex_shrink(0.0)
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .whitespace_normal()
+                .child(value.to_string()),
+        )
+        .child(action)
 }
 
 /// A `label  value` row, the label muted and fixed-width.
@@ -3080,6 +3204,14 @@ fn should_offer_update(manual: bool, available: &str, skipped: Option<&str>) -> 
     manual || skipped != Some(available)
 }
 
+/// Whether a domain value counts as hand-edited rather than still auto-filled.
+///
+/// The auto-fill writes the app-name slug, so anything else (once non-empty) is
+/// the user's own choice and stops the mirroring.
+fn domain_is_hand_edited(typed: &str, expected: &str) -> bool {
+    !typed.trim().is_empty() && typed != expected
+}
+
 /// Closing the window hides it to the tray while "Run in background" is on, and
 /// exits the app otherwise.
 pub fn window_should_close(_window: &mut Window, cx: &mut App) -> bool {
@@ -3102,7 +3234,7 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_newer, should_offer_update, REPOSITORY_URL};
+    use super::{domain_is_hand_edited, is_newer, should_offer_update, REPOSITORY_URL};
     use crate::update::{REPO_NAME, REPO_OWNER};
 
     #[test]
@@ -3150,5 +3282,18 @@ mod tests {
     #[test]
     fn manual_check_still_offers_a_skipped_version() {
         assert!(should_offer_update(true, "0.2.0", Some("0.2.0")));
+    }
+
+    #[test]
+    fn the_auto_filled_domain_does_not_count_as_hand_edited() {
+        // Matching the slug, or still empty, keeps the mirroring on.
+        assert!(!domain_is_hand_edited("my-app", "my-app"));
+        assert!(!domain_is_hand_edited("", "my-app"));
+    }
+
+    #[test]
+    fn a_typed_domain_counts_as_hand_edited() {
+        assert!(domain_is_hand_edited("shop", "my-app"));
+        assert!(domain_is_hand_edited("my-apps", "my-app"));
     }
 }

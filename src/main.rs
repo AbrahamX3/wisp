@@ -22,6 +22,7 @@ mod platform;
 mod runtime;
 mod serve;
 mod settings;
+mod shell;
 #[cfg(test)]
 mod test_support;
 mod tray;
