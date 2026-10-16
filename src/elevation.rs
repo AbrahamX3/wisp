@@ -87,11 +87,37 @@ pub fn perform_hosts(mode: ControlMode, domains: &[String]) -> ActionOutcome {
             Err(TaskError::Cancelled) => ActionOutcome::Cancelled,
             Err(error) => ActionOutcome::Failed(error.to_string()),
         },
-        ControlMode::Uac => match run_elevated() {
-            Ok(()) => ActionOutcome::Done,
-            Err(ElevationError::Cancelled) => ActionOutcome::Cancelled,
-            Err(error) => ActionOutcome::Failed(error.to_string()),
-        },
+        ControlMode::Uac => {
+            // First time we need elevation, install the no-prompt task instead
+            // of a one-off elevated write: that is one prompt ever, not one per
+            // change. If the task cannot be set up, fall back to the one-off.
+            match ensure_task() {
+                Ok(()) => match helper_task::run_via_task() {
+                    Ok(()) => ActionOutcome::Done,
+                    Err(TaskError::Cancelled) => ActionOutcome::Cancelled,
+                    Err(error) => ActionOutcome::Failed(error.to_string()),
+                },
+                Err(ElevationError::Cancelled) => ActionOutcome::Cancelled,
+                Err(_) => match run_elevated() {
+                    Ok(()) => ActionOutcome::Done,
+                    Err(ElevationError::Cancelled) => ActionOutcome::Cancelled,
+                    Err(error) => ActionOutcome::Failed(error.to_string()),
+                },
+            }
+        }
+    }
+}
+
+/// Install the no-prompt scheduled task if it is not there yet.
+fn ensure_task() -> Result<(), ElevationError> {
+    if helper_task::is_usable() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(ElevationError::Spawn)?;
+    match helper_task::setup(&exe) {
+        Ok(()) => Ok(()),
+        Err(TaskError::Cancelled) => Err(ElevationError::Cancelled),
+        Err(error) => Err(ElevationError::Helper(error.to_string())),
     }
 }
 

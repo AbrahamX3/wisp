@@ -1104,6 +1104,10 @@ impl Wisp {
                         ActionOutcome::Done => {
                             let should_report = this.hosts_written.is_empty() && !domains.is_empty();
                             this.hosts_written = domains;
+                            // The first write may have installed no-prompt control.
+                            if this.mode == ControlMode::Uac {
+                                this.mode = elevation::detect_mode();
+                            }
                             if should_report {
                                 this.push_toast(
                                     ToastKind::Success,
@@ -1720,8 +1724,6 @@ impl Wisp {
         let theme = self.theme;
         let autostart = self.autostart;
         let background = self.settings.background;
-        let mode = self.mode;
-        let elevation_busy = self.elevation_busy;
 
         Button::new("settings-menu")
             .icon(icon(IconName::Ellipsis))
@@ -1750,28 +1752,6 @@ impl Wisp {
                                 let entity = entity.clone();
                                 move |_, _, cx| {
                                     entity.update(cx, Wisp::toggle_background);
-                                }
-                            }),
-                    )
-                    .separator();
-
-                let menu = menu
-                    .check_side(Side::Right)
-                    .item(
-                        PopupMenuItem::new("No-prompt hosting control")
-                            .icon(icon(IconName::ShieldCheck))
-                            .checked(mode == ControlMode::Task)
-                            .disabled(elevation_busy || mode == ControlMode::Elevated)
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        if mode == ControlMode::Task {
-                                            this.remove_elevated(cx);
-                                        } else {
-                                            this.setup_elevated(cx);
-                                        }
-                                    });
                                 }
                             }),
                     )
@@ -2250,6 +2230,7 @@ impl Wisp {
         }
 
         column = column.child(self.https_card(cx));
+        column = column.child(self.hosting_card(cx));
         column = column.child(self.php_section(cx));
         column = column.child(self.nginx_section(cx));
 
@@ -2365,6 +2346,90 @@ impl Wisp {
                 .child(header)
                 .child(toolbar)
                 .child(body),
+        )
+    }
+
+    /// The state of the hosts-file elevated control.
+    fn hosting_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.mode;
+        let busy = self.elevation_busy;
+
+        let badge_label = match mode {
+            ControlMode::Elevated => "Elevated",
+            ControlMode::Task => "No-prompt",
+            ControlMode::Uac => "Asks once",
+        };
+        let state = match mode {
+            ControlMode::Elevated => "Wisp is running elevated, so hosts changes never prompt.",
+            ControlMode::Task => "Set up once \u{2014} hosts changes never prompt.",
+            ControlMode::Uac => {
+                "Wisp prompts once on first use, then sets up no-prompt control."
+            }
+        };
+        let action: AnyElement = match mode {
+            ControlMode::Elevated => div().into_any_element(),
+            ControlMode::Task => Button::new("hosting-remove")
+                .outline()
+                .small()
+                .label("Remove")
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, _window, cx| this.remove_elevated(cx)))
+                .into_any_element(),
+            ControlMode::Uac => Button::new("hosting-setup")
+                .outline()
+                .small()
+                .label("Set up now")
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, _window, cx| this.setup_elevated(cx)))
+                .into_any_element(),
+        };
+        let badge_label = SharedString::from(badge_label);
+        let state = SharedString::from(state);
+
+        ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .p(px(18.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(icon(IconName::ShieldCheck).text_color(brand::accent()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child("Hosts file"),
+                                        )
+                                        .child(badge(&badge_label, cx)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(state.clone()),
+                                ),
+                        ),
+                )
+                .child(action),
         )
     }
 
