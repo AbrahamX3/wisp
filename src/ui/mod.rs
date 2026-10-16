@@ -28,11 +28,3 @@ pub fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(8.)).rounded_full().bg(color)
 }
 
-/// A rail in the brand accent, marking the active sidebar item.
-pub fn accent_rail(cx: &App) -> impl IntoElement {
-    div()
-        .w(px(3.))
-        .h_full()
-        .rounded_full()
-        .bg(cx.theme().primary)
-}

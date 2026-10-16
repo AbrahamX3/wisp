@@ -98,7 +98,7 @@ fn main() {
                 let settings = settings.clone();
                 // Closing the window is how background mode is left running.
                 window.on_window_should_close(cx, app::window_should_close);
-                cx.new(move |cx| app::Wisp::new(settings, cx))
+                cx.new(move |cx| app::Wisp::new(settings, window, cx))
             }) {
                 // Best-effort: a GUI-subsystem build may have no console at all,
                 // and `eprintln!` would panic on an invalid handle.

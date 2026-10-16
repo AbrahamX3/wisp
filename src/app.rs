@@ -22,6 +22,9 @@ use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::sidebar::{
+    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
@@ -192,18 +195,35 @@ pub struct Wisp {
     /// Which log the project detail shows, and its tail.
     log_kind: LogKind,
     log_lines: Vec<String>,
+    /// Filters the sidebar's project list.
+    project_filter: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Wisp {
-    pub fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (store, error) = match Store::open() {
             Ok(store) => (Some(store), None),
-            Err(error) => (None, Some(format!("Could not open the project database: {error}"))),
+            Err(error) => (
+                None,
+                Some(format!("Could not open the project database: {error}")),
+            ),
         };
 
+        // Filters the project list; typing re-renders the sidebar.
+        let project_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
+        let _subscriptions = vec![cx.subscribe_in(
+            &project_filter,
+            window,
+            |_this, _state, event, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )];
+
         let mut this = Self {
-            theme: settings.theme,
-            settings,
+            theme: settings.theme,            settings,
             toasts: Vec::new(),
             update: UpdateState::Idle,
             autostart: autostart::is_enabled(),
@@ -231,6 +251,8 @@ impl Wisp {
             pending_root: None,
             log_kind: LogKind::Php,
             log_lines: Vec::new(),
+            project_filter,
+            _subscriptions,
         };
         this.reload(cx);
         // Show the first project on launch rather than an empty pane.
@@ -2015,105 +2037,92 @@ impl Wisp {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
-        let on_services = self.screen == Screen::Services;
+        let on_runtimes = self.screen == Screen::Services;
         let on_settings = self.screen == Screen::Settings;
+        let filter = self.project_filter.read(cx).value().to_lowercase();
 
-        // The project list is always visible; the content pane shows the
-        // selected project. Services is a separate destination at the bottom.
-        let list = if self.projects.is_empty() {
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_2()
-                .px(px(20.))
-                .py(px(30.))
-                .text_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No projects yet"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Add one to serve it on a domain."),
-                )
-                .into_any_element()
+        let visible: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|project| {
+                filter.is_empty()
+                    || project.name.to_lowercase().contains(&filter)
+                    || project.domain.to_lowercase().contains(&filter)
+            })
+            .collect();
+
+        let mut menu = SidebarMenu::new();
+        if visible.is_empty() {
+            menu = menu.child(
+                SidebarMenuItem::new(if self.projects.is_empty() {
+                    "No projects yet"
+                } else {
+                    "No matches"
+                })
+                .icon(IconName::FolderOpen)
+                .disable(true),
+            );
         } else {
+            for project in &visible {
+                let active = selected == Some(project.id) && !on_runtimes && !on_settings;
+                let serving = self.nginx_on.contains(&project.id);
+                let worker = self.php_on.contains(&project.id);
+                let color = if serving && worker {
+                    cx.theme().success
+                } else if serving || worker {
+                    cx.theme().warning
+                } else {
+                    cx.theme().muted_foreground
+                };
+                menu = menu.child(project_menu_item(project, active, color, cx));
+            }
+        }
+
+        let footer = SidebarFooter::new()
+            .child(nav_item(
+                "Runtimes",
+                IconName::Server,
+                on_runtimes,
+                Screen::Services,
+                self.runtimes.len(),
+                cx,
+            ))
+            .child(nav_item(
+                "Settings",
+                IconName::Settings,
+                on_settings,
+                Screen::Settings,
+                0,
+                cx,
+            ));
+
+        let header = SidebarHeader::new().child(
             div()
-                .id("project-list")
                 .flex()
                 .flex_col()
-                .gap_1()
-                .p(px(10.))
-                .overflow_y_scrollbar()
-                .min_h(px(0.))
-                .children(self.projects.iter().map(|project| {
-                    let is_selected = selected == Some(project.id) && !on_services;
-                    project_row(project, is_selected, cx)
-                }))
-                .into_any_element()
-        };
+                .gap_2()
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().size(px(22.)).child(img(APP_ICON).size(px(22.))))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Wisp"),
+                        ),
+                )
+                .child(Input::new(&self.project_filter)),
+        );
 
-        div()
-            .flex()
-            .flex_col()
-            .w(px(300.))
-            .h_full()
-            .flex_shrink(0.0)
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(cx.theme().muted_foreground)
-                            .child("PROJECTS"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.projects.len().to_string()),
-                    ),
-            )
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(list))
-            .child(div().h(px(1.)).w_full().bg(cx.theme().border))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p(px(10.))
-                    .child(nav_item(
-                        "Runtimes",
-                        IconName::Server,
-                        on_services,
-                        Screen::Services,
-                        self.runtimes.len(),
-                        cx,
-                    ))
-                    .child(nav_item(
-                        "Settings",
-                        IconName::Settings,
-                        on_settings,
-                        Screen::Settings,
-                        0,
-                        cx,
-                    )),
-            )
+        Sidebar::new("wisp-sidebar")
+            .header(header)
+            .child(SidebarGroup::new("Projects").child(menu))
+            .footer(footer)
     }
 
     fn content(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3187,6 +3196,22 @@ fn about_settings_page() -> SettingPage {
         )
 }
 
+/// One project row in the sidebar: name, a status dot, and selection.
+fn project_menu_item(
+    project: &Project,
+    active: bool,
+    color: Hsla,
+    cx: &mut Context<Wisp>,
+) -> SidebarMenuItem {
+    let id = project.id;
+
+    SidebarMenuItem::new(project.name.clone())
+        .icon(IconName::Globe)
+        .active(active)
+        .suffix(move |_window, _cx| ui::dot(color))
+        .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
+}
+
 /// A top-level sidebar destination.
 fn nav_item(
     label: &'static str,
@@ -3496,80 +3521,6 @@ fn version_key(version: &str) -> Vec<u32> {
         .split('.')
         .filter_map(|part| part.parse::<u32>().ok())
         .collect()
-}
-
-/// A single project in the sidebar.
-fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> impl IntoElement {
-    let id = project.id;
-    let name = project.name.clone();
-    let domain = project.domain.clone();
-
-    let core = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_3()
-        .px(px(12.))
-        .py(px(10.))
-        .rounded_lg()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(0.))
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(domain),
-                ),
-        )
-        .child(if project.ssl_enabled {
-            icon(IconName::Lock)
-                .small()
-                .text_color(cx.theme().primary)
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        });
-
-    let base = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .rounded_lg();
-
-    let styled = if selected {
-        base.bg(cx.theme().accent)
-            .border_1()
-            .border_color(cx.theme().accent)
-    } else {
-        base
-    };
-
-    styled
-        .id(("project", id as u64))
-        .hover(|d| d.bg(cx.theme().list_hover))
-        .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
-        .child(if selected {
-            ui::accent_rail(cx).into_any_element()
-        } else {
-            div().w(px(3.)).into_any_element()
-        })
-        .child(core)
 }
 
 /// Which of a project's two services a row (or its buttons) refers to.
