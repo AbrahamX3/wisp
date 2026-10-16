@@ -61,9 +61,16 @@ Still open:
 rows, the status bar dropped the duplicated hosts control and groups the
 all-sites buttons behind a separator, the project Services tab has its Start
 both / Restart / Stop both back alongside the per-service controls, the Overview
-rows put their open buttons beside the value instead of at the far edge, the
-sidebar and content sit in an `h_resizable` pair, and the sidebar collapses to
-icons from a toggle in the top bar, remembered in `settings.json`.
+rows put their open buttons beside the value instead of at the far edge, and the
+sidebar collapses to icons from the kit's own `SidebarToggleButton`, remembered in
+`settings.json`.
+
+The sidebar is **not** resizable, deliberately: `Sidebar` is fixed width by
+design. It renders its own wrapper at 255px with `flex_shrink_0` and
+`overflow_hidden`, taken from its style, so a draggable panel around it either
+left a dead band when widened or let the sidebar paint over the page when
+squeezed. Making it resizable would mean driving its width from the panel's
+measured width every frame, which the component does not expose.
 
 Still open:
 
@@ -95,6 +102,13 @@ Still open:
 
 ## Traps worth remembering
 
+- **Read the component's own docs page before concluding a builder is missing.**
+  I grepped the crate source, decided `Sidebar` had no width control and that its
+  width was unset, and built a resizable panel around it on that basis.
+  `gpui-kit.com/component/sidebar` documents `.width()`, and the source's
+  `sidebar_expanded_width` shows the width comes from the sidebar's own style and
+  already defaults to 255 - so the wrapper was always there, and wrapping it in
+  an unclipped panel is what let it bleed over the page.
 - **A `ResizablePanelGroup` splits space evenly unless a panel asks for a size.**
   Leaving `resizable_panel()` bare gave the sidebar half the window. Use
   `.size(...)` (and `.size_range(...)`) the way the component documents.
