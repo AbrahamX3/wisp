@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Wisp">
+  <defs>
+    <linearGradient id="wisp" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="0.55" stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- near-black squircle with a hairline edge, matching the app's surfaces -->
+  <rect width="64" height="64" rx="15" fill="#0C0E12"/>
+  <rect x="0.9" y="0.9" width="62.2" height="62.2" rx="14.1" fill="none"
+        stroke="#ffffff" stroke-opacity="0.30" stroke-width="1.6"/>
+
+  <!-- the monogram: a single stroked W in the brand gradient -->
+  <path d="M16 20 L24 44 L32 28 L40 44 L48 20" fill="none" stroke="url(#wisp)"
+        stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- a small spark, the "wisp" that gives the name its glimmer -->
+  <path d="M52 8.5 C52.5 11.5 54 12.5 57 13.5 C54 14.5 52.5 15.5 52 18.5 C51.5 15.5 50 14.5 47 13.5 C50 12.5 51.5 11.5 52 8.5 Z"
+        fill="#5EEAD4"/>
+</svg>
