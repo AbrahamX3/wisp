@@ -114,8 +114,9 @@ enum Screen {
 /// Which pane of a project's detail is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProjectTab {
-    Overview,
+    /// Starting a site is the common case, so Services leads.
     Services,
+    Overview,
     Logs,
     Settings,
 }
@@ -123,8 +124,8 @@ enum ProjectTab {
 impl ProjectTab {
     fn index(self) -> usize {
         match self {
-            ProjectTab::Overview => 0,
-            ProjectTab::Services => 1,
+            ProjectTab::Services => 0,
+            ProjectTab::Overview => 1,
             ProjectTab::Logs => 2,
             ProjectTab::Settings => 3,
         }
@@ -132,10 +133,10 @@ impl ProjectTab {
 
     fn from_index(index: usize) -> Self {
         match index {
-            1 => ProjectTab::Services,
+            1 => ProjectTab::Overview,
             2 => ProjectTab::Logs,
             3 => ProjectTab::Settings,
-            _ => ProjectTab::Overview,
+            _ => ProjectTab::Services,
         }
     }
 }
@@ -444,7 +445,7 @@ impl Wisp {
             log_kind: LogKind::Php,
             log_lines: Vec::new(),
             project_filter,
-            project_tab: ProjectTab::Overview,
+            project_tab: ProjectTab::Services,
             log_filter,
             log_case,
             log_follow,
@@ -457,7 +458,7 @@ impl Wisp {
             machine_metrics: VecDeque::new(),
             palette,
             palette_open: false,
-            runtime_tab: RuntimeTab::Php,
+            runtime_tab: RuntimeTab::Https,
             _subscriptions,
         };
         this.reload(cx);
@@ -2393,22 +2394,29 @@ impl Wisp {
                     .child(php_label),
             );
 
-        // Center: the selected project, ellipsised rather than clipped.
+        // Center: the selected project, ellipsised rather than clipped, with its
+        // address as a link.
         if let Some(project) = self.selected_project() {
             let serving = self.nginx_on.contains(&project.id);
             let state = if serving { "serving" } else { "stopped" };
-            let text = if wide {
-                format!(
-                    "{} \u{00b7} {} {}{}",
-                    project.name,
-                    state,
-                    scheme_prefix(project.ssl_enabled),
-                    project.domain
-                )
-            } else {
-                format!("{} \u{00b7} {state}", project.name)
-            };
-            bar = bar.child(div().text_ellipsis().overflow_hidden().child(text));
+            let url = format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain);
+            let name = project.name.clone();
+            let wide_here = wide;
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .overflow_hidden()
+                .child(div().flex_shrink_0().child(if wide_here {
+                    format!("{name} \u{00b7} {state}")
+                } else {
+                    name
+                }));
+            if wide_here {
+                row = row.child(Link::new("status-domain").href(url.clone()).child(url));
+            }
+            bar = bar.child(row);
         }
 
         if let Some(version) = self.settings.available_version.clone() {
@@ -2758,43 +2766,21 @@ impl Wisp {
                 .into_any_element();
         };
 
-        let id = project.id;
         let name = project.name.clone();
         let domain = project.domain.clone();
         let ssl = project.ssl_enabled;
-
+        // The domain is the one thing here worth clicking, and it is a link
+        // rather than a button beside it. Edit and Remove live on the Settings
+        // tab, where they are needed once rather than always.
         let header = div()
             .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_start()
-            .justify_between()
-            .gap_4()
+            .flex_col()
+            .gap_2()
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(ui::dot(cx.theme().primary))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{}{}", scheme_prefix(ssl), domain)),
-                            ),
-                    ),
+                    .text_2xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(name),
             )
             .child(
                 div()
@@ -2802,27 +2788,12 @@ impl Wisp {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .child(ui::dot(cx.theme().primary))
                     .child(
-                        Button::new("edit-project")
-                            .outline()
-                            .small()
-                            .icon(icon(IconName::SquarePen))
-                            .label("Edit")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let existing =
-                                    this.projects.iter().find(|p| p.id == id).cloned();
-                                this.open_editor(existing, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("delete-project")
-                            .danger()
-                            .small()
-                            .icon(icon(IconName::Trash))
-                            .label("Remove")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_delete(id, window, cx)
-                            })),
+                        Link::new("header-domain")
+                            .href(format!("{}{}", scheme_prefix(ssl), domain))
+                            .text_sm()
+                            .child(format!("{}{}", scheme_prefix(ssl), domain)),
                     ),
             );
 
@@ -2830,8 +2801,8 @@ impl Wisp {
             .segmented()
             .selected_index(self.project_tab.index())
             .children([
-                Tab::new().label("Overview"),
                 Tab::new().label("Services"),
+                Tab::new().label("Overview"),
                 Tab::new().label("Logs"),
                 Tab::new().label("Settings"),
             ])
@@ -2907,34 +2878,14 @@ impl Wisp {
                         .text_color(cx.theme().muted_foreground)
                         .child("PROJECT"),
                 )
-                .child(detail_row_action(
+                .child(detail_row_link(
+                    "open-root",
                     "Root folder",
                     &root,
-                    Button::new("open-root")
-                        .ghost()
-                        .small()
-                        .icon(icon(IconName::FolderOpen))
-                        .tooltip("Open in Explorer")
-                        .on_click(cx.listener({
-                            let path = root.clone();
-                            move |this, _, _window, cx| this.open_folder(&path, cx)
-                        })),
+                    folder_url(&root),
                     cx,
                 ))
-                .child(detail_row_action(
-                    "Domain",
-                    &url,
-                    Button::new("open-url")
-                        .ghost()
-                        .small()
-                        .icon(icon(IconName::ExternalLink))
-                        .tooltip("Open in browser")
-                        .on_click(cx.listener({
-                            let url = url.clone();
-                            move |this, _, _window, cx| this.open_domain(url.clone(), cx)
-                        })),
-                    cx,
-                ))
+                .child(detail_row_link("open-url", "Domain", &url, url.clone(), cx))
                 .child(detail_row(
                     "HTTPS",
                     if project.ssl_enabled {
@@ -2945,18 +2896,11 @@ impl Wisp {
                     cx,
                 ))
                 .child(detail_row("PHP", &php, cx))
-                .child(detail_row_action(
+                .child(detail_row_link(
+                    "open-config",
                     "Config folder",
                     &config_display,
-                    Button::new("open-config")
-                        .ghost()
-                        .small()
-                        .icon(icon(IconName::FolderTree))
-                        .tooltip("Open in Explorer")
-                        .on_click(cx.listener({
-                            let path = config_display.clone();
-                            move |this, _, _window, cx| this.open_folder(&path, cx)
-                        })),
+                    folder_url(&config_display),
                     cx,
                 )),
         )
@@ -3033,27 +2977,34 @@ impl Wisp {
                             })),
                     ),
             );
-        let nginx_state = if !nginx_on {
-            "Not serving".to_string()
+        let nginx_state: AnyElement = if !nginx_on {
+            div().child("Not serving").into_any_element()
         } else if nginx_up {
-            format!("Serving {url}")
+            Link::new("nginx-serving")
+                .href(url.clone())
+                .child(format!("Serving {url}"))
+                .into_any_element()
         } else {
-            "Starting\u{2026}".to_string()
+            div().child("Starting\u{2026}").into_any_element()
         };
-        let php_state = if !php_on {
-            "Stopped".to_string()
-        } else if worker_up {
-            format!("php-cgi {php}")
-        } else {
-            "Starting\u{2026}".to_string()
-        };
+        let php_state: AnyElement = div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(if !php_on {
+                "Stopped".to_string()
+            } else if worker_up {
+                format!("php-cgi {php}")
+            } else {
+                "Starting\u{2026}".to_string()
+            })
+            .into_any_element();
         let rows = div()
             .flex()
             .flex_col()
             .p(px(8.))
             .child(project_service_row(
                 "nginx",
-                &nginx_state,
+                nginx_state,
                 nginx_on,
                 ProjectService::Nginx,
                 id,
@@ -3062,7 +3013,7 @@ impl Wisp {
             ))
             .child(project_service_row(
                 "PHP",
-                &php_state,
+                php_state,
                 php_on,
                 ProjectService::Php,
                 id,
@@ -3163,8 +3114,7 @@ impl Wisp {
     }
 
     /// Collapse or expand the sidebar, and remember the choice.
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {        self.sidebar_collapsed = !self.sidebar_collapsed;
         self.settings.sidebar_collapsed = Some(self.sidebar_collapsed);
         self.settings.save();
         cx.notify();
@@ -3925,7 +3875,33 @@ impl Wisp {
                     Some(expires) => human_expiry(expires),
                     None => "not issued yet".to_string(),
                 };
-                detail_row(&project.domain, &state, cx).into_any_element()
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_shrink(0.0)
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Domain"),
+                    )
+                    .child(
+                        Link::new(SharedString::from(format!("cert-{}", project.id)))
+                            .href(format!("https://{}", project.domain))
+                            .text_sm()
+                            .child(project.domain.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(state),
+                    )
+                    .into_any_element()
             })
             .collect();
 
@@ -4934,7 +4910,7 @@ enum ProjectService {
 /// A project service row: status dot, name, status, and Start/Stop/Restart.
 fn project_service_row(
     label: &str,
-    status: &str,
+    status: impl IntoElement,
     on: bool,
     service: ProjectService,
     id: i64,
@@ -5020,12 +4996,7 @@ fn project_service_row(
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(status.to_string()),
-                )
+                .child(status)
                 .child(
                     div()
                         .flex()
@@ -5037,13 +5008,21 @@ fn project_service_row(
         )
 }
 
-/// A `label  value` row with a trailing action (e.g. open in Explorer).
-fn detail_row_action(
+
+/// A `file:///` URL for a Windows path, so the shell opens it in Explorer.
+fn folder_url(path: &str) -> String {
+    format!("file:///{}", path.replace('\\', "/"))
+}
+
+/// A `label  link` row: the value is the thing you click, with no button beside
+/// it repeating what the text already says.
+fn detail_row_link(
+    id: &'static str,
     label: &str,
-    value: &str,
-    action: impl IntoElement,
+    text: &str,
+    href: String,
     cx: &App,
-) -> impl IntoElement {
+) -> AnyElement {
     div()
         .flex()
         .flex_row()
@@ -5058,18 +5037,13 @@ fn detail_row_action(
                 .child(label.to_string()),
         )
         .child(
-            // Sized to its text so the button sits beside the value, but free to
-            // shrink below that so a long path wraps inside the card instead of
-            // pushing the button off the edge.
             div()
                 .flex_shrink(1.0)
                 .min_w(px(0.))
                 .overflow_hidden()
-                .text_sm()
-                .whitespace_normal()
-                .child(value.to_string()),
+                .child(Link::new(id).href(href).text_sm().child(text.to_string())),
         )
-        .child(div().flex_shrink_0().child(action))
+        .into_any_element()
 }
 
 /// A `label  value` row, the label muted and fixed-width.
@@ -5142,6 +5116,8 @@ fn service_row(name: &str, detail: &str, sample: &ServiceSample, cx: &App) -> An
                     format!("cpu-{key}"),
                     sample.cpu_history.iter().copied().collect(),
                     cpu_max,
+                    "CPU",
+                    format_percent,
                     cx.theme().primary,
                     cx,
                 ))
@@ -5151,6 +5127,8 @@ fn service_row(name: &str, detail: &str, sample: &ServiceSample, cx: &App) -> An
                     format!("ram-{key}"),
                     sample.ram_history.iter().copied().collect(),
                     ram_max,
+                    "RAM",
+                    format_megabytes,
                     cx.theme().warning,
                     cx,
                 )),
@@ -5159,12 +5137,15 @@ fn service_row(name: &str, detail: &str, sample: &ServiceSample, cx: &App) -> An
 }
 
 /// `label  value  sparkline`, one metric of one service.
+#[allow(clippy::too_many_arguments)]
 fn service_meter(
     label: &str,
     value: &str,
     id: String,
     values: Vec<f64>,
     max: f64,
+    name: &'static str,
+    format: fn(f64) -> String,
     color: Hsla,
     cx: &App,
 ) -> AnyElement {
@@ -5174,7 +5155,7 @@ fn service_meter(
         .items_center()
         .gap_2()
         .flex_1()
-        .min_w(px(220.))
+        .min_w(px(240.))
         .child(
             div()
                 .w(px(34.))
@@ -5195,18 +5176,37 @@ fn service_meter(
                 .flex_1()
                 .min_w(px(80.))
                 .h(px(28.))
-                .child(metric_sparkline(id, values, max, color)),
+                .child(metric_sparkline(id, values, max, name, format, color)),
+        )
+        .child(
+            // What the top of the chart is, since there is no axis to read it off.
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("peak {}", format(max))),
         )
         .into_any_element()
 }
 
-/// A sparkline over a `0..max` domain.
-fn metric_sparkline(id: String, values: Vec<f64>, max: f64, color: Hsla) -> impl IntoElement {
+/// A sparkline over a `0..max` domain, whose tooltip says what the numbers are.
+fn metric_sparkline(
+    id: String,
+    values: Vec<f64>,
+    max: f64,
+    name: &'static str,
+    format: fn(f64) -> String,
+    color: Hsla,
+) -> impl IntoElement {
+    let total = values.len();
     AreaChart::new(values.into_iter().enumerate())
         .id(id)
-        .x(|(index, _)| index.to_string())
+        .name(name)
+        .x(move |(index, _)| sample_age(total, *index))
         .y(|(_, value)| *value)
         .stroke(color)
+        .tooltip_title(move |_| SharedString::from(name))
+        .tooltip_value(move |_, _, value| SharedString::from(format(value)))
         .x_axis(false)
         .y_axis(false)
         .grid(false)
@@ -5343,6 +5343,29 @@ fn diff_row(marker: &str, text: &str, color: Hsla, cx: &App) -> AnyElement {
         .child(div().w(px(8.)).flex_shrink(0.0).text_color(color).child(marker.to_string()))
         .child(div().text_color(cx.theme().foreground).child(text.to_string()))
         .into_any_element()
+}
+
+/// How an axis label should read for a sample `index` of `total`.
+///
+/// Samples are two seconds apart, so the x axis is an age rather than a sample
+/// number: "-2m" says more than "31" ever did.
+fn sample_age(total: usize, index: usize) -> String {
+    let seconds = (total.saturating_sub(1).saturating_sub(index)) * 2;
+    if seconds < 60 {
+        format!("-{seconds}s")
+    } else {
+        format!("-{}m", seconds / 60)
+    }
+}
+
+/// A percentage, as a chart value and a tooltip both read it.
+fn format_percent(value: f64) -> String {
+    format!("{value:.1}%")
+}
+
+/// Megabytes, as a chart value and a tooltip both read it.
+fn format_megabytes(value: f64) -> String {
+    format!("{value:.1} MB")
 }
 
 /// A line diff for the change Wisp makes, which is an append.
@@ -5778,7 +5801,9 @@ fn merge_samples(existing: &mut Vec<ServiceSample>, samples: Vec<(Option<i64>, f
             .map(|sample| (sample.cpu_history.clone(), sample.ram_history.clone()))
             .unwrap_or_default();
         push_capped(&mut cpu_history, cpu);
-        push_capped(&mut ram_history, ram_bytes as f64);
+        // Stored in megabytes, not bytes: the chart, its axis and its tooltip all
+        // read from this history, and raw byte counts meant nothing on screen.
+        push_capped(&mut ram_history, ram_bytes as f64 / (1024.0 * 1024.0));
         fresh.push(ServiceSample {
             project,
             cpu,
