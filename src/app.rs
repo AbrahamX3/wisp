@@ -2855,7 +2855,7 @@ impl Wisp {
                 .child(self.resources_card(Some(project.id), cx))
                 .into_any_element(),
             ProjectTab::Services => self.project_services(project, cx),
-            ProjectTab::Logs => self.logs_card(window, cx).into_any_element(),
+            ProjectTab::Logs => self.logs_card(cx).into_any_element(),
             ProjectTab::Settings => self.project_settings(project, window, cx),
         };
 
@@ -3564,11 +3564,7 @@ impl Wisp {
     }
 
     /// The selected project's logs: source, search, follow and a bounded tail.
-    fn logs_card(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The log fills what is left of the window instead of a fixed box, so the
-        // space below the card belongs to the log rather than to nobody.
-        let available = window.bounds().size.height - px(330.);
-        let height = if available < px(240.) { px(240.) } else { available };
+    fn logs_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.log_kind;
         let raw = self.log_filter.read(cx).value().to_string();
         let needle = if self.log_case {
@@ -3846,39 +3842,38 @@ impl Wisp {
                 })
                 .collect();
 
+            // Grows into whatever the card has left after its header and
+            // toolbar. This used to be a height derived from the window, which
+            // overshot and let the log run past the card and off the window.
             div()
+                .relative()
+                .flex_1()
+                .min_h(px(0.))
+                .w_full()
                 .px(px(18.))
                 .pb(px(18.))
                 .child(
                     div()
-                        .relative()
-                        .w_full()
-                        .h(height)
-                        .rounded_md()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .child(
-                            div()
-                                .id("log-lines")
-                                .track_scroll(&self.log_scroll)
-                                .overflow_y_scroll()
-                                .size_full()
-                                .px(px(12.))
-                                .py(px(10.))
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_xs()
-                                .children(lines),
-                        )
-                        .vertical_scrollbar(&self.log_scroll),
+                        .id("log-lines")
+                        .track_scroll(&self.log_scroll)
+                        .overflow_y_scroll()
+                        .size_full()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .children(lines),
                 )
+                .vertical_scrollbar(&self.log_scroll)
                 .into_any_element()
         };
 
-        ui::section(
+        ui::section_grow(
             cx,
             div()
                 .flex()
                 .flex_col()
+                .h_full()
                 .gap_1()
                 .child(header)
                 .child(toolbar)
