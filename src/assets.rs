@@ -34,6 +34,23 @@ icon_assets!(
         Github,
         Rocket,
         X,
+        Plus,
+        SquarePen,
+        Trash,
+        FolderOpen,
+        FolderTree,
+        Globe,
+        Lock,
+        LockOpen,
+        Settings,
+        ScrollText,
+        Server,
+        ExternalLink,
+        Terminal,
+        ChevronRight,
+        CircleCheck,
+        TriangleAlert,
+        Sparkles,
     ]
 );
 

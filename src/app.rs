@@ -1,17 +1,21 @@
 //! The Wisp window.
 //!
-//! Phase 1 ships the shell: a header with the single settings menu, the update
-//! banner, toasts and the About dialog. The project list, the services page and
-//! the log viewer land on top of this frame in later phases.
+//! Layout: a slim sidebar of projects beside a detail pane. Every card is the
+//! shared "tray and plate" primitive, the brand accent marks the active project
+//! and the primary action, and nothing else carries colour.
 
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::form::{Field, Form};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
 };
@@ -19,13 +23,19 @@ use gpui_kit::*;
 
 use crate::assets::APP_ICON;
 use crate::autostart;
+use crate::brand;
+use crate::db::{self, Project, ProjectDraft, Store};
 use crate::platform;
 use crate::settings::{Settings, ThemePreference};
 use crate::tray;
+use crate::ui;
 use crate::update;
 
 /// Delay before the automatic launch update check, so start-up stays snappy.
 const AUTO_CHECK_DELAY: Duration = Duration::from_secs(6);
+
+/// The PHP major/minor lines offered in the editor before runtimes are managed.
+const PHP_VERSIONS: &[&str] = &["8.4", "8.3", "8.2", "8.1", "8.0", "7.4"];
 
 /// Repository URL, taken from `Cargo.toml` so it cannot drift from the updater's
 /// own `REPO_OWNER` / `REPO_NAME` (a test below keeps the two in step).
@@ -51,40 +61,349 @@ enum UpdateState {
     ReadyToRestart(String),
 }
 
+/// The create/edit dialog's live state. `id` is `None` while creating.
+struct EditorState {
+    id: Option<i64>,
+    name: Entity<InputState>,
+    app_name: Entity<InputState>,
+    root_path: Entity<InputState>,
+    domain: Entity<InputState>,
+    php_version: Option<String>,
+    ssl_enabled: bool,
+    error: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
 pub struct Wisp {
     theme: ThemePreference,
     settings: Settings,
     toasts: Vec<(ToastKind, String)>,
     update: UpdateState,
-    /// Whether the per-user Run entry points at this executable. Read from the
-    /// registry at start-up and after each toggle, never persisted here.
     autostart: bool,
+
+    store: Option<Store>,
+    projects: Vec<Project>,
+    selected: Option<i64>,
+    editor: Option<EditorState>,
+    /// A persistent problem (e.g. the database could not be opened).
+    error: Option<String>,
 }
 
 impl Wisp {
     pub fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
-        let this = Self {
+        let (store, error) = match Store::open() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(format!("Could not open the project database: {error}"))),
+        };
+
+        let mut this = Self {
             theme: settings.theme,
             settings,
             toasts: Vec::new(),
             update: UpdateState::Idle,
             autostart: autostart::is_enabled(),
+            store,
+            projects: Vec::new(),
+            selected: None,
+            editor: None,
+            error,
         };
+        this.reload(cx);
 
         Self::spawn_auto_update_check(cx);
         this
+    }
+
+    // ---- projects --------------------------------------------------------
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            match store.list_projects() {
+                Ok(projects) => {
+                    self.projects = projects;
+                    self.error = None;
+                    if let Some(id) = self.selected {
+                        if !self.projects.iter().any(|p| p.id == id) {
+                            self.selected = None;
+                        }
+                    }
+                }
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
+    }
+
+    fn selected_project(&self) -> Option<&Project> {
+        let id = self.selected?;
+        self.projects.iter().find(|p| p.id == id)
+    }
+
+    fn select(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.selected = Some(id);
+        cx.notify();
     }
 
     fn push_toast(&mut self, kind: ToastKind, message: String) {
         self.toasts.push((kind, message));
     }
 
+    // ---- editor ----------------------------------------------------------
+
+    fn open_editor(
+        &mut self,
+        existing: Option<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = existing
+            .as_ref()
+            .map(ProjectDraft::from_project)
+            .unwrap_or_else(|| ProjectDraft {
+                ssl_enabled: true,
+                php_ini_overrides: "{}".to_string(),
+                ..Default::default()
+            });
+
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("My Shop")
+                .default_value(draft.name.clone())
+        });
+        let app_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("my-shop")
+                .default_value(draft.app_name.clone())
+        });
+        let root_path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(r"C:\Sites\my-shop")
+                .default_value(draft.root_path.clone())
+        });
+        let domain = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("my-shop.test")
+                .default_value(draft.domain.clone())
+        });
+
+        // Deriving the domain from the app name while the domain is still empty
+        // gives a sensible default without fighting a manual edit.
+        let subscription = cx.subscribe_in(
+            &app_name,
+            window,
+            |this, _state, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.sync_domain(window, cx);
+                }
+            },
+        );
+
+        self.editor = Some(EditorState {
+            id: existing.as_ref().map(|p| p.id),
+            name,
+            app_name,
+            root_path,
+            domain,
+            php_version: draft.php_version,
+            ssl_enabled: draft.ssl_enabled,
+            error: None,
+            _subscriptions: vec![subscription],
+        });
+
+        let entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let Some(editor) = entity.read(cx).editor.as_ref() else {
+                return dialog;
+            };
+            let title = if editor.id.is_some() {
+                "Edit project"
+            } else {
+                "New project"
+            };
+            let error = editor.error.clone();
+            let is_new = editor.id.is_none();
+
+            dialog
+                .title(title)
+                .w(px(580.))
+                .close_button(true)
+                .child(editor_form(editor, &entity, error))
+                .footer(editor_footer(entity.clone(), is_new))
+        });
+    }
+
+    /// Fill the domain from the app name while the domain is still untouched.
+    fn sync_domain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let domain_is_empty = editor.domain.read(cx).value().trim().is_empty();
+        if !domain_is_empty {
+            return;
+        }
+        let slug = db::slugify(&editor.app_name.read(cx).value());
+        if slug.is_empty() {
+            return;
+        }
+        editor
+            .domain
+            .update(cx, |state, cx| state.set_value(format!("{slug}.test"), window, cx));
+    }
+
+    fn cancel_editor(&mut self, cx: &mut Context<Self>) {
+        self.editor = None;
+        cx.notify();
+    }
+
+    /// Persist the editor. Returns whether it saved (and the dialog may close).
+    fn save_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.editor.as_ref() else {
+            return false;
+        };
+        let draft = ProjectDraft {
+            name: editor.name.read(cx).value().to_string(),
+            app_name: editor.app_name.read(cx).value().to_string(),
+            root_path: editor.root_path.read(cx).value().to_string(),
+            domain: editor.domain.read(cx).value().to_string(),
+            php_version: editor.php_version.clone(),
+            ssl_enabled: editor.ssl_enabled,
+            php_ini_overrides: "{}".to_string(),
+        };
+        let id = editor.id;
+
+        let Some(store) = &self.store else {
+            self.set_editor_error("The project database is unavailable.".to_string(), cx);
+            return false;
+        };
+
+        let result = match id {
+            Some(id) => store.update_project(id, &draft).map(|()| id),
+            None => store.create_project(&draft),
+        };
+
+        match result {
+            Ok(saved_id) => {
+                self.editor = None;
+                self.selected = Some(saved_id);
+                self.reload(cx);
+                self.push_toast(
+                    ToastKind::Success,
+                    if id.is_some() {
+                        format!("Saved {}.", draft.name.trim())
+                    } else {
+                        format!("Created {}.", draft.name.trim())
+                    },
+                );
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.set_editor_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    fn set_editor_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.error = Some(message);
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        let entity = cx.entity();
+        let name = project.name.clone();
+        let root = project.root_path.clone();
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .child("This removes the project from Wisp only."),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Its files on disk stay untouched \u{2014} {root}"
+                        )),
+                );
+
+            let cancel = Button::new("delete-cancel")
+                .label("Cancel")
+                .outline()
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            let delete = Button::new("delete-confirm")
+                .label("Remove project")
+                .danger()
+                .on_click({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.delete_project(id, cx));
+                        window.close_dialog(cx);
+                    }
+                });
+
+            dialog
+                .title(format!("Remove {name}?"))
+                .w(px(460.))
+                .close_button(true)
+                .child(body)
+                .footer(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(cancel)
+                        .child(delete),
+                )
+        });
+    }
+
+    fn delete_project(&mut self, id: i64, cx: &mut Context<Self>) {
+        let name = self
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+
+        let outcome = self
+            .store
+            .as_ref()
+            .map(|store| store.delete_project(id));
+
+        match outcome {
+            Some(Ok(())) => {
+                if self.selected == Some(id) {
+                    self.selected = None;
+                }
+                self.reload(cx);
+                self.push_toast(ToastKind::Success, format!("Removed {name} from Wisp."));
+            }
+            Some(Err(error)) => self.push_toast(ToastKind::Error, error.to_string()),
+            None => self.push_toast(
+                ToastKind::Error,
+                "The project database is unavailable.".to_string(),
+            ),
+        }
+        cx.notify();
+    }
+
     // ---- settings toggles ------------------------------------------------
 
-    /// Turn the tray icon, and with it "closing hides the window", on or off.
     fn toggle_background(&mut self, cx: &mut Context<Self>) {
         let wanted = !self.settings.background;
-
         if wanted {
             if let Err(error) = tray::install(cx) {
                 self.push_toast(
@@ -97,7 +416,6 @@ impl Wisp {
         } else {
             tray::remove(cx);
         }
-
         self.settings.background = wanted;
         self.settings.save();
         self.push_toast(
@@ -112,7 +430,6 @@ impl Wisp {
         cx.notify();
     }
 
-    /// Switch the per-user `Run` entry on or off. No elevation: it is HKCU.
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
         let wanted = !self.autostart;
         match autostart::set(wanted) {
@@ -149,11 +466,6 @@ impl Wisp {
 
     // ---- updates ---------------------------------------------------------
 
-    /// Ask GitHub Releases whether a newer version exists.
-    ///
-    /// `manual` is the Menu action: it always reports a result (including "up to
-    /// date" and errors). The automatic launch check is cached, stays silent on
-    /// failure, and respects a dismissed version.
     fn check_updates(&mut self, cx: &mut Context<Self>, manual: bool) {
         if matches!(
             self.update,
@@ -175,16 +487,15 @@ impl Wisp {
             entity
                 .update(cx, |this, cx| {
                     this.settings.record_update_check();
-
                     match result {
                         Ok(Some(version)) => {
                             this.settings.available_version = Some(version.clone());
-                            this.update = if should_offer_update(manual, &version, skipped.as_deref())
-                            {
-                                UpdateState::Available(version)
-                            } else {
-                                UpdateState::Idle
-                            };
+                            this.update =
+                                if should_offer_update(manual, &version, skipped.as_deref()) {
+                                    UpdateState::Available(version)
+                                } else {
+                                    UpdateState::Idle
+                                };
                         }
                         Ok(None) => {
                             this.settings.available_version = None;
@@ -206,7 +517,6 @@ impl Wisp {
                             }
                         }
                     }
-
                     this.settings.save();
                     cx.notify();
                 })
@@ -215,20 +525,15 @@ impl Wisp {
         .detach();
     }
 
-    /// Check once shortly after launch, at most once a day.
     fn spawn_auto_update_check(cx: &mut Context<Self>) {
         cx.spawn(async move |entity, cx| {
             cx.background_executor().timer(AUTO_CHECK_DELAY).await;
-
             entity
                 .update(cx, |this, cx| {
                     if this.settings.update_check_due() {
                         this.check_updates(cx, false);
                         return;
                     }
-
-                    // Inside the throttle window: no network call, but still
-                    // show an update a previous check already found.
                     let Some(cached) = this.settings.available_version.clone() else {
                         return;
                     };
@@ -245,7 +550,6 @@ impl Wisp {
         .detach();
     }
 
-    /// Remember the dismissed version so the banner does not come back for it.
     fn dismiss_update(&mut self, version: String, cx: &mut Context<Self>) {
         self.settings.skipped_version = Some(version);
         self.settings.save();
@@ -253,7 +557,6 @@ impl Wisp {
         cx.notify();
     }
 
-    /// Download and install the available update (off the UI thread).
     fn install_update(&mut self, cx: &mut Context<Self>) {
         let UpdateState::Available(version) = &self.update else {
             return;
@@ -266,7 +569,6 @@ impl Wisp {
                 .background_executor()
                 .spawn(async { update::install() })
                 .await;
-
             entity
                 .update(cx, |this, cx| {
                     match result {
@@ -293,7 +595,6 @@ impl Wisp {
         .detach();
     }
 
-    /// The update banner, if there is anything to say about updates.
     fn update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let row = match &self.update {
             UpdateState::Idle | UpdateState::Checking => return None,
@@ -358,11 +659,11 @@ impl Wisp {
 
         Some(
             div()
-                .px(px(28.))
-                .pt(px(20.))
+                .px(px(20.))
+                .pb(px(12.))
                 .child(
                     row.px(px(18.))
-                        .py(px(14.))
+                        .py(px(12.))
                         .rounded_lg()
                         .bg(cx.theme().secondary)
                         .border_1()
@@ -374,16 +675,15 @@ impl Wisp {
 
     // ---- chrome ----------------------------------------------------------
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
-            .flex_wrap()
             .items_center()
             .justify_between()
-            .gap_3()
-            .px(px(28.))
-            .py(px(18.))
+            .gap_4()
+            .px(px(20.))
+            .py(px(14.))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -394,24 +694,39 @@ impl Wisp {
                     .gap_3()
                     .child(
                         div()
-                            .size(px(28.))
+                            .size(px(30.))
                             .rounded_md()
-                            .child(img(APP_ICON).size(px(28.))),
+                            .child(img(APP_ICON).size(px(30.))),
                     )
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Wisp"),
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Wisp"),
+                            )
+                            .child(ui::eyebrow("Local PHP", cx)),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .flex_shrink(0.0)
                     .items_center()
-                    .gap_3()
+                    .gap_2()
+                    .child(
+                        Button::new("new-project")
+                            .primary()
+                            .small()
+                            .icon(icon(IconName::Plus))
+                            .label("New project")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_editor(None, window, cx)
+                            })),
+                    )
                     .child(self.settings_menu(cx)),
             )
     }
@@ -455,39 +770,33 @@ impl Wisp {
                     .separator();
 
                 let menu = menu
-                    .submenu_with_icon(
-                        Some(icon(IconName::Palette)),
-                        "Theme",
-                        window,
-                        cx,
-                        {
-                            let entity = entity.clone();
-                            move |menu, _, _| {
-                                let menu = menu.check_side(Side::Right);
-                                menu.item(theme_item(
-                                    "System",
-                                    ThemePreference::System,
-                                    theme,
-                                    IconName::Monitor,
-                                    &entity,
-                                ))
-                                .item(theme_item(
-                                    "Light",
-                                    ThemePreference::Light,
-                                    theme,
-                                    IconName::Sun,
-                                    &entity,
-                                ))
-                                .item(theme_item(
-                                    "Dark",
-                                    ThemePreference::Dark,
-                                    theme,
-                                    IconName::Moon,
-                                    &entity,
-                                ))
-                            }
-                        },
-                    )
+                    .submenu_with_icon(Some(icon(IconName::Palette)), "Theme", window, cx, {
+                        let entity = entity.clone();
+                        move |menu, _, _| {
+                            let menu = menu.check_side(Side::Right);
+                            menu.item(theme_item(
+                                "System",
+                                ThemePreference::System,
+                                theme,
+                                IconName::Monitor,
+                                &entity,
+                            ))
+                            .item(theme_item(
+                                "Light",
+                                ThemePreference::Light,
+                                theme,
+                                IconName::Sun,
+                                &entity,
+                            ))
+                            .item(theme_item(
+                                "Dark",
+                                ThemePreference::Dark,
+                                theme,
+                                IconName::Moon,
+                                &entity,
+                            ))
+                        }
+                    })
                     .separator();
 
                 menu.item(
@@ -508,28 +817,234 @@ impl Wisp {
             })
     }
 
-    /// The empty state until the project list lands in a later phase.
-    fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected;
+
+        let body = if self.projects.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .px(px(20.))
+                .py(px(40.))
+                .text_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No projects yet"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Add one to serve it on a .test domain."),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("project-list")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p(px(10.))
+                .overflow_y_scroll()
+                .children(self.projects.iter().map(|project| {
+                    let is_selected = selected == Some(project.id);
+                    project_row(project, is_selected, cx)
+                }))
+                .into_any_element()
+        };
+
         div()
             .flex()
             .flex_col()
+            .w(px(300.))
+            .h_full()
+            .flex_shrink(0.0)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .child(ui::eyebrow("Projects", cx))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", self.projects.len())),
+                    ),
+            )
+            .child(div().flex_1().overflow_hidden().child(body))
+    }
+
+    fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(project) = self.selected_project() else {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(div().size(px(72.)).child(img(APP_ICON).size(px(72.))))
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("No project selected"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Choose a project, or create a new one."),
+                )
+                .into_any_element();
+        };
+
+        let id = project.id;
+        let name = project.name.clone();
+        let domain = project.domain.clone();
+        let root = project.root_path.clone();
+        let php = project
+            .php_version
+            .clone()
+            .unwrap_or_else(|| "Not set".to_string());
+        let ssl = project.ssl_enabled;
+        let slug = project.slug();
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(ui::dot(brand::accent()))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{}{}", scheme_prefix(ssl), domain)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("edit-project")
+                            .outline()
+                            .small()
+                            .icon(icon(IconName::SquarePen))
+                            .label("Edit")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let existing =
+                                    this.projects.iter().find(|p| p.id == id).cloned();
+                                this.open_editor(existing, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("delete-project")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::Trash))
+                            .label("Remove")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_delete(id, window, cx)
+                            })),
+                    ),
+            );
+
+        let details = ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .p(px(18.))
+                .gap_4()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().muted_foreground)
+                        .child("PROJECT"),
+                )
+                .child(detail_row("Root folder", &root, cx))
+                .child(detail_row("Domain", &format!("{}{}", scheme_prefix(ssl), domain), cx))
+                .child(detail_row("HTTPS", if ssl { "Trusted certificate" } else { "Off" }, cx))
+                .child(detail_row("PHP", &php, cx))
+                .child(detail_row("Config folder", &format!("sites/{slug}"), cx)),
+        );
+
+        let services = ui::plate(
+            cx,
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .p(px(18.))
+                .child(icon(IconName::Server).text_color(brand::accent()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Services"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("nginx and PHP start here once the runtime manager lands next."),
+                        ),
+                ),
+        );
+
+        div()
+            .id("content")
+            .flex()
+            .flex_col()
             .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child(div().size(px(72.)).child(img(APP_ICON).size(px(72.))))
-            .child(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("No projects yet"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Projects and the PHP/nginx services arrive in the next build."),
-            )
+            .gap_6()
+            .p(px(28.))
+            .overflow_y_scroll()
+            .child(header)
+            .child(details)
+            .child(services)
+            .into_any_element()
     }
 }
 
@@ -543,13 +1058,266 @@ impl Render for Wisp {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.header(cx));
+            .child(self.top_bar(cx));
+
+        if let Some(message) = self.error.clone() {
+            root = root.child(
+                div().px(px(20.)).pb(px(12.)).child(
+                    Alert::error("db-error", message)
+                        .title("Something went wrong")
+                        .banner(),
+                ),
+            );
+        }
 
         if let Some(banner) = self.update_banner(cx) {
             root = root.child(banner);
         }
 
-        root.child(div().flex_1().overflow_hidden().child(self.body(cx)))
+        root.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .overflow_hidden()
+                .child(self.sidebar(cx))
+                .child(self.content(cx)),
+        )
+    }
+}
+
+/// A single project in the sidebar.
+fn project_row(project: &Project, selected: bool, cx: &mut Context<Wisp>) -> impl IntoElement {
+    let id = project.id;
+    let name = project.name.clone();
+    let domain = project.domain.clone();
+
+    let core = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded_lg()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(domain),
+                ),
+        )
+        .child(if project.ssl_enabled {
+            icon(IconName::Lock)
+                .small()
+                .text_color(brand::accent())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        });
+
+    let base = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .rounded_lg();
+
+    let styled = if selected {
+        base.bg(brand::accent_wash())
+            .border_1()
+            .border_color(brand::accent_tint())
+    } else {
+        base
+    };
+
+    styled
+        .id(("project", id as u64))
+        .hover(|d| d.bg(cx.theme().list_hover))
+        .on_click(cx.listener(move |this, _, _window, cx| this.select(id, cx)))
+        .child(if selected {
+            ui::accent_rail().into_any_element()
+        } else {
+            div().w(px(3.)).into_any_element()
+        })
+        .child(core)
+}
+
+/// A `label  value` row, the label muted and fixed-width.
+fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_4()
+        .child(
+            div()
+                .w(px(120.))
+                .flex_shrink(0.0)
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .whitespace_normal()
+                .child(value.to_string()),
+        )
+}
+
+/// The body of the create/edit dialog.
+fn editor_form(editor: &EditorState, entity: &Entity<Wisp>, error: Option<String>) -> impl IntoElement {
+    let php_label = editor
+        .php_version
+        .clone()
+        .unwrap_or_else(|| "Not set".to_string());
+
+    let php_menu = Button::new("php-version")
+        .outline()
+        .label(php_label)
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+            let entity = entity.clone();
+            move |menu, _, _| {
+                let entity = entity.clone();
+                let mut menu = menu.check_side(Side::Right);
+                for version in PHP_VERSIONS {
+                    let version = version.to_string();
+                    menu = menu.item(
+                        PopupMenuItem::new(version.clone()).on_click({
+                            let entity = entity.clone();
+                            move |_, _, cx| {
+                                let version = version.clone();
+                                entity.update(cx, |this, cx| {
+                                    if let Some(editor) = this.editor.as_mut() {
+                                        editor.php_version = Some(version.clone());
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                    );
+                }
+                menu
+            }
+        });
+
+    let mut form = Form::new()
+        .child(
+            Field::new()
+                .label("Name")
+                .description("How the project is labelled in Wisp.")
+                .child(Input::new(&editor.name)),
+        )
+        .child(
+            Field::new()
+                .label("App name")
+                .description("Used for the default domain and config folder.")
+                .child(Input::new(&editor.app_name)),
+        )
+        .child(
+            Field::new()
+                .label("Root folder")
+                .description("The project's document root.")
+                .child(Input::new(&editor.root_path)),
+        )
+        .child(
+            Field::new()
+                .label("Domain")
+                .description("Must end with .test. HTTPS uses a locally-trusted certificate.")
+                .child(Input::new(&editor.domain)),
+        )
+        .child(Field::new().label("PHP").child(php_menu))
+        .child(
+            Field::new().label("HTTPS").child({
+                let entity = entity.clone();
+                Switch::new("ssl")
+                    .checked(editor.ssl_enabled)
+                    .label("Trusted certificate")
+                    .on_change(move |checked, _, cx| {
+                        let checked = *checked;
+                        entity.update(cx, |this, cx| {
+                            if let Some(editor) = this.editor.as_mut() {
+                                editor.ssl_enabled = checked;
+                            }
+                            cx.notify();
+                        });
+                    })
+            }),
+        );
+
+    if let Some(message) = error {
+        form = form.footer(
+            div()
+                .w_full()
+                .text_sm()
+                .text_color(cx_error())
+                .child(message),
+        );
+    }
+
+    form
+}
+
+/// The dialog footer: Cancel and Save.
+fn editor_footer(entity: Entity<Wisp>, is_new: bool) -> impl IntoElement {
+    let cancel = Button::new("editor-cancel")
+        .label("Cancel")
+        .outline()
+        .on_click({
+            let entity = entity.clone();
+            move |_, window, cx| {
+                entity.update(cx, |this, cx| this.cancel_editor(cx));
+                window.close_dialog(cx);
+            }
+        });
+
+    let save = Button::new("editor-save")
+        .label(if is_new { "Create project" } else { "Save changes" })
+        .primary()
+        .on_click(move |_, window, cx| {
+            let saved = entity.update(cx, |this, cx| this.save_editor(cx));
+            if saved {
+                window.close_dialog(cx);
+            }
+        });
+
+    div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .gap_2()
+        .child(cancel)
+        .child(save)
+}
+
+fn cx_error() -> Hsla {
+    rgb(0xEF4444).into()
+}
+
+fn scheme_prefix(ssl: bool) -> &'static str {
+    if ssl {
+        "https://"
+    } else {
+        "http://"
     }
 }
 
@@ -654,14 +1422,12 @@ fn about_content(cx: &App) -> impl IntoElement {
         )
 }
 
-/// The repository URL without its scheme, as shown in the About dialog.
 fn repository_label() -> &'static str {
     REPOSITORY_URL
         .strip_prefix("https://")
         .unwrap_or(REPOSITORY_URL)
 }
 
-/// The brand icon inside a nested tray, matching the card treatment.
 fn icon_tile(cx: &App) -> impl IntoElement {
     div()
         .p(px(5.))
@@ -697,10 +1463,6 @@ fn flush_toasts(
     }
 }
 
-/// Whether `candidate` is a later release than `current`.
-///
-/// Compares the dotted numeric parts. Anything unparsable - a prerelease tag,
-/// say - counts as not-later, so a surprising tag can never raise a prompt.
 fn is_newer(candidate: &str, current: &str) -> bool {
     fn parts(version: &str) -> Option<Vec<u64>> {
         version
@@ -709,17 +1471,12 @@ fn is_newer(candidate: &str, current: &str) -> bool {
             .map(|part| part.parse::<u64>().ok())
             .collect()
     }
-
     match (parts(candidate), parts(current)) {
         (Some(candidate), Some(current)) => candidate > current,
         _ => false,
     }
 }
 
-/// Whether an available version should be surfaced to the user.
-///
-/// A manual check always reports what it found, including a version the user
-/// dismissed earlier; the automatic launch check stays quiet about it.
 fn should_offer_update(manual: bool, available: &str, skipped: Option<&str>) -> bool {
     manual || skipped != Some(available)
 }
@@ -734,13 +1491,14 @@ pub fn window_should_close(_window: &mut Window, cx: &mut App) -> bool {
     true
 }
 
-/// Apply a three-way theme preference to the global theme.
+/// Apply a three-way theme preference, then reassert the brand on top.
 pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut App) {
     match pref {
         ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
         ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
         ThemePreference::System => Theme::sync_system_appearance(window, cx),
     }
+    brand::apply(cx);
 }
 
 #[cfg(test)]

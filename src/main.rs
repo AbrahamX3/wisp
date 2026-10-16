@@ -10,10 +10,14 @@
 mod app;
 mod assets;
 mod autostart;
+mod brand;
 mod config;
+mod db;
+mod fonts;
 mod platform;
 mod settings;
 mod tray;
+mod ui;
 mod update;
 
 use gpui_kit::*;
@@ -41,6 +45,10 @@ fn main() {
             gpui_kit::init(cx);
             cx.set_app_identity("com.abraham.wisp", "Wisp");
             cx.set_global(tray::TrayState::default());
+
+            // Register the bundled typeface before the first window, so the
+            // first frame is already laid out in it.
+            fonts::install(cx);
 
             // Tray actions are ordinary GPUI actions, dispatched to the app.
             let _ = cx.on_action(|_: &tray::OpenWindow, _cx: &mut App| {
