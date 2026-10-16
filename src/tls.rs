@@ -14,6 +14,12 @@ use rcgen::{
 };
 
 use crate::config;
+use time::Duration;
+
+/// The current time, as the certificate types want it.
+fn now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -41,6 +47,15 @@ impl TlsPaths {
     pub fn is_ready(&self) -> bool {
         self.cert.is_file() && self.key.is_file()
     }
+}
+
+/// When a domain's certificate stops being valid, read from the certificate
+/// itself rather than guessed from the file's timestamp.
+pub fn expiry(domain: &str) -> Option<time::OffsetDateTime> {
+    let bytes = std::fs::read(paths_for(domain).cert).ok()?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes).ok()?;
+    let certificate = pem.parse_x509().ok()?;
+    Some(certificate.validity().not_after.to_datetime())
 }
 
 pub fn ca_cert() -> PathBuf {
@@ -79,6 +94,11 @@ pub fn ensure_ca() -> Result<()> {
         .distinguished_name
         .push(DnType::OrganizationName, "Wisp");
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    // rcgen defaults to the year 4096, which is not a validity period: the
+    // authority should outlive the leaves it signs, not the heat death of the
+    // universe.
+    params.not_before = now() - Duration::days(1);
+    params.not_after = now() + Duration::days(3650);
 
     let key = KeyPair::generate()?;
     let cert = params.self_signed(&key)?;
@@ -114,6 +134,10 @@ pub fn issue(domain: &str) -> Result<TlsPaths> {
         KeyUsagePurpose::KeyEncipherment,
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // A leaf should expire, and be replaced, rather than being valid until 4096
+    // the way rcgen's default has it. One day of slack covers a wrong clock.
+    params.not_before = now() - Duration::days(1);
+    params.not_after = now() + Duration::days(825);
 
     let key = KeyPair::generate()?;
     let cert = params.signed_by(&key, &issuer)?;

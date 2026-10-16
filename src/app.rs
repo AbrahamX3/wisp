@@ -2861,18 +2861,25 @@ impl Wisp {
             ProjectTab::Settings => self.project_settings(project, window, cx),
         };
 
-        div()
+        let page = div()
             .id("content")
             .flex()
             .flex_col()
             .size_full()
             .gap_4()
             .p(px(28.))
-            .overflow_y_scrollbar()
             .child(header)
             .child(tabs)
-            .child(body)
-            .into_any_element()
+            .child(body);
+
+        // Logs sizes its own pane to the window and scrolls inside it. Wrapping
+        // that in the page's scroll region made the wheel move both, so the log
+        // tab is the one tab that does not scroll as a page.
+        if self.project_tab == ProjectTab::Logs {
+            page.into_any_element()
+        } else {
+            page.overflow_y_scrollbar().into_any_element()
+        }
     }
 
     /// The Overview tab: the project's configuration at a glance.
@@ -3818,6 +3825,15 @@ impl Wisp {
                 })
                 .into_any_element()
         } else {
+            // A stripe on alternating rows, so a dense log is easier to follow
+            // across. It is the card's own colour lightened, rather than another
+            // surface token: `muted`, `accent`, `background` and a translucent
+            // overlay all sat too close to `secondary` to read as a row, which a
+            // diagnostic fill in pure red proved was the colour and not the
+            // layout.
+            let mut stripe = cx.theme().secondary;
+            stripe.l = (stripe.l + 0.13).min(1.0);
+
             let lines: Vec<AnyElement> = visible
                 .iter()
                 .map(|(index, line)| {
@@ -3825,10 +3841,8 @@ impl Wisp {
                         .w_full()
                         .px(px(2.))
                         .child(log_line(line, &needle, self.log_case, self.log_wrap, cx));
-                    // A faint stripe on alternating rows, so a dense log is
-                    // easier to follow across.
                     if index % 2 == 1 {
-                        row = row.bg(cx.theme().list_hover);
+                        row = row.bg(stripe);
                     }
                     row.into_any_element()
                 })
@@ -3914,17 +3928,11 @@ impl Wisp {
             .projects
             .iter()
             .map(|project| {
-                let paths = tls::paths_for(&project.domain);
-                let age = if paths.is_ready() {
-                    std::fs::metadata(&paths.cert)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .map_or_else(|| "issued".to_string(), |age| human_age(age.as_secs()))
-                } else {
-                    "not issued yet".to_string()
+                let state = match tls::expiry(&project.domain) {
+                    Some(expires) => human_expiry(expires),
+                    None => "not issued yet".to_string(),
                 };
-                detail_row(&project.domain, &age, cx).into_any_element()
+                detail_row(&project.domain, &state, cx).into_any_element()
             })
             .collect();
 
@@ -4394,10 +4402,24 @@ impl Render for Wisp {
                     .min_h(px(0.))
                     .overflow_hidden()
                     .child(
-                        // The sidebar can be dragged wider, and collapses to
-                        // icons from the toggle in the top bar.
+                        // The sidebar keeps its own width: without a size the
+                        // group splits the window in half between the two panels,
+                        // which left the list stranded in a field of empty space.
                         h_resizable("wisp-shell")
-                            .child(resizable_panel().child(sidebar))
+                            .child(
+                                resizable_panel()
+                                    .size(if self.sidebar_collapsed {
+                                        px(48.)
+                                    } else {
+                                        px(255.)
+                                    })
+                                    .size_range(if self.sidebar_collapsed {
+                                        px(48.)..px(48.)
+                                    } else {
+                                        px(200.)..px(460.)
+                                    })
+                                    .child(sidebar),
+                            )
                             .child(resizable_panel().child(
                                 div()
                                     .min_w(px(0.))
@@ -5950,18 +5972,19 @@ fn find_ranges(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, us
     ranges
 }
 
-/// A rough age, in the units a person would say it in.
-fn human_age(seconds: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
+/// A certificate's expiry as a person would state it, with the date itself.
+fn human_expiry(expires: time::OffsetDateTime) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    let days = (expires - now).whole_days();
+    let date = expires
+        .format(time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_default();
 
-    match seconds {
-        s if s < MINUTE => "just now".to_string(),
-        s if s < HOUR => format!("{} min ago", s / MINUTE),
-        s if s < DAY => format!("{} h ago", s / HOUR),
-        s if s < 30 * DAY => format!("{} days ago", s / DAY),
-        s => format!("{} months ago", s / (30 * DAY)),
+    match days {
+        d if d < 0 => format!("expired {} days ago ({date})", -d),
+        0 => format!("expires today ({date})"),
+        1 => format!("expires tomorrow ({date})"),
+        d => format!("expires in {d} days ({date})"),
     }
 }
 

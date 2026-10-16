@@ -8681,10 +8681,12 @@ dependencies = [
  "serde_json",
  "sysinfo 0.39.6",
  "thiserror 2.0.21",
+ "time",
  "ureq",
  "windows-sys 0.61.2",
  "winreg",
  "winresource",
+ "x509-parser",
  "zip 9.0.3",
 ]
 

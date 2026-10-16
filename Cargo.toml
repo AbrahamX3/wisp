@@ -34,6 +34,8 @@ ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 rcgen = { version = "0.14.10", features = ["x509-parser"] }
 rfd = "0.17.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+x509-parser = "0.18"
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 
 [target.'cfg(windows)'.dependencies]
 # The per-user "start with Windows" Run entry.
