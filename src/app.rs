@@ -4,7 +4,7 @@
 //! shared "tray and plate" primitive, the brand accent marks the active project
 //! and the primary action, and nothing else carries colour.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
@@ -58,6 +59,9 @@ const AUTO_CHECK_DELAY: Duration = Duration::from_secs(6);
 
 /// How long a fetched runtime catalog stays fresh before Services refreshes it.
 const CATALOG_TTL_SECS: u64 = 12 * 60 * 60;
+
+/// CPU/RAM samples kept for the sparklines: 150 at 2s each is five minutes.
+const METRIC_SAMPLES: usize = 150;
 
 /// Seconds since the Unix epoch.
 fn now_unix() -> u64 {
@@ -238,6 +242,8 @@ pub struct Wisp {
     log_scroll: ScrollHandle,
     /// The last set of sites published to the tray, to avoid needless rebuilds.
     tray_sites: Vec<tray::TraySite>,
+    /// CPU and RAM percentages, one per 2s sample, capped at five minutes.
+    metrics: VecDeque<(f64, f64)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -309,6 +315,7 @@ impl Wisp {
             log_match: 0,
             log_scroll: ScrollHandle::default(),
             tray_sites: Vec::new(),
+            metrics: VecDeque::new(),
             _subscriptions,
         };
         this.reload(cx);
@@ -320,6 +327,7 @@ impl Wisp {
         this.load_catalog(cx);
         Self::spawn_status_poll(cx);
         Self::spawn_log_poll(cx);
+        Self::spawn_metrics_poll(cx);
         Self::spawn_mode_probe(cx);
 
         Self::spawn_auto_update_check(cx);
@@ -1400,6 +1408,44 @@ impl Wisp {
             }
         })
         .detach();
+    }
+
+    /// Sample CPU and memory every other second, keeping five minutes of history.
+    fn spawn_metrics_poll(cx: &mut Context<Self>) {
+        cx.spawn(async move |entity, cx| {
+            let mut system = sysinfo::System::new();
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(2000))
+                    .await;
+                system.refresh_cpu_usage();
+                system.refresh_memory();
+                let cpu = system.global_cpu_usage() as f64;
+                let total = system.total_memory();
+                let used = system.used_memory();
+                let ram = if total == 0 {
+                    0.0
+                } else {
+                    used as f64 / total as f64 * 100.0
+                };
+                let applied = entity.update(cx, |this, cx| {
+                    this.push_metrics(cpu, ram);
+                    cx.notify();
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Add one sample, dropping the oldest once the window is full.
+    fn push_metrics(&mut self, cpu: f64, ram: f64) {
+        if self.metrics.len() == METRIC_SAMPLES {
+            self.metrics.pop_front();
+        }
+        self.metrics.push_back((cpu, ram));
     }
 
     /// Move between search hits, scrolling the log towards the new one.
@@ -2576,7 +2622,13 @@ impl Wisp {
             }));
 
         let body: AnyElement = match self.project_tab {
-            ProjectTab::Overview => details.into_any_element(),
+            ProjectTab::Overview => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(details)
+                .child(self.resources_card(cx))
+                .into_any_element(),
             ProjectTab::Services => services.into_any_element(),
             ProjectTab::Logs => logs.into_any_element(),
             ProjectTab::Settings => self.project_settings(project, window, cx),
@@ -2594,6 +2646,43 @@ impl Wisp {
             .child(tabs)
             .child(body)
             .into_any_element()
+    }
+
+    /// A live CPU/RAM readout with five-minute sparklines for the Overview tab.
+    fn resources_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (cpu, ram) = self.metrics.back().copied().unwrap_or((0.0, 0.0));
+        let cpu_values: Vec<f64> = self.metrics.iter().map(|(cpu, _)| *cpu).collect();
+        let ram_values: Vec<f64> = self.metrics.iter().map(|(_, ram)| *ram).collect();
+
+        let header = section_header(
+            "Resources",
+            "This machine, sampled every two seconds for the last five minutes.",
+            cx,
+        );
+
+        let mut body = div().flex().flex_col().gap_3().p(px(18.));
+        if self.metrics.is_empty() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Measuring\u{2026}"),
+            );
+        }
+        body = body
+            .child(resource_row("CPU", cpu, "cpu-spark", cpu_values, cx))
+            .child(resource_row("RAM", ram, "ram-spark", ram_values, cx));
+
+        ui::section(
+            cx,
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(header)
+                .child(body),
+        )
+        .into_any_element()
     }
 
     /// The Settings tab: the project form in place, or a summary that opens it.
@@ -4150,6 +4239,51 @@ fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
                 .text_sm()
                 .whitespace_normal()
                 .child(value.to_string()),
+        )
+}
+
+/// A metric row: name, current value, and a sparkline of its recent history.
+fn resource_row(
+    label: &str,
+    value: f64,
+    id: &'static str,
+    values: Vec<f64>,
+    cx: &App,
+) -> impl IntoElement {
+    let color = cx.theme().primary;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .w(px(48.))
+                .flex_shrink(0.0)
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .w(px(64.))
+                .flex_shrink(0.0)
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{value:.1}%")),
+        )
+        .child(
+            div().flex_1().h(px(40.)).child(
+                AreaChart::new(values.into_iter().enumerate())
+                    .id(id)
+                    .x(|(index, _)| index.to_string())
+                    .y(|(_, value)| *value)
+                    .stroke(color)
+                    .x_axis(false)
+                    .y_axis(false)
+                    .grid(false)
+                    .y_domain(0.0, 100.0),
+            ),
         )
 }
 
