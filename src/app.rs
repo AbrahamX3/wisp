@@ -350,6 +350,8 @@ pub struct Wisp {
     log_follow: bool,
     log_wrap: bool,
     log_match: usize,
+    /// Which level the log is filtered to.
+    log_level: LogLevel,
     log_scroll: ScrollHandle,
     /// The last set of sites published to the tray, to avoid needless rebuilds.
     tray_sites: Vec<tray::TraySite>,
@@ -397,6 +399,11 @@ impl Wisp {
             }),
         ];
 
+        // Read before `settings` moves into the struct.
+        let log_follow = settings.log_follow.unwrap_or(true);
+        let log_wrap = settings.log_wrap.unwrap_or(false);
+        let log_case = settings.log_case.unwrap_or(false);
+
         let mut this = Self {
             theme: settings.theme,            settings,
             toasts: Vec::new(),
@@ -430,10 +437,11 @@ impl Wisp {
             project_filter,
             project_tab: ProjectTab::Overview,
             log_filter,
-            log_case: false,
-            log_follow: true,
-            log_wrap: false,
+            log_case,
+            log_follow,
+            log_wrap,
             log_match: 0,
+            log_level: LogLevel::All,
             log_scroll: ScrollHandle::default(),
             tray_sites: Vec::new(),
             service_metrics: Vec::new(),
@@ -1714,6 +1722,36 @@ impl Wisp {
             self.machine_metrics.pop_front();
         }
         self.machine_metrics.push_back((machine_cpu, machine_ram));
+    }
+
+    /// The lines the log view is currently showing, in order.
+    fn visible_log_lines(&self, cx: &App) -> Vec<String> {
+        let raw = self.log_filter.read(cx).value().to_string();
+        let needle = if self.log_case { raw } else { raw.to_lowercase() };
+        self.log_lines
+            .iter()
+            .filter(|line| line_has_level(line, self.log_level))
+            .filter(|line| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let hay = if self.log_case {
+                    (*line).clone()
+                } else {
+                    line.to_lowercase()
+                };
+                hay.contains(&needle)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Remember the log viewer's toggles, so they survive a restart.
+    fn save_log_prefs(&mut self) {
+        self.settings.log_follow = Some(self.log_follow);
+        self.settings.log_wrap = Some(self.log_wrap);
+        self.settings.log_case = Some(self.log_case);
+        self.settings.save();
     }
 
     /// Move between search hits, scrolling the log towards the new one.
@@ -3466,6 +3504,9 @@ impl Wisp {
             .iter()
             .enumerate()
             .filter(|(_, line)| {
+                if !line_has_level(line, self.log_level) {
+                    return false;
+                }
                 if needle.is_empty() {
                     return true;
                 }
@@ -3503,6 +3544,9 @@ impl Wisp {
                         this.log_kind = kind;
                         this.log_lines.clear();
                         this.log_match = 0;
+                        // The filters are in the source's own terms, so they
+                        // start again when the source changes.
+                        this.log_level = LogLevel::All;
                         this.refresh_logs(cx);
                     }
                     cx.notify();
@@ -3511,14 +3555,38 @@ impl Wisp {
         })
         .collect();
 
+        let mut levels: Vec<AnyElement> = LogLevel::for_kind(current)
+            .iter()
+            .map(|level| {
+                let level = *level;
+                let button = Button::new(format!("log-level-{}", level.label()))
+                    .small()
+                    .label(level.label());
+                let button = if level == self.log_level {
+                    button.primary()
+                } else {
+                    button.outline()
+                };
+                button
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.log_level = level;
+                        this.log_match = 0;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        levels.insert(0, Separator::vertical().into_any_element());
+
         let count = if matching {
             format!("{} of {} lines", self.log_match.saturating_add(1).min(shown), shown)
         } else {
             format!("{total} lines")
         };
+        let leading: Vec<AnyElement> = sources.into_iter().chain(levels).collect();
         let header = section_header("Logs", "The tail of this project's logs.", cx);
         let toolbar = Toolbar::new("logs-toolbar")
-            .contents(sources)
+            .contents(leading)
             .content(
                 div()
                     .flex()
@@ -3538,6 +3606,7 @@ impl Wisp {
                         };
                         button.on_click(cx.listener(|this, _, _window, cx| {
                             this.log_case = !this.log_case;
+                            this.save_log_prefs();
                             cx.notify();
                         }))
                     })
@@ -3576,6 +3645,7 @@ impl Wisp {
                                 let max = this.log_scroll.max_offset();
                                 this.log_scroll.set_offset(point(px(0.), max.y));
                             }
+                            this.save_log_prefs();
                             cx.notify();
                         }))
                     })
@@ -3591,9 +3661,27 @@ impl Wisp {
                         };
                         button.on_click(cx.listener(|this, _, _window, cx| {
                             this.log_wrap = !this.log_wrap;
+                            this.save_log_prefs();
                             cx.notify();
                         }))
                     })
+                    .child(
+                        Button::new("log-copy")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::Copy))
+                            .tooltip("Copy the lines shown")
+                            .disabled(visible.is_empty())
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                let text = this.visible_log_lines(cx).join("\r\n");
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                this.push_toast(
+                                    ToastKind::Success,
+                                    "Copied the lines shown.".to_string(),
+                                );
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("log-folder")
                             .ghost()
@@ -3627,8 +3715,17 @@ impl Wisp {
         } else {
             let lines: Vec<AnyElement> = visible
                 .iter()
-                .map(|(_, line)| {
-                    log_line(line, &needle, self.log_case, self.log_wrap, cx)
+                .map(|(index, line)| {
+                    let mut row = div()
+                        .w_full()
+                        .px(px(2.))
+                        .child(log_line(line, &needle, self.log_case, self.log_wrap, cx));
+                    // A faint stripe on alternating rows, so a dense log is
+                    // easier to follow across.
+                    if index % 2 == 1 {
+                        row = row.bg(cx.theme().list_hover);
+                    }
+                    row.into_any_element()
                 })
                 .collect();
 
@@ -5502,6 +5599,77 @@ fn descends_from(
     false
 }
 
+/// A coarse filter over the log, in the terms its source speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LogLevel {
+    All,
+    Fatal,
+    Warning,
+    Notice,
+    /// Access lines that answered 4xx.
+    Client,
+    /// Access lines that answered 5xx.
+    Server,
+}
+
+impl LogLevel {
+    fn label(self) -> &'static str {
+        match self {
+            LogLevel::All => "All",
+            LogLevel::Fatal => "Fatal",
+            LogLevel::Warning => "Warning",
+            LogLevel::Notice => "Notice",
+            LogLevel::Client => "4xx",
+            LogLevel::Server => "5xx",
+        }
+    }
+
+    /// Which filters are worth offering for a given source.
+    fn for_kind(kind: LogKind) -> &'static [LogLevel] {
+        match kind {
+            LogKind::Access => &[
+                LogLevel::All,
+                LogLevel::Client,
+                LogLevel::Server,
+            ],
+            _ => &[
+                LogLevel::All,
+                LogLevel::Fatal,
+                LogLevel::Warning,
+                LogLevel::Notice,
+            ],
+        }
+    }
+}
+
+/// Whether a line belongs to the level being filtered for.
+fn line_has_level(line: &str, level: LogLevel) -> bool {
+    match level {
+        LogLevel::All => true,
+        LogLevel::Fatal => line.contains("Fatal error") || line.contains("PHP Fatal"),
+        LogLevel::Warning => line.contains("Warning"),
+        LogLevel::Notice => line.contains("Notice") || line.contains("Deprecated"),
+        LogLevel::Client => access_status(line).is_some_and(|status| (400..500).contains(&status)),
+        LogLevel::Server => access_status(line).is_some_and(|status| (500..600).contains(&status)),
+    }
+}
+
+/// The status code of an nginx access line, if it carries one.
+///
+/// The combined format is `host - - [date] "METHOD /path HTTP/1.1" 200 1234`,
+/// so the code is the first field after the closing quote of the request.
+fn access_status(line: &str) -> Option<u16> {
+    let mut quotes = line.split('"');
+    quotes.next()?;
+    quotes.next()?;
+    quotes
+        .next()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// One log line, with every hit on the search term emphasised.
 fn log_line(text: &str, needle: &str, case_sensitive: bool, wrap: bool, cx: &App) -> AnyElement {
     let line = div().flex().flex_row().flex_wrap();
@@ -5788,9 +5956,9 @@ pub fn apply_theme(pref: ThemePreference, window: Option<&mut Window>, cx: &mut 
 #[cfg(test)]
 mod tests {
     use super::{
-        descends_from, diff_lines, domain_is_hand_edited, find_ranges, is_newer, measure_services,
-        merge_samples, push_capped, service_config_changed, should_offer_update, DiffRow,
-        ServiceSample, REPOSITORY_URL,
+        access_status, descends_from, diff_lines, domain_is_hand_edited, find_ranges, is_newer,
+        line_has_level, measure_services, merge_samples, push_capped, service_config_changed,
+        should_offer_update, DiffRow, LogKind, LogLevel, ServiceSample, REPOSITORY_URL,
     };
     use crate::update::{REPO_NAME, REPO_OWNER};
     use std::collections::{HashMap, VecDeque};
@@ -6098,5 +6266,62 @@ mod tests {
             })
             .collect();
         assert_eq!(removed, vec!["gone"]);
+    }
+
+    // ---- log levels ------------------------------------------------------
+
+    #[test]
+    fn an_access_line_reports_the_status_it_answered() {
+        let line = r#"127.0.0.1 - - [16/Oct/2026:04:05:25 +0000] "GET /dashboard HTTP/1.1" 404 153 "-" "curl/8.4.0""#;
+        assert_eq!(access_status(line), Some(404));
+        assert!(line_has_level(line, LogLevel::Client));
+        assert!(!line_has_level(line, LogLevel::Server));
+
+        let failure = line.replace(" 404 ", " 502 ");
+        assert_eq!(access_status(&failure), Some(502));
+        assert!(line_has_level(&failure, LogLevel::Server));
+    }
+
+    #[test]
+    fn a_line_that_is_not_an_access_line_has_no_status() {
+        assert_eq!(access_status("PHP Fatal error: something"), None);
+        assert_eq!(access_status(""), None);
+        // A quote with nothing after it must not be read as a code.
+        assert_eq!(access_status(r#""GET / HTTP/1.1""#), None);
+    }
+
+    #[test]
+    fn php_levels_are_recognised_from_the_text() {
+        assert!(line_has_level(
+            "[16-Oct-2026 04:05:25 UTC] PHP Fatal error:  Uncaught Error: Class \"NumberFormatter\" not found",
+            LogLevel::Fatal
+        ));
+        assert!(line_has_level(
+            "PHP Warning:  Undefined array key 1 in index.php",
+            LogLevel::Warning
+        ));
+        assert!(line_has_level(
+            "PHP Deprecated:  strlen(): Passing null is deprecated",
+            LogLevel::Notice
+        ));
+        assert!(!line_has_level("PHP Notice: something", LogLevel::Fatal));
+        assert!(line_has_level("anything at all", LogLevel::All));
+    }
+
+    #[test]
+    fn each_source_offers_the_filters_that_make_sense_for_it() {
+        assert_eq!(
+            LogLevel::for_kind(LogKind::Access),
+            &[LogLevel::All, LogLevel::Client, LogLevel::Server]
+        );
+        assert_eq!(
+            LogLevel::for_kind(LogKind::Php),
+            &[
+                LogLevel::All,
+                LogLevel::Fatal,
+                LogLevel::Warning,
+                LogLevel::Notice
+            ]
+        );
     }
 }

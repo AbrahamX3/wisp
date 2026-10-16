@@ -57,6 +57,15 @@ pub struct Settings {
     /// user's trusted root store. A hint for the UI; trusting is idempotent.
     #[serde(default)]
     pub ca_trusted: bool,
+    /// Log viewer: keep the newest line in view as the tail refreshes.
+    #[serde(default)]
+    pub log_follow: Option<bool>,
+    /// Log viewer: wrap long lines instead of running off the side.
+    #[serde(default)]
+    pub log_wrap: Option<bool>,
+    /// Log viewer: match the search term case-sensitively.
+    #[serde(default)]
+    pub log_case: Option<bool>,
 }
 
 impl Settings {
