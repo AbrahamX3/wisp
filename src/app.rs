@@ -28,6 +28,9 @@ use crate::assets::APP_ICON;
 use crate::autostart;
 use crate::brand;
 use crate::db::{self, InstalledRuntime, Project, ProjectDraft, Store};
+use crate::elevation::{self, ActionOutcome, ControlMode};
+use crate::helper_task::{self, TaskError};
+use crate::hosts;
 use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::serve::{self, SiteSpec};
@@ -119,6 +122,12 @@ pub struct Wisp {
     serve_error: Option<String>,
     serve_busy: bool,
     trust_busy: bool,
+
+    /// How privileged hosts writes are performed (probed on start-up).
+    mode: ControlMode,
+    elevation_busy: bool,
+    /// The domains last written to the hosts file, so we only elevate on change.
+    hosts_written: Vec<String>,
 }
 
 impl Wisp {
@@ -150,11 +159,15 @@ impl Wisp {
             serve_error: None,
             serve_busy: false,
             trust_busy: false,
+            mode: ControlMode::Uac,
+            elevation_busy: false,
+            hosts_written: Vec::new(),
         };
         this.reload(cx);
         this.reload_runtimes(cx);
         this.load_catalog(cx);
         Self::spawn_status_poll(cx);
+        Self::spawn_mode_probe(cx);
 
         Self::spawn_auto_update_check(cx);
         this
@@ -436,6 +449,7 @@ impl Wisp {
                     self.selected = None;
                 }
                 self.reload(cx);
+                self.sync_hosts(cx);
                 self.push_toast(ToastKind::Success, format!("Removed {name} from Wisp."));
             }
             Some(Err(error)) => self.push_toast(ToastKind::Error, error.to_string()),
@@ -817,6 +831,7 @@ impl Wisp {
                         }
                         Err(error) => this.serve_error = Some(error.to_string()),
                     }
+                    this.sync_hosts(cx);
                     cx.notify();
                 })
                 .ok();
@@ -851,6 +866,161 @@ impl Wisp {
                                     .to_string(),
                             );
                         }
+                        Err(error) => this.push_toast(ToastKind::Error, error.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Probe how privileged writes will be performed.
+    fn spawn_mode_probe(cx: &mut Context<Self>) {
+        cx.spawn(async move |entity, cx| {
+            let mode = cx
+                .background_executor()
+                .spawn(async { elevation::detect_mode() })
+                .await;
+            entity
+                .update(cx, |this, cx| {
+                    this.mode = mode;
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Keep the hosts file in step with the running projects.
+    fn sync_hosts(&mut self, cx: &mut Context<Self>) {
+        let mut domains: Vec<String> = self
+            .projects
+            .iter()
+            .filter(|project| self.running.contains(&project.id))
+            .map(|project| project.domain.clone())
+            .collect();
+        domains.sort();
+
+        // Nothing to do when the file already matches.
+        if domains == self.hosts_written {
+            return;
+        }
+        // A previous run, or another tool, may already have written the entries.
+        // Reading the file itself avoids an unnecessary elevation prompt.
+        if !hosts::needs_update(&domains) {
+            self.hosts_written = domains;
+            return;
+        }
+
+        let mode = self.mode;
+        let to_write = domains.clone();
+        cx.spawn(async move |entity, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { elevation::perform_hosts(mode, &to_write) })
+                .await;
+            entity
+                .update(cx, |this, cx| {
+                    match outcome {
+                        ActionOutcome::Done => {
+                            let should_report = this.hosts_written.is_empty() && !domains.is_empty();
+                            this.hosts_written = domains;
+                            if should_report {
+                                this.push_toast(
+                                    ToastKind::Success,
+                                    "Hosts updated \u{2014} the .test domains now resolve."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        ActionOutcome::Cancelled => this.push_toast(
+                            ToastKind::Warning,
+                            "The hosts update was cancelled \u{2014} domains will not resolve."
+                                .to_string(),
+                        ),
+                        ActionOutcome::Failed(message) => this.push_toast(ToastKind::Error, message),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn setup_elevated(&mut self, cx: &mut Context<Self>) {
+        if self.elevation_busy {
+            return;
+        }
+        self.elevation_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async {
+                    let exe = std::env::current_exe().map_err(|error| {
+                        TaskError::Setup(format!("could not locate the application: {error}"))
+                    })?;
+                    helper_task::setup(&exe)
+                })
+                .await;
+
+            entity
+                .update(cx, |this, cx| {
+                    this.elevation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.mode = ControlMode::Task;
+                            this.push_toast(
+                                ToastKind::Success,
+                                "No-prompt control is on \u{2014} hosting changes will not prompt."
+                                    .to_string(),
+                            );
+                        }
+                        Err(TaskError::Cancelled) => this.push_toast(
+                            ToastKind::Warning,
+                            "Setup cancelled \u{2014} administrator rights are needed once."
+                                .to_string(),
+                        ),
+                        Err(error) => this.push_toast(ToastKind::Error, error.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn remove_elevated(&mut self, cx: &mut Context<Self>) {
+        if self.elevation_busy {
+            return;
+        }
+        self.elevation_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { helper_task::remove() })
+                .await;
+            entity
+                .update(cx, |this, cx| {
+                    this.elevation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            this.mode = ControlMode::Uac;
+                            this.push_toast(
+                                ToastKind::Success,
+                                "No-prompt control is off \u{2014} hosting changes will prompt again."
+                                    .to_string(),
+                            );
+                        }
+                        Err(TaskError::RemoveCancelled) => this.push_toast(
+                            ToastKind::Warning,
+                            "Removal cancelled \u{2014} administrator rights are needed to remove it."
+                                .to_string(),
+                        ),
                         Err(error) => this.push_toast(ToastKind::Error, error.to_string()),
                     }
                     cx.notify();
@@ -1209,6 +1379,8 @@ impl Wisp {
         let theme = self.theme;
         let autostart = self.autostart;
         let background = self.settings.background;
+        let mode = self.mode;
+        let elevation_busy = self.elevation_busy;
 
         Button::new("settings-menu")
             .icon(icon(IconName::Ellipsis))
@@ -1237,6 +1409,28 @@ impl Wisp {
                                 let entity = entity.clone();
                                 move |_, _, cx| {
                                     entity.update(cx, Wisp::toggle_background);
+                                }
+                            }),
+                    )
+                    .separator();
+
+                let menu = menu
+                    .check_side(Side::Right)
+                    .item(
+                        PopupMenuItem::new("No-prompt hosting control")
+                            .icon(icon(IconName::ShieldCheck))
+                            .checked(mode == ControlMode::Task)
+                            .disabled(elevation_busy || mode == ControlMode::Elevated)
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        if mode == ControlMode::Task {
+                                            this.remove_elevated(cx);
+                                        } else {
+                                            this.setup_elevated(cx);
+                                        }
+                                    });
                                 }
                             }),
                     )

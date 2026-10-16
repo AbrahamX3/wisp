@@ -12,8 +12,12 @@ mod assets;
 mod autostart;
 mod brand;
 mod config;
+mod ctl;
 mod db;
+mod elevation;
 mod fonts;
+mod helper_task;
+mod hosts;
 mod platform;
 mod runtime;
 mod serve;
@@ -31,6 +35,13 @@ use std::io::Write as _;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Privileged helpers share this executable.
+    match args.get(1).map(String::as_str) {
+        Some("--ctl") => std::process::exit(ctl::run(&args)),
+        Some("--ctl-from-task") => std::process::exit(ctl::run_from_task()),
+        _ => {}
+    }
 
     // Starting with Windows makes a second launch likely (autostart plus a
     // manual open), so surface the window that already exists instead of
