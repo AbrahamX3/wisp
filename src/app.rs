@@ -515,6 +515,10 @@ impl Wisp {
         Self::spawn_log_poll(cx);
         Self::spawn_metrics_poll(cx);
         Self::spawn_mode_probe(cx);
+        // A previous run that was force-killed can leave nginx holding ports 80
+        // and 443 and PHP workers holding their FastCGI ports. Clear them before
+        // this session tries to start anything.
+        serve::sweep_orphans();
 
         Self::spawn_auto_update_check(cx);
 
@@ -554,9 +558,10 @@ impl Wisp {
     }
 
     fn select(&mut self, id: i64, cx: &mut Context<Self>) {
-        // A new project starts back on Overview, and any in-flight edit is lost.
+        // Services leads: starting a site is the common case. Any in-flight
+        // edit is lost when moving to another project.
         if self.selected != Some(id) {
-            self.project_tab = ProjectTab::Overview;
+            self.project_tab = ProjectTab::Services;
             self.editor = None;
         }
         self.selected = Some(id);
@@ -1050,6 +1055,10 @@ impl Wisp {
                 self.editor = None;
                 self.selected = Some(saved_id);
                 self.screen = Screen::Projects;
+                if id.is_none() {
+                    // A brand-new project lands on Services, ready to start.
+                    self.project_tab = ProjectTab::Services;
+                }
                 // The icon the record no longer points at is no longer wanted.
                 if let Some(previous) = before.as_ref().and_then(|p| p.icon_path.clone()) {
                     if Some(&previous) != draft.icon_path.as_ref() {
@@ -2160,20 +2169,23 @@ impl Wisp {
     fn handle_tray(&mut self, request: tray::TrayRequest, cx: &mut Context<Self>) {
         match request {
             tray::TrayRequest::Site { id, command } => match command {
+                // Both sets are changed first, then one sync runs: toggling them
+                // one at a time let the second toggle fall into `serve_busy` and
+                // be dropped, so the tray's Start left nginx or PHP behind.
                 tray::SiteCommand::Start => {
-                    if !self.php_on.contains(&id) {
-                        self.toggle_php(id, cx);
-                    }
-                    if !self.nginx_on.contains(&id) {
-                        self.toggle_nginx(id, cx);
+                    // Both inserts run before the `||`: short-circuiting here
+                    // would leave one of the two services out.
+                    let nginx = self.nginx_on.insert(id);
+                    let php = self.php_on.insert(id);
+                    if nginx || php || self.serve_error.is_some() {
+                        self.sync_server(cx);
                     }
                 }
                 tray::SiteCommand::Stop => {
-                    if self.nginx_on.contains(&id) {
-                        self.toggle_nginx(id, cx);
-                    }
-                    if self.php_on.contains(&id) {
-                        self.toggle_php(id, cx);
+                    let nginx = self.nginx_on.remove(&id);
+                    let php = self.php_on.remove(&id);
+                    if nginx || php {
+                        self.sync_server(cx);
                     }
                 }
                 tray::SiteCommand::Restart => self.restart_service(id, true, cx),
@@ -2185,6 +2197,16 @@ impl Wisp {
                         .map(|project| serve::config::site_dir(&project.slug()));
                     if let Some(dir) = dir {
                         self.open_folder(&dir.to_string_lossy(), cx);
+                    }
+                }
+                tray::SiteCommand::OpenRoot => {
+                    let root = self
+                        .projects
+                        .iter()
+                        .find(|project| project.id == id)
+                        .map(|project| project.root_path.clone());
+                    if let Some(root) = root {
+                        self.open_folder(&root, cx);
                     }
                 }
                 tray::SiteCommand::Open => {
@@ -7208,11 +7230,16 @@ fn domain_is_hand_edited(typed: &str, expected: &str) -> bool {
 
 /// Closing the window hides it to the tray while "Run in background" is on, and
 /// exits the app otherwise.
+///
+/// When it exits, nginx and the PHP workers are stopped here rather than only in
+/// the framework's quit callback: that callback is not guaranteed to run, and a
+/// leaked nginx keeps ports 80 and 443, so the next launch cannot bind them.
 pub fn window_should_close(_window: &mut Window, cx: &mut App) -> bool {
     if tray::is_enabled(cx) {
         platform::show_window(platform::WINDOW_TITLE, false);
         return false;
     }
+    cx.global_mut::<ServerGlobal>().0.stop_all();
     true
 }
 

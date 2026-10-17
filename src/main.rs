@@ -84,6 +84,10 @@ fn main() {
                 cx.global_mut::<app::ServerGlobal>().0.stop_all();
                 async {}
             });
+            // An in-app restart (the updater's) replaces the process too.
+            let _ = cx.on_app_restart(|cx| {
+                cx.global_mut::<app::ServerGlobal>().0.stop_all();
+            });
 
             // Register the bundled typeface before the first window, so the
             // first frame is already laid out in it.
@@ -95,6 +99,9 @@ fn main() {
                 platform::show_window(platform::WINDOW_TITLE, true);
             });
             let _ = cx.on_action(|_: &tray::QuitApp, cx: &mut App| {
+                // Stop the servers before anything else: quitting the app must
+                // not leave nginx holding ports 80 and 443.
+                cx.global_mut::<app::ServerGlobal>().0.stop_all();
                 tray::remove(cx);
                 cx.quit();
             });

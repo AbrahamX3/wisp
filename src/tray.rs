@@ -24,7 +24,10 @@ pub enum SiteCommand {
     Start,
     Stop,
     Restart,
+    /// Open the site's address in the default browser.
     Open,
+    /// Show the project's own files in File Explorer.
+    OpenRoot,
     /// Show the folder holding this site's logs and generated config.
     OpenFiles,
 }
@@ -167,10 +170,10 @@ fn site_submenu(site: &TraySite) -> MenuItem {
         .disabled(!any_up),
         MenuItem::separator(),
         MenuItem::action(
-            "Open",
+            "Open in Explorer",
             SiteAction {
                 id,
-                command: SiteCommand::Open,
+                command: SiteCommand::OpenRoot,
             },
         ),
         MenuItem::action(

@@ -433,14 +433,27 @@ impl Supervisor {
     }
 }
 
-/// Kill `php-cgi` workers left behind by a previous run, so they do not hold
-/// ports and stale configuration. Only processes whose command line points at
-/// Wisp's own sites directory are touched.
-fn sweep_orphans() {
-    let needle = crate::config::sites().to_string_lossy().to_string();
+/// Kill `nginx` and `php-cgi` processes left behind by a previous run, so they
+/// do not hold ports 80 and 443 or a FastCGI port, and do not serve stale
+/// configuration.
+///
+/// Only processes whose command line points inside this install's own data
+/// directory are touched, so another Wisp install (or another tool) is left
+/// alone. Called at start-up and, again, before the first sync.
+pub fn sweep_orphans() {
+    let sites = crate::config::sites().to_string_lossy().to_string();
+    let nginx = crate::config::root()
+        .join("runtimes")
+        .join("nginx")
+        .to_string_lossy()
+        .to_string();
     let script = format!(
-        "Get-CimInstance Win32_Process -Filter \"Name='php-cgi.exe'\" \
-         | Where-Object {{ $_.CommandLine -like '*{needle}*' }} \
+        "$ErrorActionPreference = 'SilentlyContinue'\n\
+         Get-CimInstance Win32_Process \
+         | Where-Object {{ \
+             ($_.Name -eq 'php-cgi.exe' -and $_.CommandLine -like '*{sites}*') -or \
+             ($_.Name -eq 'nginx.exe' -and $_.CommandLine -like '*{nginx}*') \
+           }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
     let powershell = system32()
