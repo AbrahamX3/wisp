@@ -1,6 +1,6 @@
 [package]
 name = "wisp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Local PHP development for Windows: nginx + PHP sites on .test domains with trusted HTTPS"
 license = "MIT"
