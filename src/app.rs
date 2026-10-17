@@ -69,7 +69,7 @@ use crate::update;
 use crate::vcrt;
 
 /// Delay before the automatic launch update check, so start-up stays snappy.
-const AUTO_CHECK_DELAY: Duration = Duration::from_secs(6);
+const AUTO_CHECK_DELAY: Duration = Duration::from_secs(3);
 
 /// How long a fetched runtime catalog stays fresh before Services refreshes it.
 const CATALOG_TTL_SECS: u64 = 12 * 60 * 60;
@@ -316,6 +316,9 @@ pub struct Wisp {
     settings: Settings,
     toasts: Vec<(ToastKind, String)>,
     update: UpdateState,
+    /// Hidden the update banner for this session, without skipping the version
+    /// for good; the status bar still offers it and the next launch asks again.
+    update_dismissed: bool,
     autostart: bool,
 
     store: Option<Store>,
@@ -446,6 +449,7 @@ impl Wisp {
             theme: settings.theme,            settings,
             toasts: Vec::new(),
             update: UpdateState::Idle,
+            update_dismissed: false,
             autostart: autostart::is_enabled(),
             store,
             projects: Vec::new(),
@@ -2383,6 +2387,9 @@ impl Wisp {
                             this.settings.available_version = Some(version.clone());
                             this.update =
                                 if should_offer_update(manual, &version, skipped.as_deref()) {
+                                    // A fresh check may show the banner again,
+                                    // even if it was dismissed earlier.
+                                    this.update_dismissed = false;
                                     UpdateState::Available(version)
                                 } else {
                                     UpdateState::Idle
@@ -2441,10 +2448,13 @@ impl Wisp {
         .detach();
     }
 
-    fn dismiss_update(&mut self, version: String, cx: &mut Context<Self>) {
-        self.settings.skipped_version = Some(version);
-        self.settings.save();
-        self.update = UpdateState::Idle;
+    /// Hide the update banner for this session.
+    ///
+    /// Deliberately not a permanent skip: the version is not recorded as
+    /// skipped, the status bar keeps offering it, and the next launch asks
+    /// again. That is what "not right now" should mean.
+    fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        self.update_dismissed = true;
         cx.notify();
     }
 
@@ -2487,6 +2497,9 @@ impl Wisp {
     }
 
     fn update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.update_dismissed && matches!(self.update, UpdateState::Available(_)) {
+            return None;
+        }
         let row = match &self.update {
             UpdateState::Idle | UpdateState::Checking => return None,
             UpdateState::Available(version) => {
@@ -2510,13 +2523,8 @@ impl Wisp {
                             .ghost()
                             .small()
                             .icon(icon(IconName::X))
-                            .tooltip("Skip this version")
-                            .on_click({
-                                let version = version.clone();
-                                cx.listener(move |this, _, _window, cx| {
-                                    this.dismiss_update(version.clone(), cx)
-                                })
-                            }),
+                            .tooltip("Not now")
+                            .on_click(cx.listener(|this, _, _window, cx| this.dismiss_update(cx))),
                     )
             }
             UpdateState::Installing(version) => {
@@ -2551,6 +2559,7 @@ impl Wisp {
         Some(
             div()
                 .px(px(20.))
+                .pt(px(14.))
                 .pb(px(12.))
                 .child(
                     row.px(px(18.))
@@ -5033,7 +5042,7 @@ impl Render for Wisp {
 
         if let Some(message) = self.error.clone() {
             root = root.child(
-                div().px(px(20.)).pb(px(12.)).child(
+                div().px(px(20.)).pt(px(14.)).pb(px(12.)).child(
                     Alert::error("db-error", message)
                         .title("Something went wrong")
                         .banner(),
@@ -5043,7 +5052,7 @@ impl Render for Wisp {
 
         if let Some(message) = self.serve_error.clone() {
             root = root.child(
-                div().px(px(20.)).pb(px(12.)).child(
+                div().px(px(20.)).pt(px(14.)).pb(px(12.)).child(
                     Alert::error("serve-error", message)
                         .title("Could not start the server")
                         .banner(),
@@ -5055,6 +5064,7 @@ impl Render for Wisp {
             root = root.child(
                 div()
                     .px(px(20.))
+                    .pt(px(14.))
                     .pb(px(12.))
                     .flex()
                     .flex_row()
