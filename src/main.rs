@@ -37,10 +37,22 @@ use std::io::Write as _;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Privileged helpers are launched by Windows (UAC, the scheduled task) with
+    // a fresh environment, so the config directory is passed explicitly rather
+    // than relying on `WISP_CONFIG_DIR` surviving elevation.
+    if let Some(index) = args.iter().position(|arg| arg == "--config-dir") {
+        if let Some(dir) = args.get(index + 1) {
+            std::env::set_var("WISP_CONFIG_DIR", dir);
+        }
+    }
+
     // Privileged helpers share this executable.
     match args.get(1).map(String::as_str) {
         Some("--ctl") => std::process::exit(ctl::run(&args)),
         Some("--ctl-from-task") => std::process::exit(ctl::run_from_task()),
+        // Remove Wisp's managed block (and its markers) from the hosts file.
+        // Needs administrator rights; used by the testing reset script.
+        Some("--clear-hosts") => std::process::exit(clear_hosts()),
         _ => {}
     }
 
@@ -131,6 +143,20 @@ fn main() {
                 platform::show_window(platform::WINDOW_TITLE, false);
             }
         });
+}
+
+/// `--clear-hosts`: drop Wisp's managed hosts block, markers included.
+fn clear_hosts() -> i32 {
+    match hosts::write(&[]) {
+        Ok(()) => {
+            let _ = writeln!(std::io::stdout(), "wisp: hosts block cleared");
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "wisp: could not clear hosts: {error}");
+            1
+        }
+    }
 }
 
 fn window_options() -> WindowOptions {

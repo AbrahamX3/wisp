@@ -29,7 +29,7 @@ pub fn section_grow(cx: &App, inner: impl IntoElement) -> impl IntoElement {
 fn section_base(cx: &App) -> Div {
     div()
         .w_full()
-        .rounded_lg()
+        .rounded_xl()
         .bg(cx.theme().secondary)
         .border_1()
         .border_color(cx.theme().border)

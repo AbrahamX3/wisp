@@ -69,6 +69,9 @@ pub struct Settings {
     /// Whether the sidebar is collapsed to its icons.
     #[serde(default)]
     pub sidebar_collapsed: Option<bool>,
+    /// Whether the first-run onboarding has been completed.
+    #[serde(default)]
+    pub onboarding_complete: bool,
 }
 
 impl Settings {

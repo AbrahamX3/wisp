@@ -1,9 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Wisp">
   <defs>
     <linearGradient id="wisp" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#2DD4BF"/>
-      <stop offset="0.55" stop-color="#60A5FA"/>
-      <stop offset="1" stop-color="#8B5CF6"/>
+      <stop offset="0" stop-color="#5EEAD4"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
     </linearGradient>
   </defs>
 
@@ -18,5 +17,5 @@
 
   <!-- a small spark, the "wisp" that gives the name its glimmer -->
   <path d="M52 8.5 C52.5 11.5 54 12.5 57 13.5 C54 14.5 52.5 15.5 52 18.5 C51.5 15.5 50 14.5 47 13.5 C50 12.5 51.5 11.5 52 8.5 Z"
-        fill="#5EEAD4"/>
+        fill="#99F6E4"/>
 </svg>

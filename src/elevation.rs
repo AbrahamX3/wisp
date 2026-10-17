@@ -131,6 +131,9 @@ pub fn run_elevated() -> Result<(), ElevationError> {
         "--ctl".to_string(),
         "--out".to_string(),
         out_path.to_string_lossy().into_owned(),
+        // Elevation starts a fresh process, so the config dir is explicit.
+        "--config-dir".to_string(),
+        crate::config::root().to_string_lossy().into_owned(),
     ];
 
     match runas::Command::new(exe).args(&args).status() {

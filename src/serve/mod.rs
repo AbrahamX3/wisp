@@ -368,11 +368,18 @@ impl Supervisor {
         let running = self.nginx.as_mut().is_some_and(process::is_running);
         if running {
             if self.nginx_version.as_deref() == Some(version) {
-                // Same version: pick up any config changes without dropping it.
-                let _ = self.signal(prefix, "-s", "reload");
-                return Ok(());
+                // Same version: pick up any config changes. `nginx -s reload` is
+                // unreliable on Windows (the named-event open fails with
+                // "Access is denied"), so fall back to a stop + start when the
+                // reload signal does not succeed.
+                if self.signal(prefix, "-s", "reload").is_err() {
+                    self.stop_nginx(prefix);
+                } else {
+                    return Ok(());
+                }
+            } else {
+                self.stop_nginx(prefix);
             }
-            self.stop_nginx(prefix);
         }
 
         let exe = prefix.join("nginx.exe");

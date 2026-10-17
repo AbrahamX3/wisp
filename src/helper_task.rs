@@ -97,7 +97,7 @@ fn extract_command(xml: &str) -> Option<String> {
 /// Register (or re-register) the highest-privileges task. Prompts for UAC once.
 pub fn setup(exe: &Path) -> Result<(), TaskError> {
     let script_path = std::env::temp_dir().join("wisp-setup.ps1");
-    std::fs::write(&script_path, setup_script(exe)).map_err(TaskError::Io)?;
+    std::fs::write(&script_path, setup_script(exe, &crate::config::root())).map_err(TaskError::Io)?;
 
     let result = runas::Command::new(powershell_path())
         .args(&[
@@ -246,12 +246,13 @@ fn wait_for_response(response: &Path) -> Result<(), TaskError> {
     }
 }
 
-fn setup_script(exe: &Path) -> String {
+fn setup_script(exe: &Path, config_dir: &Path) -> String {
     let exe = exe.to_string_lossy().replace('\'', "''");
+    let config_dir = config_dir.to_string_lossy().replace('\'', "''");
     format!(
         "$ErrorActionPreference = 'Stop'\n\
          $me = \"$env:USERDOMAIN\\$env:USERNAME\"\n\
-         $action = New-ScheduledTaskAction -Execute '{exe}' -Argument '--ctl-from-task'\n\
+         $action = New-ScheduledTaskAction -Execute '{exe}' -Argument '--ctl-from-task --config-dir \"{config_dir}\"'\n\
          $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest\n\
          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)\n\
          Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Principal $principal -Settings $settings -Force | Out-Null\n"
@@ -290,7 +291,17 @@ fn is_uac_cancelled(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_command;
+    use super::{extract_command, setup_script};
+    use std::path::Path;
+
+    #[test]
+    fn the_task_action_carries_the_config_dir() {
+        // The task runs with a clean environment, so the helper must be told
+        // where the config lives or it reads another install's request file.
+        let script = setup_script(Path::new(r"C:\Tools\wisp.exe"), Path::new(r"C:\Users\me\.config\wisp"));
+        assert!(script.contains("--ctl-from-task"));
+        assert!(script.contains(r#"--config-dir "C:\Users\me\.config\wisp""#));
+    }
 
     #[test]
     fn reads_the_command_out_of_a_task_definition() {

@@ -33,6 +33,14 @@ use gpui_kit::component::sidebar::{
     SidebarMenuItem, SidebarToggleButton,
 };
 use gpui_kit::component::Collapsible;
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::IndexPath;
+use gpui_kit::component::stepper::{Stepper, StepperItem};
+use gpui_kit::component::Placement;
+use gpui_kit::component::empty::{
+    Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
+};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -339,6 +347,9 @@ pub struct Wisp {
     php_on: HashSet<i64>,
     serve_status: serve::Status,
     serve_error: Option<String>,
+    /// A hosts-file problem, kept apart from `serve_error` because the server
+    /// itself may be running fine while domains do not resolve.
+    hosts_error: Option<String>,
     serve_busy: bool,
     trust_busy: bool,
 
@@ -379,6 +390,16 @@ pub struct Wisp {
     palette_open: bool,
     /// Which pane of the Runtimes screen is showing.
     runtime_tab: RuntimeTab,
+    /// First-run onboarding.
+    onboarding_open: bool,
+    onboarding_step: usize,
+    onboarding_php_selected: std::collections::HashSet<String>,
+    onboarding_php_queue: Vec<crate::runtime::catalog::Release>,
+    onboarding_nginx_selected: Option<String>,
+    /// Multi-select PHP version picker, created once the catalog is available.
+    onboarding_php_combo: Option<Entity<ComboboxState<SearchableVec<String>>>>,
+    /// Single-select nginx version picker, created once the catalog is available.
+    onboarding_nginx_combo: Option<Entity<ComboboxState<SearchableVec<String>>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -419,6 +440,7 @@ impl Wisp {
         let log_wrap = settings.log_wrap.unwrap_or(false);
         let log_case = settings.log_case.unwrap_or(false);
         let sidebar_collapsed = settings.sidebar_collapsed.unwrap_or(false);
+        let onboarding_complete = settings.onboarding_complete;
 
         let mut this = Self {
             theme: settings.theme,            settings,
@@ -444,6 +466,7 @@ impl Wisp {
             php_on: HashSet::new(),
             serve_status: serve::Status::default(),
             serve_error: None,
+            hosts_error: None,
             serve_busy: false,
             trust_busy: false,
             mode: ControlMode::Uac,
@@ -468,6 +491,13 @@ impl Wisp {
             palette,
             palette_open: false,
             runtime_tab: RuntimeTab::Https,
+            onboarding_open: !onboarding_complete,
+            onboarding_step: 0,
+            onboarding_php_selected: std::collections::HashSet::new(),
+            onboarding_php_queue: Vec::new(),
+            onboarding_nginx_selected: None,
+            onboarding_php_combo: None,
+            onboarding_nginx_combo: None,
             _subscriptions,
         };
         this.reload(cx);
@@ -542,12 +572,16 @@ impl Wisp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A new project starts on the newest installed PHP, which the user can
+        // change before saving.
+        let default_php = self.installed_php_versions().first().cloned();
         let draft = existing
             .as_ref()
             .map(ProjectDraft::from_project)
-            .unwrap_or_else(|| ProjectDraft {
+            .unwrap_or_else(move || ProjectDraft {
                 ssl_enabled: true,
                 php_ini_overrides: String::new(),
+                php_version: default_php,
                 ..Default::default()
             });
 
@@ -637,12 +671,25 @@ impl Wisp {
             };
             let error = editor.error.clone();
             let is_new = editor.id.is_none();
+            // Keep the whole dialog inside the window: the title, footer,
+            // paddings and margins take roughly this much, and the form scrolls
+            // inside what is left.
+            let cap = window.bounds().size.height - px(320.);
+            let cap = if cap < px(140.) { px(140.) } else { cap };
 
             dialog
                 .title(title)
                 .w(px(580.))
                 .close_button(true)
-                .child(editor_form(editor, &entity, error, &php_versions, window, cx))
+                .child(editor_form(
+                    editor,
+                    &entity,
+                    error,
+                    &php_versions,
+                    Some(cap),
+                    window,
+                    cx,
+                ))
                 .footer(editor_footer(entity.clone(), is_new))
         });
     }
@@ -668,21 +715,20 @@ impl Wisp {
         });
 
         let entity = cx.entity();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_sheet_at(Placement::Right, cx, move |sheet, _window, cx| {
             let read = entity.read(cx);
             let Some(editor) = read.ini_editor.as_ref() else {
-                return dialog;
+                return sheet;
             };
             let Some(project) = read.projects.iter().find(|p| p.id == editor.project) else {
-                return dialog;
+                return sheet;
             };
             let title = format!("php.ini \u{00b7} {}", project.name);
             let error = editor.error.clone();
             let body = ini_editor_body(editor, &entity, read, project, cx);
-            dialog
+            sheet
                 .title(title)
-                .w(px(760.))
-                .close_button(true)
+                .size(px(760.))
                 .child(body)
                 .footer(ini_editor_footer(entity.clone(), error))
         });
@@ -1246,6 +1292,7 @@ impl Wisp {
         cx.notify();
 
         let version = release.version.clone();
+        let chain_php = kind == RuntimeKind::Php;
         cx.spawn(async move |entity, cx| {
             let outcome = cx
                 .background_executor()
@@ -1285,6 +1332,13 @@ impl Wisp {
                         }
                     }
                     cx.notify();
+                    if chain_php {
+                        let next = this.onboarding_php_queue.first().cloned();
+                        if let Some(next) = next {
+                            this.onboarding_php_queue.remove(0);
+                            this.install_release(crate::runtime::RuntimeKind::Php, next, cx);
+                        }
+                    }
                 })
                 .ok();
         })
@@ -1549,6 +1603,10 @@ impl Wisp {
         if self.serve_busy {
             return;
         }
+        // Clear any stale error so the banner disappears while we retry; it is
+        // re-set below if this attempt also fails.
+        self.serve_error = None;
+        cx.notify();
         let specs = match self.site_specs() {
             Ok(specs) => specs,
             Err(message) => {
@@ -1557,6 +1615,15 @@ impl Wisp {
                 return;
             }
         };
+        // Domains that need to resolve via the hosts file.
+        let mut domains: Vec<String> = self
+            .projects
+            .iter()
+            .filter(|project| self.nginx_on.contains(&project.id))
+            .map(|project| project.domain.clone())
+            .collect();
+        domains.sort();
+        let mode = self.mode;
         let version = self.settings.active_nginx.clone();
         let mut supervisor = std::mem::take(&mut cx.global_mut::<ServerGlobal>().0);
         self.serve_busy = true;
@@ -1584,7 +1651,9 @@ impl Wisp {
                         }
                         Err(error) => this.serve_error = Some(error.to_string()),
                     }
-                    this.sync_hosts(cx);
+                    // The hosts write runs separately: it can wait on a Windows
+                    // permission prompt, and the UI must not stay busy for it.
+                    this.write_hosts(mode, domains, cx);
                     cx.notify();
                 })
                 .ok();
@@ -1654,7 +1723,17 @@ impl Wisp {
             .map(|project| project.domain.clone())
             .collect();
         domains.sort();
+        let mode = self.mode;
+        self.write_hosts(mode, domains, cx);
+    }
 
+    /// Write the managed hosts block off the UI thread.
+    ///
+    /// Never blocks the serve flow: the write can wait on a Windows permission
+    /// prompt, and stalling the UI on that is what left the app stuck on
+    /// "Starting…". A failure is recorded in `hosts_error` and shown as a banner
+    /// with a retry, so a started site that cannot resolve is never silent.
+    fn write_hosts(&mut self, mode: ControlMode, domains: Vec<String>, cx: &mut Context<Self>) {
         // Nothing to do when the file already matches.
         if domains == self.hosts_written {
             return;
@@ -1663,10 +1742,10 @@ impl Wisp {
         // Reading the file itself avoids an unnecessary elevation prompt.
         if !hosts::needs_update(&domains) {
             self.hosts_written = domains;
+            self.hosts_error = None;
             return;
         }
 
-        let mode = self.mode;
         let to_write = domains.clone();
         cx.spawn(async move |entity, cx| {
             let outcome = cx
@@ -1679,6 +1758,7 @@ impl Wisp {
                         ActionOutcome::Done => {
                             let should_report = this.hosts_written.is_empty() && !domains.is_empty();
                             this.hosts_written = domains;
+                            this.hosts_error = None;
                             // The first write may have installed no-prompt control.
                             if this.mode == ControlMode::Uac {
                                 this.mode = elevation::detect_mode();
@@ -1691,12 +1771,20 @@ impl Wisp {
                                 );
                             }
                         }
-                        ActionOutcome::Cancelled => this.push_toast(
-                            ToastKind::Warning,
-                            "The hosts update was cancelled \u{2014} domains will not resolve."
-                                .to_string(),
-                        ),
-                        ActionOutcome::Failed(message) => this.push_toast(ToastKind::Error, message),
+                        ActionOutcome::Cancelled => {
+                            this.hosts_error = Some(
+                                "Writing the hosts file was declined, so .test domains will not resolve."
+                                    .to_string(),
+                            );
+                            this.push_toast(
+                                ToastKind::Warning,
+                                "Writing the hosts file was declined.".to_string(),
+                            );
+                        }
+                        ActionOutcome::Failed(message) => {
+                            this.hosts_error = Some(message.clone());
+                            this.push_toast(ToastKind::Error, message);
+                        }
                     }
                     cx.notify();
                 })
@@ -2051,7 +2139,9 @@ impl Wisp {
             let php = self.php_on.remove(&id);
             nginx || php
         };
-        if changed {
+        // Retry even when nothing changed, so a previous failure (e.g. a missing
+        // runtime) can be recovered from once it has been installed.
+        if changed || self.serve_error.is_some() {
             self.sync_server(cx);
         }
     }
@@ -2607,7 +2697,7 @@ impl Wisp {
                         IconName::Play,
                         "Start",
                         format!("Start {name}"),
-                        !(serving && worker),
+                        !(serving && worker && self.serve_error.is_none()),
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.set_project(id, true, cx)
@@ -2653,7 +2743,7 @@ impl Wisp {
             .justify_between()
             .gap_4()
             .px(px(20.))
-            .py(px(14.))
+            .py(px(10.))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -2888,27 +2978,467 @@ impl Wisp {
         }
     }
 
+    fn onboarding_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // Make sure the catalog is on its way; installs need it.
+        if self.catalog.is_none() && !self.catalog_loading {
+            self.load_catalog(cx);
+        }
+
+        let step = self.onboarding_step;
+        let php_versions = self.installed_php_versions();
+        let nginx_installed = !self.installed(crate::runtime::RuntimeKind::Nginx).is_empty();
+        let php_done = !php_versions.is_empty();
+        let nginx_done = nginx_installed && self.settings.active_nginx.is_some();
+        let cert_done = self.settings.ca_trusted;
+        let hosts_done = self.mode != crate::elevation::ControlMode::Uac
+            || !self.hosts_written.is_empty();
+
+        let (step_title, step_desc): (&str, &str) = match step {
+            0 => (
+                "Install PHP",
+                "Wisp needs at least one PHP build to run your projects.",
+            ),
+            1 => (
+                "Install nginx",
+                "One nginx process serves every project. Install a build and make it active.",
+            ),
+            2 => (
+                "Trust the certificate",
+                "Wisp issues a local certificate per domain. Trust its authority once so https:// works in your browser.",
+            ),
+            _ => (
+                "Hosts file access",
+                "So .test domains resolve to your PC, Wisp writes them to the Windows hosts file. This needs administrator permission once; afterwards it never prompts.",
+            ),
+        };
+
+        let step_condition = match step {
+            0 => php_done,
+            1 => nginx_done,
+            2 => cert_done,
+            _ => hosts_done,
+        };
+        let skippable = step >= 2;
+
+        // Status line + action button for the current step.
+        let mut action_area = div().flex().flex_col().gap_3().items_center();
+        match step {
+            0 => {
+                if php_done {
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().success)
+                            .child(format!("Installed: {}", php_versions.join(", "))),
+                    );
+                }
+                if self.catalog_loading {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading versions\u{2026}"));
+                } else if self.catalog.is_some() {
+                    let busy = self.busy_runtime.is_some();
+                    self.ensure_onboarding_combos(window, cx);
+                    let combo = self.onboarding_php_combo.clone();
+                    if let Some(combo) = combo {
+                        action_area = action_area.child(
+                            div().w(px(320.)).child(
+                                Combobox::new(&combo)
+                                    .placeholder("Select PHP versions\u{2026}")
+                                    .search_placeholder("Search versions\u{2026}")
+                                    .cleanable(true)
+                                    .w_full(),
+                            ),
+                        );
+                    }
+                    // Count selected lines that have no installed build yet.
+                    let to_install: Vec<String> = self
+                        .onboarding_php_selected
+                        .iter()
+                        .filter(|line| {
+                            !php_versions
+                                .iter()
+                                .any(|installed| db::minor_line(installed) == **line)
+                        })
+                        .cloned()
+                        .collect();
+                    let n = to_install.len();
+                    action_area = action_area.child(
+                        Button::new("onb-install-php")
+                            .primary()
+                            .label(if busy {
+                                "Installing\u{2026}".to_string()
+                            } else if n == 0 {
+                                "Install selected".to_string()
+                            } else {
+                                format!("Install {} selected", n)
+                            })
+                            .disabled(busy || n == 0)
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                // Queue the newest release of each selected line
+                                // and start installing (the catalog is newest
+                                // first, so the first match is the latest patch).
+                                if let Some(catalog) = this.catalog.clone() {
+                                    let mut queue = Vec::new();
+                                    for line in &to_install {
+                                        if let Some(r) = catalog
+                                            .php
+                                            .iter()
+                                            .find(|r| db::minor_line(&r.version) == *line)
+                                            .cloned()
+                                        {
+                                            queue.push(r);
+                                        }
+                                    }
+                                    this.onboarding_php_queue = queue;
+                                    // kick off first
+                                    if let Some(first) = this.onboarding_php_queue.first().cloned() {
+                                        this.onboarding_php_queue.remove(0);
+                                        this.install_release(crate::runtime::RuntimeKind::Php, first, cx);
+                                    }
+                                }
+                            })),
+                    );
+                } else if let Some(err) = self.catalog_error.clone() {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
+                }
+            }
+            1 => {
+                if nginx_done {
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().success)
+                            .child(format!(
+                                "Active: nginx {}",
+                                self.settings.active_nginx.clone().unwrap_or_default()
+                            )),
+                    );
+                }
+                if self.catalog_loading {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading versions\u{2026}"));
+                } else if self.catalog.is_some() {
+                    let busy = self.busy_runtime.is_some();
+                    let installed = self.installed(crate::runtime::RuntimeKind::Nginx);
+                    self.ensure_onboarding_combos(window, cx);
+                    if let Some(combo) = self.onboarding_nginx_combo.clone() {
+                        action_area = action_area.child(
+                            div().w(px(320.)).child(
+                                Combobox::new(&combo)
+                                    .placeholder("Select an nginx version\u{2026}")
+                                    .search_placeholder("Search versions\u{2026}")
+                                    .w_full(),
+                            ),
+                        );
+                    }
+
+                    // Determine action for selected version.
+                    let selected = self.onboarding_nginx_selected.clone().or_else(|| installed.first().map(|r| r.version.clone()));
+                    if let Some(version) = selected {
+                        let is_installed = installed.iter().any(|r| r.version == version);
+                        if is_installed {
+                            if self.settings.active_nginx.as_deref() != Some(&version) {
+                                action_area = action_area.child(
+                                    Button::new("onb-activate-nginx")
+                                        .primary()
+                                        .label(format!("Use nginx {}", version))
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.set_active_nginx(version.clone(), cx);
+                                        })),
+                                );
+                            }
+                        } else if let Some(catalog) = self.catalog.clone() {
+                            if let Some(release) = catalog.nginx.iter().find(|r| r.version == version).cloned() {
+                                action_area = action_area.child(
+                                    Button::new("onb-install-nginx")
+                                        .primary()
+                                        .label(if busy {
+                                            "Installing\u{2026}".to_string()
+                                        } else {
+                                            format!("Install nginx {}", release.version)
+                                        })
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.install_release(crate::runtime::RuntimeKind::Nginx, release.clone(), cx);
+                                        })),
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(err) = self.catalog_error.clone() {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
+                }
+            }
+            2 => {
+                if cert_done {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().success).child("Trusted."));
+                } else if self.trust_busy {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Trusting\u{2026}"));
+                } else {
+                    action_area = action_area.child(
+                        Button::new("onb-trust")
+                            .primary()
+                            .label("Trust certificate")
+                            .on_click(cx.listener(|this, _, _window, cx| this.trust_ca(cx))),
+                    );
+                }
+            }
+            _ => {
+                if hosts_done {
+                    // Say *why* it is ready, so a pre-satisfied step on a clean
+                    // slate never reads as a leftover from an earlier run.
+                    let reason = match self.mode {
+                        crate::elevation::ControlMode::Elevated => {
+                            "Wisp is running as Administrator, so it can write the hosts file directly. Nothing to set up."
+                        }
+                        crate::elevation::ControlMode::Task => {
+                            "No-prompt hosts access is already set up, so .test domains can be written without prompts."
+                        }
+                        crate::elevation::ControlMode::Uac => "Hosts file updated.",
+                    };
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().success)
+                            .text_center()
+                            .child(reason),
+                    );
+                } else if self.elevation_busy {
+                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Setting up\u{2026}"));
+                } else {
+                    action_area = action_area.child(
+                        Button::new("onb-hosts")
+                            .primary()
+                            .label("Set up no-prompt hosts access")
+                            .on_click(cx.listener(|this, _, _window, cx| this.set_hosting_control(true, cx))),
+                    );
+                    action_area = action_area.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("This asks for administrator permission once. You can also do it later in Settings \u{2192} Hosting."),
+                    );
+                }
+            }
+        }
+
+        // Navigation row.
+        let mut nav = div().flex().flex_row().items_center().justify_between().gap_3().mt(px(8.));
+        // Back
+        if step > 0 {
+            nav = nav.child(
+                Button::new("onb-back")
+                    .outline()
+                    .label("Back")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        if this.onboarding_step > 0 {
+                            this.onboarding_step -= 1;
+                            cx.notify();
+                        }
+                    })),
+            );
+        } else {
+            nav = nav.child(div());
+        }
+        // Skip (steps 2,3) + Continue/Finish
+        let mut right = div().flex().flex_row().gap_2();
+        if skippable {
+            right = right.child(
+                Button::new("onb-skip")
+                    .ghost()
+                    .label("Skip")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        if this.onboarding_step < 3 {
+                            this.onboarding_step += 1;
+                        } else {
+                            this.finish_onboarding(cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        if step < 3 {
+            right = right.child(
+                Button::new("onb-next")
+                    .primary()
+                    .label("Continue")
+                    .disabled(!step_condition)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        if this.onboarding_step < 3 {
+                            this.onboarding_step += 1;
+                            cx.notify();
+                        }
+                    })),
+            );
+        } else {
+            right = right.child(
+                Button::new("onb-finish")
+                    .primary()
+                    .label("Finish")
+                    .disabled(!php_done || !nginx_done)
+                    .on_click(cx.listener(|this, _, _window, cx| this.finish_onboarding(cx))),
+            );
+        }
+        nav = nav.child(right);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .bg(cx.theme().background)
+            .child(
+                div()
+                    .w(px(560.))
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(40.)).child(img(APP_ICON).size(px(40.))))
+                            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Welcome to Wisp"))
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Let\u{2019}s get you set up in a few steps.")),
+                    )
+                    .child(
+                        Stepper::new("onboarding-stepper")
+                            .w_full()
+                            .text_center(true)
+                            .selected_index(step)
+                            .items([
+                                StepperItem::new().child("PHP"),
+                                StepperItem::new().child("nginx"),
+                                StepperItem::new().child("Certificate"),
+                                StepperItem::new().child("Hosts"),
+                            ]),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(step_title))
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground).text_center().child(step_desc)),
+                    )
+                    .child(action_area)
+                    .child(nav),
+            )
+            .into_any_element()
+    }
+
+    /// Create the onboarding version pickers once the catalog is known.
+    ///
+    /// PHP is a multi-select (you can install several versions); nginx is a
+    /// single-select (one build serves everything). Rebuilt only when absent, so
+    /// a user's selection survives re-renders.
+    fn ensure_onboarding_combos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        if self.onboarding_php_combo.is_none() {
+            // One entry per minor line (8.5, 8.4, …), like the Runtimes page,
+            // rather than every patch release in the catalog.
+            let mut lines: Vec<String> = Vec::new();
+            for release in &catalog.php {
+                let line = db::minor_line(&release.version);
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+            let default_line = lines.first().cloned();
+            let combo = cx.new(|cx| {
+                // The newest line is selected out of the box; changing it is
+                // always allowed.
+                ComboboxState::new(
+                    SearchableVec::new(lines),
+                    vec![IndexPath::new(0)],
+                    window,
+                    cx,
+                )
+                .searchable(true)
+                .multiple(true)
+            });
+            self.onboarding_php_selected = default_line.into_iter().collect();
+            let sub = cx.subscribe_in(
+                &combo,
+                window,
+                |this, _state, event: &ComboboxEvent<SearchableVec<String>>, _window, cx| {
+                    if let ComboboxEvent::Change(values) = event {
+                        this.onboarding_php_selected = values.iter().cloned().collect();
+                        cx.notify();
+                    }
+                },
+            );
+            self._subscriptions.push(sub);
+            self.onboarding_php_combo = Some(combo);
+        }
+        if self.onboarding_nginx_combo.is_none() {
+            let items: Vec<String> = catalog.nginx.iter().map(|r| r.version.clone()).collect();
+            let default_version = items.first().cloned();
+            let combo = cx.new(|cx| {
+                // The newest build is selected out of the box; changing it is
+                // always allowed.
+                ComboboxState::new(
+                    SearchableVec::new(items),
+                    vec![IndexPath::new(0)],
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            });
+            self.onboarding_nginx_selected = default_version;
+            let sub = cx.subscribe_in(
+                &combo,
+                window,
+                |this, _state, event: &ComboboxEvent<SearchableVec<String>>, _window, cx| {
+                    if let ComboboxEvent::Change(values) = event {
+                        this.onboarding_nginx_selected = values.first().cloned();
+                        cx.notify();
+                    }
+                },
+            );
+            self._subscriptions.push(sub);
+            self.onboarding_nginx_combo = Some(combo);
+        }
+    }
+
+    fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.settings.onboarding_complete = true;
+        self.settings.save();
+        self.onboarding_open = false;
+        cx.notify();
+    }
+
     fn projects_content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(project) = self.selected_project() else {
-            return div()
-                .flex()
-                .flex_col()
+            return Empty::new()
                 .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .child(div().size(px(72.)).child(img(APP_ICON).size(px(72.))))
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("No project selected"),
+                .header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .child(img(APP_ICON).size(px(40.))),
+                        )
+                        .title(EmptyTitle::new().child("No project selected"))
+                        .description(
+                            EmptyDescription::new()
+                                .child("Choose a project from the sidebar, or create a new one."),
+                        ),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Choose a project, or create a new one."),
+                .content(
+                    EmptyContent::new().child(
+                        Button::new("empty-new-project")
+                            .primary()
+                            .label("New project")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_editor(None, window, cx)
+                            })),
+                    ),
                 )
                 .into_any_element();
         };
@@ -2933,7 +3463,7 @@ impl Wisp {
                     .gap_2()
                     .child(
                         div()
-                            .text_2xl()
+                            .text_3xl()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(name),
                     )
@@ -2945,6 +3475,12 @@ impl Wisp {
                             .gap_2()
                             .child(ui::dot(self.state_color(serving, worker, cx)))
                             .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if serving || worker { "Serving" } else { "Stopped" }),
+                            )
+                            .child(
                                 Link::new("header-domain")
                                     .href(format!("{}{}", scheme_prefix(ssl), domain))
                                     .text_sm()
@@ -2954,7 +3490,6 @@ impl Wisp {
             );
 
         let tabs = TabBar::new("project-tabs")
-            .segmented()
             .selected_index(self.project_tab.index())
             .children([
                 Tab::new().label("Services"),
@@ -3104,7 +3639,7 @@ impl Wisp {
                             .icon(icon(IconName::Play))
                             .label("Start")
                             .tooltip("Start this project's nginx entry and PHP worker")
-                            .disabled(busy || (nginx_on && php_on))
+                            .disabled(busy || (nginx_on && php_on && self.serve_error.is_none()))
                             .on_click(cx.listener(move |this, _, _window, cx| {
                                 this.set_project(id, true, cx)
                             })),
@@ -3214,7 +3749,7 @@ impl Wisp {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(match only {
-                        Some(_) => "This project is not running, so it is using nothing.",
+                        Some(_) => "Not running \u{2014} using no resources.",
                         None => "Nothing is running yet. Start a site to see what it costs.",
                     }),
             );
@@ -3409,6 +3944,7 @@ impl Wisp {
                     &entity,
                     error,
                     &php_versions,
+                    None,
                     window,
                     cx,
                 ))
@@ -3582,7 +4118,7 @@ impl Wisp {
                     .gap_2()
                     .child(
                         div()
-                            .text_2xl()
+                            .text_3xl()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Services"),
                     )
@@ -3622,7 +4158,6 @@ impl Wisp {
         }
 
         let tabs = TabBar::new("runtime-tabs")
-            .segmented()
             .selected_index(self.runtime_tab.index())
             .children([
                 Tab::new().label("PHP"),
@@ -4030,7 +4565,7 @@ impl Wisp {
             .map(|project| {
                 let state = match tls::expiry(&project.domain) {
                     Some(expires) => human_expiry(expires),
-                    None => "not issued yet".to_string(),
+                    None => "issued when the site starts".to_string(),
                 };
                 div()
                     .flex()
@@ -4470,6 +5005,10 @@ impl Render for Wisp {
         self.apply_pending_icon();
         self.publish_tray(cx);
 
+        if self.onboarding_open {
+            return self.onboarding_view(window, cx);
+        }
+
         let mut root = div()
             .id("wisp-root")
             .relative()
@@ -4509,6 +5048,34 @@ impl Render for Wisp {
                         .title("Could not start the server")
                         .banner(),
                 ),
+            );
+        }
+
+        if let Some(message) = self.hosts_error.clone() {
+            root = root.child(
+                div()
+                    .px(px(20.))
+                    .pb(px(12.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div().flex_1().child(
+                            Alert::warning("hosts-error", message)
+                                .title("Domains will not resolve")
+                                .banner(),
+                        ),
+                    )
+                    .child(
+                        Button::new("hosts-retry")
+                            .small()
+                            .primary()
+                            .label("Try again")
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.sync_hosts(cx);
+                            })),
+                    ),
             );
         }
 
@@ -4552,9 +5119,9 @@ impl Render for Wisp {
             .child(status);
 
         if self.palette_open {
-            page.child(self.palette_overlay(window, cx))
+            page.child(self.palette_overlay(window, cx)).into_any_element()
         } else {
-            page
+            page.into_any_element()
         }
     }
 }
@@ -4823,15 +5390,13 @@ fn section_header(title: &str, subtitle: &str, cx: &App) -> impl IntoElement {
 /// A small accent badge, e.g. "Up to date" or "Active".
 fn badge(label: &str, cx: &App) -> impl IntoElement {
     let color = cx.theme().primary;
-    let _ = cx;
     div()
         .px(px(8.))
-        .py(px(3.))
+        .py(px(2.))
         .rounded_full()
-        .bg(cx.theme().accent)
-        .border_1()
-        .border_color(cx.theme().accent)
+        .bg(color.opacity(0.12))
         .text_xs()
+        .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .child(label.to_string())
 }
@@ -5602,7 +6167,7 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
             let entity = entity.clone();
             move |_, window, cx| {
                 entity.update(cx, |this, cx| this.close_ini_editor(cx));
-                window.close_dialog(cx);
+                window.close_sheet(cx);
             }
         });
 
@@ -5614,7 +6179,7 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
             move |_, window, cx| {
                 let saved = entity.update(cx, |this, cx| this.save_ini_editor(cx));
                 if saved {
-                    window.close_dialog(cx);
+                    window.close_sheet(cx);
                 }
             }
         });
@@ -5636,18 +6201,21 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
         )
 }
 
-/// The body of the create/edit dialog.
+/// The body of the create/edit form.
+///
+/// `cap` is the height the form may take inside a dialog: the title, footer,
+/// paddings and margins take the rest of the window, and the form scrolls
+/// inside what is left. `None` renders the form open, for the inline editor on
+/// the Settings tab, where the page itself scrolls.
 fn editor_form(
     editor: &EditorState,
     entity: &Entity<Wisp>,
     error: Option<String>,
     php_versions: &[String],
-    window: &mut Window,
+    cap: Option<Pixels>,
+    _window: &mut Window,
     cx: &App,
 ) -> impl IntoElement {
-    // Keep the dialog inside the window; the form scrolls when it is taller.
-    let cap = window.bounds().size.height - px(200.);
-    let cap = if cap < px(220.) { px(220.) } else { cap };
 
     let php_label = editor
         .php_version
@@ -5884,11 +6452,23 @@ fn editor_form(
         );
     }
 
-    div()
-        .id("editor-scroll")
-        .max_h(cap)
-        .overflow_y_scrollbar()
-        .child(form)
+    match cap {
+        // A fixed height, not a maximum: the dialog does not shrink its body
+        // below the content, so a taller form was clipped by the dialog edge
+        // instead of scrolling inside this wrapper.
+        Some(cap) => div()
+            .id("editor-scroll")
+            .h(cap)
+            .flex_shrink_0()
+            // A gutter for the scrollbar so it does not sit over the inputs, and
+            // breathing room under the last field.
+            .pr(px(14.))
+            .pb(px(14.))
+            .overflow_y_scrollbar()
+            .child(form)
+            .into_any_element(),
+        None => form.into_any_element(),
+    }
 }
 
 /// The dialog footer: Cancel and Save.
