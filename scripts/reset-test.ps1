@@ -25,16 +25,18 @@ foreach ($name in @("wisp", "nginx", "php-cgi")) {
 Start-Sleep -Seconds 2
 
 # Remove the no-prompt hosts task, so onboarding's hosts step is exercised from
-# scratch (a leftover task makes the step read as already set up).
-$task = "WispElevatedControl"
-$query = & schtasks /Query /TN $task 2>&1 | Out-String
-if ($query -match $task) {
-    Write-Host "Removing the no-prompt hosts task ($task)..."
-    $delete = & schtasks /Delete /TN $task /F 2>&1 | Out-String
-    if ($delete -match "success") {
-        Write-Host "Task removed."
-    } else {
-        Write-Host "WARNING: could not remove the task: $delete" -ForegroundColor Yellow
+# scratch (a leftover task makes the step read as already set up). Tasks are
+# named per config directory, so match the base name and any suffix.
+$tasks = @(Get-ScheduledTask -TaskName "WispElevatedControl*" -ErrorAction SilentlyContinue)
+if ($tasks.Count -gt 0) {
+    foreach ($task in $tasks) {
+        Write-Host "Removing the no-prompt hosts task ($($task.TaskName))..."
+        Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        if (Get-ScheduledTask -TaskName $task.TaskName -ErrorAction SilentlyContinue) {
+            Write-Host "WARNING: could not remove $($task.TaskName). Run this script as Administrator." -ForegroundColor Yellow
+        } else {
+            Write-Host "Task removed."
+        }
     }
 } else {
     Write-Host "No no-prompt hosts task to remove."

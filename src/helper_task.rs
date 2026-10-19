@@ -12,13 +12,42 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Name of the scheduled task.
+use crate::platform::system32;
+
+/// Base name of the scheduled task.
 const TASK_NAME: &str = "WispElevatedControl";
+
+/// The task for this install.
+///
+/// The default config keeps the historical name, so an existing install keeps
+/// working. Any other config directory (a portable layout, or the first-run
+/// test harness) gets its own task: two configs sharing one helper would keep
+/// re-registering it at each other, and the one not currently registered would
+/// read the other install's request file.
+fn task_name() -> String {
+    let root = crate::config::root();
+    if root == crate::config::default_root() {
+        return TASK_NAME.to_string();
+    }
+
+    // FNV-1a over the lowercased path: stable across runs, short in Task
+    // Scheduler. Only the low 32 bits are used, which is plenty for a few
+    // config directories on one machine.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{TASK_NAME}-{:08x}", hash & 0xffff_ffff)
+}
 
 /// Windows `CREATE_NO_WINDOW`: keeps the console helpers from flashing a window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The helper writes a small file and exits; a cold start on a busy machine
+/// needs seconds, not minutes. A stale or missing task should fail visibly
+/// rather than leave the hosts step hanging for long.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
@@ -59,33 +88,57 @@ fn response_path() -> PathBuf {
     state_dir().join("response.json")
 }
 
-/// Whether no-prompt control is set up and still usable on this machine.
+/// Whether no-prompt control is set up for this build and config directory.
+///
+/// A task left by another install can look registered while being useless: it
+/// reads a different install's request file, so the GUI waits for a response
+/// that goes somewhere else. Checking the executable and `--config-dir` makes
+/// that state report as "not set up" so it is re-registered instead.
 pub fn is_usable() -> bool {
-    registered_command().is_some_and(|command| Path::new(&command).is_file())
+    task_xml().is_some_and(|xml| task_matches(&xml, &crate::config::root().to_string_lossy()))
 }
 
-/// The program the task launches, or `None` when there is no such task.
-fn registered_command() -> Option<String> {
+/// Whether a task definition belongs to this build and config directory.
+fn task_matches(xml: &str, config_root: &str) -> bool {
+    let Some(command) = field_value(xml, "Command") else {
+        return false;
+    };
+    if !Path::new(&command).is_file() {
+        return false;
+    }
+    let Some(arguments) = field_value(xml, "Arguments") else {
+        return false;
+    };
+    arguments.contains("--ctl-from-task")
+        && arguments
+            .to_lowercase()
+            .contains(&config_root.to_lowercase())
+}
+
+/// Read the task definition once.
+fn task_xml() -> Option<String> {
+    let name = task_name();
     let output = system_tool("schtasks.exe")
-        .args(["/query", "/tn", TASK_NAME, "/xml"])
+        .args(["/query", "/tn", name.as_str(), "/xml"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    extract_command(&String::from_utf8_lossy(&output.stdout))
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Pull `<Command>` out of the task definition, unescaping XML entities.
-fn extract_command(xml: &str) -> Option<String> {
-    const OPEN: &str = "<Command>";
-    let start = xml.find(OPEN)? + OPEN.len();
-    let end = start + xml[start..].find("</Command>")?;
-    let command = xml[start..end].trim();
+/// One `<Command>` or `<Arguments>` value, unescaped.
+fn field_value(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&close)?;
+    let value = xml[start..end].trim();
 
-    (!command.is_empty()).then(|| {
-        command
+    (!value.is_empty()).then(|| {
+        value
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
@@ -94,10 +147,21 @@ fn extract_command(xml: &str) -> Option<String> {
     })
 }
 
+/// Pull `<Command>` out of a task definition, unescaping XML entities.
+#[cfg(test)]
+fn extract_command(xml: &str) -> Option<String> {
+    field_value(xml, "Command")
+}
+
 /// Register (or re-register) the highest-privileges task. Prompts for UAC once.
 pub fn setup(exe: &Path) -> Result<(), TaskError> {
     let script_path = std::env::temp_dir().join("wisp-setup.ps1");
-    std::fs::write(&script_path, setup_script(exe, &crate::config::root())).map_err(TaskError::Io)?;
+    let name = task_name();
+    std::fs::write(
+        &script_path,
+        setup_script(exe, &crate::config::root(), &name),
+    )
+    .map_err(TaskError::Io)?;
 
     let result = runas::Command::new(powershell_path())
         .args(&[
@@ -128,7 +192,8 @@ pub fn setup(exe: &Path) -> Result<(), TaskError> {
 /// Delete the scheduled task, reverting to the per-action UAC prompt.
 pub fn remove() -> Result<(), TaskError> {
     let script_path = std::env::temp_dir().join("wisp-teardown.ps1");
-    std::fs::write(&script_path, teardown_script()).map_err(TaskError::Io)?;
+    let name = task_name();
+    std::fs::write(&script_path, teardown_script(&name)).map_err(TaskError::Io)?;
 
     let result = runas::Command::new(powershell_path())
         .args(&[
@@ -157,8 +222,9 @@ pub fn remove() -> Result<(), TaskError> {
 }
 
 fn is_registered() -> bool {
+    let name = task_name();
     system_tool("schtasks.exe")
-        .args(["/query", "/tn", TASK_NAME])
+        .args(["/query", "/tn", name.as_str()])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .is_ok_and(|output| output.status.success())
@@ -210,8 +276,9 @@ pub fn run_via_task() -> Result<(), TaskError> {
     let response = response_path();
     let _ = std::fs::remove_file(&response);
 
+    let name = task_name();
     let status = system_tool("schtasks.exe")
-        .args(["/run", "/tn", TASK_NAME])
+        .args(["/run", "/tn", name.as_str()])
         .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map_err(TaskError::Io)?;
@@ -246,23 +313,25 @@ fn wait_for_response(response: &Path) -> Result<(), TaskError> {
     }
 }
 
-fn setup_script(exe: &Path, config_dir: &Path) -> String {
+fn setup_script(exe: &Path, config_dir: &Path, name: &str) -> String {
     let exe = exe.to_string_lossy().replace('\'', "''");
     let config_dir = config_dir.to_string_lossy().replace('\'', "''");
+    let name = name.replace('\'', "''");
     format!(
         "$ErrorActionPreference = 'Stop'\n\
          $me = \"$env:USERDOMAIN\\$env:USERNAME\"\n\
          $action = New-ScheduledTaskAction -Execute '{exe}' -Argument '--ctl-from-task --config-dir \"{config_dir}\"'\n\
          $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest\n\
          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)\n\
-         Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Principal $principal -Settings $settings -Force | Out-Null\n"
+         Register-ScheduledTask -TaskName '{name}' -Action $action -Principal $principal -Settings $settings -Force | Out-Null\n"
     )
 }
 
-fn teardown_script() -> String {
+fn teardown_script(name: &str) -> String {
+    let name = name.replace('\'', "''");
     format!(
         "$ErrorActionPreference = 'Stop'\n\
-         schtasks.exe /delete /tn '{TASK_NAME}' /f | Out-Null\n\
+         schtasks.exe /delete /tn '{name}' /f | Out-Null\n\
          if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n"
     )
 }
@@ -278,37 +347,87 @@ fn powershell_path() -> PathBuf {
         .join("powershell.exe")
 }
 
-fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
-}
-
 fn is_uac_cancelled(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(1223) || err.to_string().to_lowercase().contains("cancel")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_command, setup_script};
+    use super::{extract_command, field_value, setup_script, task_matches};
     use std::path::Path;
+
+    #[test]
+    fn a_task_for_another_config_dir_is_not_usable() {
+        // This was the bug: a task registered while running with a different
+        // config dir looked registered, so the GUI waited on a response that
+        // was written to the other install's folder.
+        let exe = std::env::current_exe().expect("a test executable path");
+        let xml = format!(
+            r#"<Task><Actions><Exec>
+                <Command>{}</Command>
+                <Arguments>--ctl-from-task --config-dir "C:\Other\Wisp"</Arguments>
+            </Exec></Actions></Task>"#,
+            exe.display()
+        );
+        assert!(!task_matches(&xml, r"C:\Expected\Wisp"));
+
+        let xml = format!(
+            r#"<Task><Actions><Exec>
+                <Command>{}</Command>
+                <Arguments>--ctl-from-task --config-dir "C:\Expected\Wisp"</Arguments>
+            </Exec></Actions></Task>"#,
+            exe.display()
+        );
+        assert!(task_matches(&xml, r"C:\Expected\Wisp"));
+    }
+
+    #[test]
+    fn a_task_without_a_config_dir_is_not_usable_for_this_install() {
+        let exe = std::env::current_exe().expect("a test executable path");
+        let xml = format!(
+            r"<Task><Actions><Exec>
+                <Command>{}</Command>
+                <Arguments>--ctl-from-task</Arguments>
+            </Exec></Actions></Task>",
+            exe.display()
+        );
+        assert!(!task_matches(&xml, r"C:\Expected\Wisp"));
+    }
+
+    #[test]
+    fn reads_the_arguments_out_of_a_task_definition() {
+        // The arguments carry the config dir, which is what tells a stale task
+        // from a usable one.
+        let xml = r#"<Task><Actions><Exec>
+            <Command>C:\Tools\wisp.exe</Command>
+            <Arguments>--ctl-from-task --config-dir "C:\Users\me\.config\wisp"</Arguments>
+        </Exec></Actions></Task>"#;
+        assert_eq!(
+            field_value(xml, "Arguments").as_deref(),
+            Some(r#"--ctl-from-task --config-dir "C:\Users\me\.config\wisp""#)
+        );
+    }
 
     #[test]
     fn the_task_action_carries_the_config_dir() {
         // The task runs with a clean environment, so the helper must be told
         // where the config lives or it reads another install's request file.
-        let script = setup_script(Path::new(r"C:\Tools\wisp.exe"), Path::new(r"C:\Users\me\.config\wisp"));
+        let script = setup_script(
+            Path::new(r"C:\Tools\wisp.exe"),
+            Path::new(r"C:\Users\me\.config\wisp"),
+            "WispElevatedControl",
+        );
         assert!(script.contains("--ctl-from-task"));
         assert!(script.contains(r#"--config-dir "C:\Users\me\.config\wisp""#));
+        assert!(script.contains("TaskName 'WispElevatedControl'"));
     }
 
     #[test]
     fn reads_the_command_out_of_a_task_definition() {
-        let xml = r#"<Task><Actions><Exec>
+        let xml = r"<Task><Actions><Exec>
             <Command>C:\Users\Abraham\AppData\Local\Programs\Wisp\wisp.exe</Command>
             <Arguments>--ctl-from-task</Arguments>
-        </Exec></Actions></Task>"#;
+        </Exec></Actions></Task>";
         assert_eq!(
             extract_command(xml).as_deref(),
             Some(r"C:\Users\Abraham\AppData\Local\Programs\Wisp\wisp.exe")

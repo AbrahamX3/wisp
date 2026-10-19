@@ -14,6 +14,14 @@ pub fn root() -> PathBuf {
     if let Some(dir) = std::env::var_os("WISP_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
+    default_root()
+}
+
+/// The historical per-user root, ignoring `WISP_CONFIG_DIR`.
+///
+/// Callers that need to tell a normal install from an override (the elevated
+/// helper task is named per install) compare `root()` against this.
+pub fn default_root() -> PathBuf {
     home().join(".config").join("wisp")
 }
 

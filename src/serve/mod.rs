@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
+use crate::platform::system32;
 use crate::runtime::{self, RuntimeKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -78,7 +79,7 @@ pub struct Supervisor {
     nginx: Option<Child>,
     nginx_version: Option<String>,
     workers: HashMap<i64, Worker>,
-    /// Allocated FastCGI ports, stable while a project keeps running.
+    /// Allocated `FastCGI` ports, stable while a project keeps running.
     ports: HashMap<i64, u16>,
     /// Whether the one-time sweep of workers left by a previous run has run.
     swept: bool,
@@ -99,7 +100,7 @@ impl Supervisor {
                 });
             }
         }
-        for (id, worker) in self.workers.iter_mut() {
+        for (id, worker) in &mut self.workers {
             if process::is_running(&mut worker.child) {
                 tracked.push(Tracked {
                     project: Some(*id),
@@ -123,7 +124,7 @@ impl Supervisor {
 
         let mut running_projects = Vec::new();
         let mut dead = Vec::new();
-        for (id, worker) in self.workers.iter_mut() {
+        for (id, worker) in &mut self.workers {
             if process::is_running(&mut worker.child) {
                 running_projects.push(*id);
             } else {
@@ -155,7 +156,7 @@ impl Supervisor {
         // Write each worker's php.ini; the worker must restart if it changed.
         let mut restart = Vec::new();
         for site in sites.iter().filter(|site| site.worker) {
-            if self.write_php_ini(site)? {
+            if Self::write_php_ini(site)? {
                 restart.push(site.id);
             }
         }
@@ -288,7 +289,7 @@ impl Supervisor {
     }
 
     /// Write the per-project `php.ini`, returning whether it actually changed.
-    fn write_php_ini(&self, site: &SiteSpec) -> Result<bool> {
+    fn write_php_ini(site: &SiteSpec) -> Result<bool> {
         let runtime_dir = runtime::install_dir(RuntimeKind::Php, &site.php_version);
         let template =
             std::fs::read_to_string(runtime_dir.join("php.ini-development")).unwrap_or_default();
@@ -320,13 +321,13 @@ impl Supervisor {
             }
             self.stop_project(site.id);
             let port = self.port_for(site.id);
-            let child = self.spawn_worker(site, port)?;
+            let child = Self::spawn_worker(site, port)?;
             self.workers.insert(site.id, Worker { child, port });
         }
         Ok(())
     }
 
-    fn spawn_worker(&self, site: &SiteSpec, port: u16) -> Result<Child> {
+    fn spawn_worker(site: &SiteSpec, port: u16) -> Result<Child> {
         let runtime_dir = runtime::install_dir(RuntimeKind::Php, &site.php_version);
         let exe = runtime::php_cgi(&site.php_version);
         if !exe.is_file() {
@@ -372,7 +373,7 @@ impl Supervisor {
                 // unreliable on Windows (the named-event open fails with
                 // "Access is denied"), so fall back to a stop + start when the
                 // reload signal does not succeed.
-                if self.signal(prefix, "-s", "reload").is_err() {
+                if Self::signal(prefix, "-s", "reload").is_err() {
                     self.stop_nginx(prefix);
                 } else {
                     return Ok(());
@@ -402,7 +403,7 @@ impl Supervisor {
 
     fn stop_nginx(&mut self, prefix: &Path) {
         if let Some(mut child) = self.nginx.take() {
-            let _ = self.signal(prefix, "-s", "quit");
+            let _ = Self::signal(prefix, "-s", "quit");
             std::thread::sleep(std::time::Duration::from_millis(400));
             if process::is_running(&mut child) {
                 let _ = process::kill_tree(&mut child);
@@ -412,7 +413,7 @@ impl Supervisor {
     }
 
     /// Ask the running nginx to reload or quit.
-    fn signal(&self, prefix: &Path, flag: &str, value: &str) -> std::io::Result<()> {
+    fn signal(prefix: &Path, flag: &str, value: &str) -> std::io::Result<()> {
         let exe = prefix.join("nginx.exe");
         let args = nginx_args(prefix, &[flag, value]);
         let status = std::process::Command::new(exe).args(args).status()?;
@@ -434,7 +435,7 @@ impl Supervisor {
 }
 
 /// Kill `nginx` and `php-cgi` processes left behind by a previous run, so they
-/// do not hold ports 80 and 443 or a FastCGI port, and do not serve stale
+/// do not hold ports 80 and 443 or a `FastCGI` port, and do not serve stale
 /// configuration.
 ///
 /// Only processes whose command line points inside this install's own data
@@ -466,14 +467,13 @@ pub fn sweep_orphans() {
         "-Command".to_string(),
         script,
     ];
-    let _ = process::spawn(&powershell, &args, &[], None);
-}
-
-fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
+    // Wait for it. The caller is about to start nginx and PHP, and those match
+    // the same path filter; a sweep still running when they come up would kill
+    // the processes it was meant to clear, which is why the first Start after a
+    // launch used to fail.
+    if let Ok(mut child) = process::spawn(&powershell, &args, &[], None) {
+        let _ = child.wait();
+    }
 }
 
 /// Wait until something accepts connections on `port`, or the timeout passes.

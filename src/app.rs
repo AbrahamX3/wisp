@@ -403,7 +403,8 @@ pub struct Wisp {
     onboarding_php_combo: Option<Entity<ComboboxState<SearchableVec<String>>>>,
     /// Single-select nginx version picker, created once the catalog is available.
     onboarding_nginx_combo: Option<Entity<ComboboxState<SearchableVec<String>>>>,
-    _subscriptions: Vec<Subscription>,
+    /// Subscriptions held for their lifetime: dropping one stops its callback.
+    subscriptions: Vec<Subscription>,
 }
 
 impl Wisp {
@@ -502,7 +503,7 @@ impl Wisp {
             onboarding_nginx_selected: None,
             onboarding_php_combo: None,
             onboarding_nginx_combo: None,
-            _subscriptions,
+            subscriptions: _subscriptions,
         };
         this.reload(cx);
         // Show the first project on launch rather than an empty pane.
@@ -515,10 +516,6 @@ impl Wisp {
         Self::spawn_log_poll(cx);
         Self::spawn_metrics_poll(cx);
         Self::spawn_mode_probe(cx);
-        // A previous run that was force-killed can leave nginx holding ports 80
-        // and 443 and PHP workers holding their FastCGI ports. Clear them before
-        // this session tries to start anything.
-        serve::sweep_orphans();
 
         Self::spawn_auto_update_check(cx);
 
@@ -584,15 +581,15 @@ impl Wisp {
         // A new project starts on the newest installed PHP, which the user can
         // change before saving.
         let default_php = self.installed_php_versions().first().cloned();
-        let draft = existing
-            .as_ref()
-            .map(ProjectDraft::from_project)
-            .unwrap_or_else(move || ProjectDraft {
+        let draft = existing.as_ref().map_or_else(
+            move || ProjectDraft {
                 ssl_enabled: true,
                 php_ini_overrides: String::new(),
                 php_version: default_php,
                 ..Default::default()
-            });
+            },
+            ProjectDraft::from_project,
+        );
 
         let (domain_label, domain_suffix) = db::split_domain(&draft.domain);
 
@@ -734,7 +731,7 @@ impl Wisp {
             };
             let title = format!("php.ini \u{00b7} {}", project.name);
             let error = editor.error.clone();
-            let body = ini_editor_body(editor, &entity, read, project, cx);
+            let body = ini_editor_body(editor, &entity, project, cx);
             sheet
                 .title(title)
                 .size(px(760.))
@@ -747,7 +744,7 @@ impl Wisp {
     ///
     /// Passing an empty string for `overrides` gives the file without the
     /// user's additions, which is what the diff needs as its base.
-    fn generated_ini(&self, project: &Project, overrides: &str) -> String {
+    fn generated_ini(project: &Project, overrides: &str) -> String {
         let Some(version) = project.php_version.as_deref() else {
             return String::new();
         };
@@ -985,8 +982,8 @@ impl Wisp {
     }
 
     /// Open a project's domain in the default browser.
-    fn open_domain(&mut self, url: String, cx: &mut Context<Self>) {
-        if let Err(error) = shell::open_url(&url) {
+    fn open_domain(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Err(error) = shell::open_url(url) {
             self.push_toast(ToastKind::Error, error.to_string());
         }
         cx.notify();
@@ -1470,12 +1467,13 @@ impl Wisp {
         if self.settings.active_nginx.as_deref() == Some(version.as_str()) {
             return;
         }
-        self.settings.active_nginx = Some(version.clone());
-        self.settings.save();
         self.push_toast(
             ToastKind::Success,
             format!("nginx {version} is now the active version."),
         );
+        // Moved, not cloned: the toast above is the last read of it.
+        self.settings.active_nginx = Some(version);
+        self.settings.save();
         cx.notify();
     }
 
@@ -1544,7 +1542,7 @@ impl Wisp {
     }
 
     /// The colour a project's status dot takes: both up, one up, or neither.
-    fn state_color(&self, nginx: bool, worker: bool, cx: &App) -> Hsla {
+    fn state_color(nginx: bool, worker: bool, cx: &App) -> Hsla {
         if nginx && worker {
             cx.theme().success
         } else if nginx || worker {
@@ -1952,12 +1950,12 @@ impl Wisp {
                 system.refresh_memory();
                 system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-                let cpu = system.global_cpu_usage() as f64;
+                let cpu = f64::from(system.global_cpu_usage());
                 let total = system.total_memory();
                 let ram = if total == 0 {
                     0.0
                 } else {
-                    system.used_memory() as f64 / total as f64 * 100.0
+                    percent_of(system.used_memory(), total)
                 };
                 let samples = measure_services(&system, &wanted);
 
@@ -2019,6 +2017,10 @@ impl Wisp {
     }
 
     /// Move between search hits, scrolling the log towards the new one.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "log line counts are far below f32's exact integer range"
+    )]
     fn step_log_match(&mut self, forward: bool, cx: &mut Context<Self>) {
         let raw = self.log_filter.read(cx).value().to_string();
         let needle = if self.log_case { raw } else { raw.to_lowercase() };
@@ -2070,7 +2072,7 @@ impl Wisp {
     }
 
     fn open_log_folder(&mut self, cx: &mut Context<Self>) {
-        if let Some(slug) = self.selected_project().map(|project| project.slug()) {
+        if let Some(slug) = self.selected_project().map(Project::slug) {
             let path = serve::config::site_logs(&slug).to_string_lossy().to_string();
             self.open_folder(&path, cx);
         }
@@ -2218,7 +2220,7 @@ impl Wisp {
                             format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain)
                         });
                     if let Some(url) = url {
-                        self.open_domain(url, cx);
+                        self.open_domain(&url, cx);
                     }
                 }
             },
@@ -2731,7 +2733,7 @@ impl Wisp {
                         !(serving && worker && self.serve_error.is_none()),
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.set_project(id, true, cx)
+                        this.set_project(id, true, cx);
                     })),
                 )
                 .child(
@@ -2743,7 +2745,7 @@ impl Wisp {
                         any_up,
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.restart_project(id, cx)
+                        this.restart_project(id, cx);
                     })),
                 )
                 .child(
@@ -2755,7 +2757,7 @@ impl Wisp {
                         any_up,
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.set_project(id, false, cx)
+                        this.set_project(id, false, cx);
                     })),
                 );
         }
@@ -2810,7 +2812,7 @@ impl Wisp {
                             .label("Search")
                             .tooltip("Search or run a command (Ctrl-K)")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_palette(window, cx)
+                                this.toggle_palette(window, cx);
                             })),
                     )
                     .child(
@@ -2820,7 +2822,7 @@ impl Wisp {
                             .icon(icon(IconName::Plus))
                             .label("New project")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_editor(None, window, cx)
+                                this.open_editor(None, window, cx);
                             })),
                     )
                     .child(self.settings_menu(cx)),
@@ -2942,7 +2944,7 @@ impl Wisp {
             for project in &visible {
                 let active = selected == Some(project.id) && !on_runtimes && !on_settings;
                 let (serving, worker) = self.project_state(project.id);
-                let color = self.state_color(serving, worker, cx);
+                let color = Self::state_color(serving, worker, cx);
                 menu = menu.child(project_entry(
                     project,
                     active,
@@ -3100,7 +3102,7 @@ impl Wisp {
                             } else if n == 0 {
                                 "Install selected".to_string()
                             } else {
-                                format!("Install {} selected", n)
+                                format!("Install {n} selected")
                             })
                             .disabled(busy || n == 0)
                             .on_click(cx.listener(move |this, _, _window, cx| {
@@ -3170,7 +3172,7 @@ impl Wisp {
                                 action_area = action_area.child(
                                     Button::new("onb-activate-nginx")
                                         .primary()
-                                        .label(format!("Use nginx {}", version))
+                                        .label(format!("Use nginx {version}"))
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, _window, cx| {
                                             this.set_active_nginx(version.clone(), cx);
@@ -3404,7 +3406,7 @@ impl Wisp {
                     }
                 },
             );
-            self._subscriptions.push(sub);
+            self.subscriptions.push(sub);
             self.onboarding_php_combo = Some(combo);
         }
         if self.onboarding_nginx_combo.is_none() {
@@ -3432,7 +3434,7 @@ impl Wisp {
                     }
                 },
             );
-            self._subscriptions.push(sub);
+            self.subscriptions.push(sub);
             self.onboarding_nginx_combo = Some(combo);
         }
     }
@@ -3467,7 +3469,7 @@ impl Wisp {
                             .primary()
                             .label("New project")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_editor(None, window, cx)
+                                this.open_editor(None, window, cx);
                             })),
                     ),
                 )
@@ -3504,7 +3506,7 @@ impl Wisp {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(ui::dot(self.state_color(serving, worker, cx)))
+                            .child(ui::dot(Self::state_color(serving, worker, cx)))
                             .child(
                                 div()
                                     .text_xs()
@@ -3522,7 +3524,7 @@ impl Wisp {
 
         let tabs = TabBar::new("project-tabs")
             .selected_index(self.project_tab.index())
-            .children([
+            .children(vec![
                 Tab::new().label("Services"),
                 Tab::new().label("Overview"),
                 Tab::new().label("Logs"),
@@ -3544,7 +3546,7 @@ impl Wisp {
                 .flex()
                 .flex_col()
                 .gap_4()
-                .child(self.project_details(project, cx))
+                .child(Self::project_details(project, cx))
                 .child(self.resources_card(Some(project.id), cx))
                 .into_any_element(),
             ProjectTab::Services => self.project_services(project, cx),
@@ -3574,7 +3576,7 @@ impl Wisp {
     }
 
     /// The Overview tab: the project's configuration at a glance.
-    fn project_details(&self, project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+    fn project_details(project: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let root = project.root_path.clone();
         let url = format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain);
         let php = project
@@ -3672,7 +3674,7 @@ impl Wisp {
                             .tooltip("Start this project's nginx entry and PHP worker")
                             .disabled(busy || (nginx_on && php_on && self.serve_error.is_none()))
                             .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.set_project(id, true, cx)
+                                this.set_project(id, true, cx);
                             })),
                     )
                     .child(
@@ -3684,7 +3686,7 @@ impl Wisp {
                             .tooltip("Restart this project's PHP worker")
                             .disabled(busy || !(nginx_on || php_on))
                             .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.restart_project(id, cx)
+                                this.restart_project(id, cx);
                             })),
                     )
                     .child(
@@ -3696,7 +3698,7 @@ impl Wisp {
                             .tooltip("Stop this project's nginx entry and PHP worker")
                             .disabled(busy || !(nginx_on || php_on))
                             .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.set_project(id, false, cx)
+                                this.set_project(id, false, cx);
                             })),
                     ),
             );
@@ -4042,7 +4044,7 @@ impl Wisp {
                                 .icon(icon(IconName::Trash))
                                 .label("Remove")
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_delete(id, window, cx)
+                                    this.confirm_delete(id, window, cx);
                                 })),
                         ),
                 )
@@ -4099,7 +4101,7 @@ impl Wisp {
                                             .cloned();
                                         if let Some(project) = project {
                                             entity.update(cx, |this, cx| {
-                                                this.open_ini_editor(project, window, cx)
+                                                this.open_ini_editor(project, window, cx);
                                             });
                                         }
                                     }
@@ -4185,12 +4187,12 @@ impl Wisp {
         }
 
         if let Some(vc) = self.php_vcrt_gap() {
-            column = column.child(self.vcrt_banner(vc, cx));
+            column = column.child(Self::vcrt_banner(vc, cx));
         }
 
         let tabs = TabBar::new("runtime-tabs")
             .selected_index(self.runtime_tab.index())
-            .children([
+            .children(vec![
                 Tab::new().label("PHP"),
                 Tab::new().label("nginx"),
                 Tab::new().label("HTTPS"),
@@ -4217,7 +4219,7 @@ impl Wisp {
                 .flex_col()
                 .gap_4()
                 .child(self.hosting_card(cx))
-                .child(self.hosts_block_card(cx))
+                .child(Self::hosts_block_card(cx))
                 .into_any_element(),
             RuntimeTab::Resources => self.resources_card(None, cx),
         };
@@ -4555,7 +4557,7 @@ impl Wisp {
     }
 
     /// The hosts block Wisp manages, as it is on disk.
-    fn hosts_block_card(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn hosts_block_card(cx: &mut Context<Self>) -> AnyElement {
         let header = section_header(
             "Managed entries",
             "The block Wisp owns in the hosts file. Everything else is left alone.",
@@ -4806,7 +4808,8 @@ impl Wisp {
         )
     }
 
-    fn vcrt_banner(&self, vc: u16, cx: &mut Context<Self>) -> impl IntoElement {        let family = if vc >= 17 {
+    fn vcrt_banner(vc: u16, cx: &mut Context<Self>) -> impl IntoElement {
+        let family = if vc >= 17 {
             "Visual C++ 2015\u{2013}2022 x64"
         } else {
             "Visual C++ 2015\u{2013}2019 x64"
@@ -4993,7 +4996,7 @@ impl Wisp {
                             menu = menu.item(
                                 PopupMenuItem::new(release.version.clone()).on_click(move |_, _, cx| {
                                     entity.update(cx, |this, cx| {
-                                        this.install_release(RuntimeKind::Nginx, release.clone(), cx)
+                                        this.install_release(RuntimeKind::Nginx, release.clone(), cx);
                                     });
                                 }),
                             );
@@ -5330,7 +5333,7 @@ fn updates_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
                     .on_click({
                         let entity = entity.clone();
                         move |_, _, cx| {
-                            entity.update(cx, |this, cx| this.install_update(cx));
+                            entity.update(cx, Wisp::install_update);
                         }
                     })
             }
@@ -5395,6 +5398,22 @@ fn project_entry(
     }))
 }
 
+
+/// `part` as a percentage of `whole`, or 0 when `whole` is 0.
+///
+/// Byte counts stay far below the 2^53 where `f64` stops counting exactly, so
+/// the conversion is lossless in practice; the lint cannot know the range.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "memory sizes are far below f64's exact integer range"
+)]
+fn percent_of(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
+}
 
 /// A section title and its one-line description inside a plate.
 fn section_header(title: &str, subtitle: &str, cx: &App) -> impl IntoElement {
@@ -5501,7 +5520,7 @@ fn php_row(
                     .primary()
                     .label(format!("Install {}", release.version))
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.install_release(RuntimeKind::Php, release.clone(), cx)
+                        this.install_release(RuntimeKind::Php, release.clone(), cx);
                     }))
                     .into_any_element()]
             }
@@ -5514,7 +5533,7 @@ fn php_row(
                         .danger()
                         .label("Uninstall")
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.uninstall_runtime(RuntimeKind::Php, version.clone(), cx)
+                            this.uninstall_runtime(RuntimeKind::Php, version.clone(), cx);
                         }))
                         .into_any_element(),
                 ]
@@ -5529,7 +5548,7 @@ fn php_row(
                         .primary()
                         .label(format!("Update to {}", release.version))
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.update_php(current_version.clone(), release.clone(), cx)
+                            this.update_php(current_version.clone(), release.clone(), cx);
                         }))
                         .into_any_element(),
                     Button::new(format!("php-remove2-{line}"))
@@ -5537,7 +5556,7 @@ fn php_row(
                         .danger()
                         .label("Uninstall")
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.uninstall_runtime(RuntimeKind::Php, remove_version.clone(), cx)
+                            this.uninstall_runtime(RuntimeKind::Php, remove_version.clone(), cx);
                         }))
                         .into_any_element(),
                 ]
@@ -5607,7 +5626,7 @@ fn nginx_row(
                 .outline()
                 .label("Use")
                 .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.set_active_nginx(use_version.clone(), cx)
+                    this.set_active_nginx(use_version.clone(), cx);
                 }))
                 .into_any_element()
         };
@@ -5618,7 +5637,7 @@ fn nginx_row(
                 .danger()
                 .label("Uninstall")
                 .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.uninstall_runtime(RuntimeKind::Nginx, remove_version.clone(), cx)
+                    this.uninstall_runtime(RuntimeKind::Nginx, remove_version.clone(), cx);
                 }))
                 .into_any_element(),
         ]
@@ -5703,7 +5722,7 @@ fn project_service_row(
                 .label("Restart")
                 .disabled(busy)
                 .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.restart_service(id, matches!(service, ProjectService::Php), cx)
+                    this.restart_service(id, matches!(service, ProjectService::Php), cx);
                 }))
                 .into_any_element(),
         );
@@ -5974,7 +5993,6 @@ fn metric_sparkline(
 fn ini_editor_body(
     editor: &IniEditor,
     entity: &Entity<Wisp>,
-    wisp: &Wisp,
     project: &Project,
     cx: &App,
 ) -> AnyElement {
@@ -6006,10 +6024,10 @@ fn ini_editor_body(
             .into_any_element(),
         IniView::Generated => code_pane(
             "ini-code",
-            wisp.generated_ini(project, &project.php_ini_overrides),
+            Wisp::generated_ini(project, &project.php_ini_overrides),
             cx,
         ),
-        IniView::Diff => diff_pane(wisp, project, cx),
+        IniView::Diff => diff_pane(project, cx),
     };
 
     div()
@@ -6040,9 +6058,9 @@ fn code_pane(id: &'static str, text: String, cx: &App) -> AnyElement {
 }
 
 /// What the project's overrides change about the generated file.
-fn diff_pane(wisp: &Wisp, project: &Project, cx: &App) -> AnyElement {
-    let base = wisp.generated_ini(project, "");
-    let effective = wisp.generated_ini(project, &project.php_ini_overrides);
+fn diff_pane(project: &Project, cx: &App) -> AnyElement {
+    let base = Wisp::generated_ini(project, "");
+    let effective = Wisp::generated_ini(project, &project.php_ini_overrides);
     let rows = diff_lines(&base, &effective, 3);
 
     if rows.is_empty() {
@@ -6198,7 +6216,7 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
         .on_click({
             let entity = entity.clone();
             move |_, window, cx| {
-                entity.update(cx, |this, cx| this.close_ini_editor(cx));
+                entity.update(cx, Wisp::close_ini_editor);
                 window.close_sheet(cx);
             }
         });
@@ -6209,7 +6227,7 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
         .on_click({
             let entity = entity.clone();
             move |_, window, cx| {
-                let saved = entity.update(cx, |this, cx| this.save_ini_editor(cx));
+                let saved = entity.update(cx, Wisp::save_ini_editor);
                 if saved {
                     window.close_sheet(cx);
                 }
@@ -6252,8 +6270,7 @@ fn editor_form(
     let php_label = editor
         .php_version
         .clone()
-        .map(|version| format!("PHP {version}"))
-        .unwrap_or_else(|| "Choose a version".to_string());
+        .map_or_else(|| "Choose a version".to_string(), |version| format!("PHP {version}"));
 
     let php_menu: AnyElement = if php_versions.is_empty() {
         div()
@@ -6341,7 +6358,7 @@ fn editor_form(
                                 .on_click({
                                     let entity = entity.clone();
                                     move |_, _window, cx| {
-                                        entity.update(cx, |this, cx| this.choose_icon(cx));
+                                        entity.update(cx, Wisp::choose_icon);
                                     }
                                 }),
                         )
@@ -6354,7 +6371,7 @@ fn editor_form(
                                 .on_click({
                                     let entity = entity.clone();
                                     move |_, _window, cx| {
-                                        entity.update(cx, |this, cx| this.remove_icon(cx));
+                                        entity.update(cx, Wisp::remove_icon);
                                     }
                                 }),
                         )
@@ -6434,8 +6451,9 @@ fn editor_form(
                                                             if let Some(editor) =
                                                                 this.editor.as_mut()
                                                             {
-                                                                editor.domain_suffix =
-                                                                    suffix.clone();
+                                                                editor
+                                                                    .domain_suffix
+                                                                    .clone_from(&suffix);
                                                             }
                                                             cx.notify();
                                                         });
@@ -6511,7 +6529,7 @@ fn editor_footer(entity: Entity<Wisp>, is_new: bool) -> impl IntoElement {
         .on_click({
             let entity = entity.clone();
             move |_, window, cx| {
-                entity.update(cx, |this, cx| this.cancel_editor(cx));
+                entity.update(cx, Wisp::cancel_editor);
                 window.close_dialog(cx);
             }
         });
@@ -6520,7 +6538,7 @@ fn editor_footer(entity: Entity<Wisp>, is_new: bool) -> impl IntoElement {
         .label(if is_new { "Create project" } else { "Save changes" })
         .primary()
         .on_click(move |_, window, cx| {
-            let saved = entity.update(cx, |this, cx| this.save_editor(cx));
+            let saved = entity.update(cx, Wisp::save_editor);
             if saved {
                 window.close_dialog(cx);
             }
@@ -6543,7 +6561,7 @@ fn inline_editor_footer(entity: Entity<Wisp>) -> impl IntoElement {
         .on_click({
             let entity = entity.clone();
             move |_, _, cx| {
-                entity.update(cx, |this, cx| this.cancel_editor(cx));
+                entity.update(cx, Wisp::cancel_editor);
             }
         });
 
@@ -6610,7 +6628,7 @@ fn measure_services(
                 if !descends_from(&parent_of, *pid, root) {
                     continue;
                 }
-                cpu += process.cpu_usage() as f64;
+                cpu += f64::from(process.cpu_usage());
                 ram += process.memory();
             }
             (tracked.project, cpu, ram)
@@ -6622,6 +6640,10 @@ fn measure_services(
 ///
 /// A service that is still running keeps its history; a restarted one starts
 /// again, so the line does not jump across the restart.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "megabytes stay far below f64's exact integer range"
+)]
 fn merge_samples(existing: &mut Vec<ServiceSample>, samples: Vec<(Option<i64>, f64, u64)>) {
     let mut fresh = Vec::with_capacity(samples.len());
     for (project, cpu, ram_bytes) in samples {
@@ -6846,7 +6868,9 @@ fn random_token() -> String {
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}{tick:x}")
 }
@@ -6865,7 +6889,8 @@ fn stable_hue(name: &str) -> f32 {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    (hash % 360) as f32 / 360.0
+    let degrees = u16::try_from(hash % 360).expect("a hue is below 360");
+    f32::from(degrees) / 360.0
 }
 
 /// The generated icon: a squircle in a colour derived from the name, carrying
@@ -6880,8 +6905,7 @@ fn generated_icon(name: &str, size: Pixels) -> AnyElement {
         .trim()
         .chars()
         .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string());
+        .map_or_else(|| "?".to_string(), |first| first.to_uppercase().to_string());
     let hue = stable_hue(name);
 
     div()
@@ -7014,7 +7038,7 @@ impl Collapsible for ProjectEntry {
                 collapsed,
                 ..*row
             })),
-            note => note,
+            ProjectEntry::Note(note) => ProjectEntry::Note(note),
         }
     }
 }
@@ -7040,7 +7064,9 @@ impl SidebarItem for ProjectEntry {
     }
 }
 
-fn cx_error() -> Hsla {    rgb(0xEF4444).into()
+#[expect(clippy::unreadable_literal, reason = "hex colour reads as RGB")]
+fn cx_error() -> Hsla {
+    rgb(0xEF4444).into()
 }
 
 fn scheme_prefix(ssl: bool) -> &'static str {
@@ -7262,6 +7288,7 @@ mod tests {
     };
     use crate::update::{REPO_NAME, REPO_OWNER};
     use std::collections::{HashMap, VecDeque};
+    use std::fmt::Write as _;
 
     #[test]
     fn a_cached_version_newer_than_ours_is_offered() {
@@ -7536,7 +7563,10 @@ mod tests {
 
     #[test]
     fn long_runs_are_collapsed_but_the_change_stays_visible() {
-        let base: String = (0..100).map(|n| format!("line {n}\n")).collect();
+        let mut base = String::new();
+        for n in 0..100 {
+            let _ = writeln!(base, "line {n}");
+        }
         let other = format!("{base}max_execution_time = 300");
 
         let rows = diff_lines(&base, &other, 2);
