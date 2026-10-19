@@ -2395,8 +2395,6 @@ impl Wisp {
         self.update = UpdateState::Checking;
         cx.notify();
 
-        let skipped = self.settings.skipped_version.clone();
-
         cx.spawn(async move |entity, cx| {
             let result = cx
                 .background_executor()
@@ -2405,19 +2403,13 @@ impl Wisp {
 
             entity
                 .update(cx, |this, cx| {
-                    this.settings.record_update_check();
                     match result {
                         Ok(Some(version)) => {
                             this.settings.available_version = Some(version.clone());
-                            this.update =
-                                if should_offer_update(manual, &version, skipped.as_deref()) {
-                                    // A fresh check may show the banner again,
-                                    // even if it was dismissed earlier.
-                                    this.update_dismissed = false;
-                                    UpdateState::Available(version)
-                                } else {
-                                    UpdateState::Idle
-                                };
+                            // A fresh check may show the banner again, even if
+                            // it was dismissed earlier in this session.
+                            this.update_dismissed = false;
+                            this.update = UpdateState::Available(version);
                         }
                         Ok(None) => {
                             this.settings.available_version = None;
@@ -2433,9 +2425,20 @@ impl Wisp {
                             }
                         }
                         Err(error) => {
-                            this.update = UpdateState::Idle;
                             if manual {
+                                this.update = UpdateState::Idle;
                                 this.push_toast(ToastKind::Error, error.to_string());
+                            } else if let Some(cached) = this.settings.available_version.clone() {
+                                // Offline launch: keep offering whatever the
+                                // last successful check found.
+                                this.update = if is_newer(&cached, env!("CARGO_PKG_VERSION")) {
+                                    this.update_dismissed = false;
+                                    UpdateState::Available(cached)
+                                } else {
+                                    UpdateState::Idle
+                                };
+                            } else {
+                                this.update = UpdateState::Idle;
                             }
                         }
                     }
@@ -2452,20 +2455,10 @@ impl Wisp {
             cx.background_executor().timer(AUTO_CHECK_DELAY).await;
             entity
                 .update(cx, |this, cx| {
-                    if this.settings.update_check_due() {
-                        this.check_updates(cx, false);
-                        return;
-                    }
-                    let Some(cached) = this.settings.available_version.clone() else {
-                        return;
-                    };
-                    let skipped = this.settings.skipped_version.clone();
-                    if is_newer(&cached, env!("CARGO_PKG_VERSION"))
-                        && should_offer_update(false, &cached, skipped.as_deref())
-                    {
-                        this.update = UpdateState::Available(cached);
-                        cx.notify();
-                    }
+                    // Ask once per launch, not on a daily throttle: a cached
+                    // "no update" from before the latest release must not
+                    // suppress the banner. The result is one small API call.
+                    this.check_updates(cx, false);
                 })
                 .ok();
         })
@@ -7233,10 +7226,6 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn should_offer_update(manual: bool, available: &str, skipped: Option<&str>) -> bool {
-    manual || skipped != Some(available)
-}
-
 /// Whether an edit changes how a project is served, as opposed to a rename.
 fn service_config_changed(before: &Project, after: &Project) -> bool {
     before.app_name != after.app_name
@@ -7284,7 +7273,7 @@ mod tests {
     use super::{
         access_status, descends_from, diff_lines, domain_is_hand_edited, find_ranges, is_newer,
         line_has_level, measure_services, merge_samples, push_capped, service_config_changed,
-        should_offer_update, DiffRow, LogKind, LogLevel, ServiceSample, REPOSITORY_URL,
+        DiffRow, LogKind, LogLevel, ServiceSample, REPOSITORY_URL,
     };
     use crate::update::{REPO_NAME, REPO_OWNER};
     use std::collections::{HashMap, VecDeque};
@@ -7315,26 +7304,6 @@ mod tests {
             format!("https://github.com/{REPO_OWNER}/{REPO_NAME}"),
             "Cargo.toml's repository and the updater's release target must agree"
         );
-    }
-
-    #[test]
-    fn manual_check_offers_any_available_version() {
-        assert!(should_offer_update(true, "0.2.0", None));
-    }
-
-    #[test]
-    fn automatic_check_offers_a_newer_version() {
-        assert!(should_offer_update(false, "0.2.0", Some("0.1.9")));
-    }
-
-    #[test]
-    fn automatic_check_stays_quiet_for_a_skipped_version() {
-        assert!(!should_offer_update(false, "0.2.0", Some("0.2.0")));
-    }
-
-    #[test]
-    fn manual_check_still_offers_a_skipped_version() {
-        assert!(should_offer_update(true, "0.2.0", Some("0.2.0")));
     }
 
     #[test]
