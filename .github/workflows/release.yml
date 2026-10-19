@@ -8,11 +8,23 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+  # Reuse compiled dependencies from the cache `ci.yml` warms on main. A cache
+  # written by a tag cannot be restored by another ref, so release runs read
+  # only.
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_RW_MODE: READ_ONLY
+
 jobs:
   windows:
     runs-on: windows-latest
+    # A cold GPUI build is ~13 minutes; with a warm cache this bounds a hang.
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Full history and tags: the release notes are built from the commits
           # between the previous tag and this one.
@@ -21,8 +33,21 @@ jobs:
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      # Registry and git inputs only. `ci.yml` owns the save; tag refs cannot
+      # warm each other, and restoring a multi-gigabyte target archive costs
+      # more than the compiled objects it replaces.
       - name: Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-cargo
+          shared-key: windows-stable-release
+          cache-targets: false
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Build
         run: cargo build --release --locked
@@ -69,7 +94,7 @@ jobs:
         run: ./scripts/release-notes.ps1
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/wisp-x86_64-pc-windows-msvc.zip

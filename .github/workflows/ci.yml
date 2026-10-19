@@ -1,0 +1,60 @@
+name: ci
+
+# Warms the caches the release build restores. Tag refs cannot write a cache
+# another ref can read, so without this every release started from a cold
+# target directory and spent ~11 minutes compiling the GPUI stack.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # sccache stores individual compiler outputs in the Actions cache, so a
+  # release only recompiles what actually changed. Only the default branch
+  # writes; PRs read its objects.
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+
+# CI never publishes, so superseded runs are safe to cancel.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    # A cold build is ~13 minutes; this bounds a hang rather than estimating.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+
+      # Registry and git inputs only: compiled objects come from sccache, and a
+      # multi-gigabyte target archive costs more to move than it saves.
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-cargo
+          shared-key: windows-stable-release
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
