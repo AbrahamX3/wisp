@@ -56,12 +56,35 @@ unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = 10 }
+# A curated slice of clippy's pedantic group: each one is either a
+# correctness-adjacent check or a rule the codebase already satisfies, so
+# turning it on keeps it that way. The group as a whole stays off: its
+# builder-length and wildcard-import rules fight GPUI's style.
+map_unwrap_or = { level = "deny", priority = 9 }
+unused_self = { level = "deny", priority = 9 }
+redundant_closure_for_method_calls = { level = "deny", priority = 9 }
+format_push_string = { level = "deny", priority = 9 }
+assigning_clones = { level = "deny", priority = 9 }
+needless_raw_string_hashes = { level = "deny", priority = 9 }
+cast_lossless = { level = "deny", priority = 9 }
+doc_markdown = { level = "deny", priority = 9 }
+semicolon_if_nothing_returned = { level = "deny", priority = 9 }
 
 [build-dependencies]
 winresource = "0.1"
 # Rasterises assets/icon.svg into the .ico and tray pixels at build time, so the
 # icon has a single source of truth and no generated binaries are committed.
 resvg = "0.48.1"
+
+# Release: one codegen unit and thin LTO trade a slightly longer CI build for a
+# smaller, faster binary; the symbols are stripped because nothing ships a crash
+# reporter. `panic = "abort"` is deliberately left off: the UI framework catches
+# panics in places, and aborting would turn those into hard exits.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
 
 # Keep framework dependencies optimized in Debug so the app stays responsive
 # while we iterate. This does not make compilation faster.

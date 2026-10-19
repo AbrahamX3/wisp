@@ -5,10 +5,10 @@
 //! whole catalog. If it is missing, `php-cgi.exe` fails to start with an opaque
 //! loader error, which is why Wisp checks up front and offers the installer.
 
-use std::path::PathBuf;
-
 use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
+
+use crate::platform::system32;
 
 /// x64 runtime registration under the 32-bit view, and the native view.
 const KEYS: [&str; 2] = [
@@ -69,13 +69,6 @@ fn parse_version(raw: &str) -> Option<(u32, u32)> {
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
     Some((major, minor))
-}
-
-fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
 }
 
 #[cfg(test)]

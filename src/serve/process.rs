@@ -1,8 +1,10 @@
 //! Spawning and stopping the helper processes (nginx, php-cgi) without ever
 //! flashing a console window.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
+
+use crate::platform::system32;
 
 /// Windows `CREATE_NO_WINDOW`.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -87,13 +89,6 @@ pub fn kill_tree(child: &mut Child) -> std::io::Result<()> {
         Ok(_) => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
 }
 
 // `creation_flags` is provided by the same extension trait used above.

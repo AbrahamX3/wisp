@@ -3,6 +3,7 @@
 //! Everything is written fresh from the database on each sync, so the generated
 //! files are a function of the project records rather than hand-edited state.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::tls::TlsPaths;
@@ -187,7 +188,10 @@ pub fn php_ini(
          extension_dir=\"{extension_dir}\"\n"
     );
     out.push_str(&enable_extensions(template, &lookup_dir));
-    out.push_str(&format!(
+    // Written straight into `out`: a `format!` here would allocate a second
+    // string only to copy it.
+    let _ = write!(
+        out,
         "\n\
 ; ---- Wisp overrides -------------------------------------------------------\n\
 cgi.fix_pathinfo=0\n\
@@ -203,7 +207,7 @@ upload_max_filesize=64M\n\
 post_max_size=64M\n\
 max_execution_time=120\n\
 ",
-    ));
+    );
 
     let overrides = overrides.trim();
     // An older record may hold the placeholder empty object; ignore it.

@@ -37,9 +37,9 @@ pub struct Catalog {
 impl Catalog {
     /// Fetch and parse both indexes. Runs on the background executor.
     pub fn fetch() -> Result<Self> {
-        let releases = download::get_text(PHP_RELEASES)?;
-        let archives = download::get_text(PHP_ARCHIVES)?;
-        let nginx = download::get_text(NGINX_DOWNLOAD)?;
+        let releases = download::fetch_text(PHP_RELEASES)?;
+        let archives = download::fetch_text(PHP_ARCHIVES)?;
+        let nginx = download::fetch_text(NGINX_DOWNLOAD)?;
         Ok(Self {
             php: parse_php(&[(&releases, PHP_RELEASES), (&archives, PHP_ARCHIVES)]),
             nginx: parse_nginx(&nginx),

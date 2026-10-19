@@ -4,6 +4,7 @@
 //! a hosts file, so every project domain is written explicitly. Writing it needs
 //! administrator rights, which is the one thing Wisp elevates for.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 pub const START: &str = "# wisp:start";
@@ -11,10 +12,7 @@ pub const END: &str = "# wisp:end";
 
 /// `%SystemRoot%\System32\drivers\etc\hosts`.
 pub fn hosts_path() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
+    crate::platform::system32()
         .join("drivers")
         .join("etc")
         .join("hosts")
@@ -69,7 +67,8 @@ pub fn apply(existing: &str, domains: &[String]) -> String {
     out.push_str(START);
     out.push_str("\r\n");
     for domain in domains {
-        out.push_str(&format!("127.0.0.1\t{domain}\r\n"));
+        // `write!` into the buffer, not a throwaway `format!` per domain.
+        let _ = write!(out, "127.0.0.1\t{domain}\r\n");
     }
     out.push_str(END);
     out.push_str("\r\n");

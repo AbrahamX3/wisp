@@ -9,6 +9,7 @@ use gpui_kit::component::theme::Theme;
 use gpui_kit::{rgb, App};
 
 /// The icon's teal.
+#[expect(clippy::unreadable_literal, reason = "hex colour reads as RGB")]
 const TEAL: u32 = 0x2DD4BF;
 
 /// Push the brand onto the active theme, and the bundled font.

@@ -105,3 +105,16 @@ pub fn show_window(title: &str, visible: bool) -> bool {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+/// The `System32` directory, from `%SystemRoot%` with the usual fallback.
+///
+/// One definition, because every Windows binary lives there: `schtasks.exe`,
+/// `certutil.exe`, `taskkill.exe` and PowerShell are all looked up through it.
+pub fn system32() -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        )
+        .join("System32")
+}

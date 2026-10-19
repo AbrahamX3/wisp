@@ -77,28 +77,35 @@ fn build_ico(tree: &resvg::usvg::Tree) -> Vec<u8> {
         pngs.push((size, png));
     }
 
-    let header_len = 6 + 16 * pngs.len();
     let mut out = Vec::new();
 
-    // ICONDIR
+    // ICONDIR: the counts and offsets below all come from a handful of frames,
+    // so the narrowing conversions are infallible here by construction.
+    let frame_count = u16::try_from(pngs.len()).expect("the icon has at most 65535 frames");
+    let header_len = 6 + 16 * u32::try_from(pngs.len()).expect("frame count fits u32");
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(&1u16.to_le_bytes()); // type: icon
-    out.extend_from_slice(&(pngs.len() as u16).to_le_bytes()); // image count
+    out.extend_from_slice(&frame_count.to_le_bytes()); // image count
 
     // ICONDIRENTRY per frame.
-    let mut offset = header_len as u32;
+    let mut offset = header_len;
     for (size, png) in &pngs {
         // 256 is encoded as 0 in the single-byte width/height fields.
-        let dimension = if *size >= 256 { 0u8 } else { *size as u8 };
+        let dimension = if *size >= 256 {
+            0
+        } else {
+            u8::try_from(*size).expect("an icon frame is at most 256 px")
+        };
+        let payload = u32::try_from(png.len()).expect("a frame fits u32");
         out.push(dimension); // width
         out.push(dimension); // height
         out.push(0); // colour count (0 = truecolour)
         out.push(0); // reserved
         out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
         out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
-        out.extend_from_slice(&(png.len() as u32).to_le_bytes()); // payload size
+        out.extend_from_slice(&payload.to_le_bytes()); // payload size
         out.extend_from_slice(&offset.to_le_bytes()); // payload offset
-        offset += png.len() as u32;
+        offset += payload;
     }
 
     for (_, png) in &pngs {
@@ -108,6 +115,10 @@ fn build_ico(tree: &resvg::usvg::Tree) -> Vec<u8> {
 }
 
 /// Render the tree into a square pixmap of the given side length.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "icon sizes are small integers, exact in f32"
+)]
 fn render_pixmap(tree: &resvg::usvg::Tree, size: u32) -> resvg::tiny_skia::Pixmap {
     let mut pixmap =
         resvg::tiny_skia::Pixmap::new(size, size).expect("a non-zero pixmap size");
@@ -129,7 +140,10 @@ fn demultiply(rgba: &[u8]) -> Vec<u8> {
         if alpha == 0 {
             out.extend_from_slice(&[0, 0, 0, 0]);
         } else {
-            let straight = |channel: u8| ((channel as u16 * 255) / alpha as u16).min(255) as u8;
+            let straight = |channel: u8| {
+                let value = (u16::from(channel) * 255) / u16::from(alpha);
+                u8::try_from(value.min(255)).expect("clamped to 255")
+            };
             out.extend_from_slice(&[straight(r), straight(g), straight(b), alpha]);
         }
         i += 4;

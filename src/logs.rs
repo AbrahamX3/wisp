@@ -10,7 +10,7 @@ pub fn tail(path: &Path, max_bytes: u64, max_lines: usize) -> Vec<String> {
         return Vec::new();
     };
 
-    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let length = file.metadata().map_or(0, |meta| meta.len());
     let start = length.saturating_sub(max_bytes);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
@@ -35,11 +35,15 @@ pub fn tail(path: &Path, max_bytes: u64, max_lines: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::tail;
+    use std::fmt::Write as _;
 
     #[test]
     fn returns_the_last_lines() {
         let path = std::env::temp_dir().join("wisp-tail-test.log");
-        let body: String = (0..500).map(|n| format!("line {n}\n")).collect();
+        let mut body = String::new();
+        for n in 0..500 {
+            let _ = writeln!(body, "line {n}");
+        }
         std::fs::write(&path, body).unwrap();
 
         let lines = tail(&path, 1024 * 1024, 10);

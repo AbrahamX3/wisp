@@ -62,8 +62,8 @@ pub fn install_dir(kind: RuntimeKind, version: &str) -> PathBuf {
     config::runtimes().join(kind.as_str()).join(version)
 }
 
-/// The PHP FastCGI binary for an installed version. Used once projects start
-/// their own FastCGI worker.
+/// The PHP `FastCGI` binary for an installed version. Used once projects start
+/// their own `FastCGI` worker.
 #[allow(dead_code)]
 pub fn php_cgi(version: &str) -> PathBuf {
     install_dir(RuntimeKind::Php, version).join("php-cgi.exe")
@@ -145,7 +145,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Downloads a full PHP build (~33 MB) and checks the FastCGI binary lands.
+    /// Downloads a full PHP build (~33 MB) and checks the `FastCGI` binary lands.
     /// Ignored by default; run with `cargo test -- --ignored`.
     #[test]
     #[ignore = "downloads ~33 MB from the network"]

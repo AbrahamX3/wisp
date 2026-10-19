@@ -177,7 +177,7 @@ fn temp_out_path() -> PathBuf {
     std::env::temp_dir().join(format!("wisp-ctl-{}-{nanos}.json", std::process::id()))
 }
 
-/// ERROR_CANCELLED (1223) means the user clicked "No" on the UAC prompt.
+/// `ERROR_CANCELLED` (1223) means the user clicked "No" on the UAC prompt.
 fn is_uac_cancelled(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(1223) || err.to_string().to_lowercase().contains("cancel")
 }

@@ -17,7 +17,7 @@ pub enum DownloadError {
 pub type Result<T> = std::result::Result<T, DownloadError>;
 
 /// GET a small text document (a directory listing).
-pub fn get_text(url: &str) -> Result<String> {
+pub fn fetch_text(url: &str) -> Result<String> {
     let mut response = ureq::get(url)
         .call()
         .map_err(|error| http_error(url, error))?;
@@ -66,7 +66,14 @@ pub fn download_to_reporting(
             )));
         }
         if let Some(expected) = expected {
-            progress((bytes.len() as f32 / expected as f32).min(1.0));
+            // Integer math first: a 33 MB build already exceeds f32's exact
+            // integer range, so dividing in floats first would make the last
+            // tenth of the bar stutter. `u16` keeps the conversion exact.
+            let done = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let per_cent = u16::try_from(done.saturating_mul(100) / expected)
+                .unwrap_or(100)
+                .min(100);
+            progress(f32::from(per_cent) / 100.0);
         }
     }
     progress(1.0);

@@ -14,6 +14,7 @@ use rcgen::{
 };
 
 use crate::config;
+use crate::platform::system32;
 use time::Duration;
 
 /// The current time, as the certificate types want it.
@@ -167,13 +168,6 @@ pub fn trust_ca() -> Result<()> {
             status.code().unwrap_or(-1)
         )))
     }
-}
-
-fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The schema. `IF NOT EXISTS` keeps this idempotent; a real migration runner
 /// arrives when the first breaking change does.
-const SCHEMA: &str = r#"
+const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS projects (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     name               TEXT    NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS runtimes (
     installed_at INTEGER NOT NULL,
     PRIMARY KEY (kind, version)
 );
-"#;
+";
 
 /// Handle to the on-disk database.
 #[derive(Debug, Clone)]
