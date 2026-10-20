@@ -57,6 +57,7 @@ use crate::elevation::{self, ActionOutcome, ControlMode};
 use crate::helper_task::{self, TaskError};
 use crate::hosts;
 use crate::logs;
+use crate::mcp;
 use crate::platform;
 use crate::runtime::{self, catalog::Catalog, catalog::Release, RuntimeKind};
 use crate::serve::{self, SiteSpec};
@@ -299,6 +300,57 @@ struct IniEditor {
     _subscriptions: Vec<Subscription>,
 }
 
+/// A failure the MCP bridge can show to the model.
+struct McpFailure {
+    /// Stable machine-readable kind (`not_found`, `invalid_params`, ...).
+    code: &'static str,
+    message: String,
+}
+
+impl McpFailure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new("not_found", message)
+    }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self::new("internal", error.to_string())
+    }
+}
+
+type McpResult<T = serde_json::Value> = std::result::Result<T, McpFailure>;
+
+/// Parse tool arguments at the boundary, so a bad call names every field.
+fn parse_mcp<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> McpResult<T> {
+    serde_json::from_value(params)
+        .map_err(|error| McpFailure::new("invalid_params", format!("Invalid arguments: {error}")))
+}
+
+fn mcp_db_error(error: db::Error) -> McpFailure {
+    match error {
+        db::Error::Validation(message) => McpFailure::new("invalid_params", message),
+        db::Error::DomainTaken(domain) => McpFailure::new(
+            "conflict",
+            format!("Another project already uses \"{domain}\"."),
+        ),
+        db::Error::Sqlite(error) => McpFailure::internal(error),
+    }
+}
+
+fn mcp_mode_name(mode: ControlMode) -> &'static str {
+    match mode {
+        ControlMode::Elevated => "elevated",
+        ControlMode::Task => "task",
+        ControlMode::Uac => "uac",
+    }
+}
+
 /// One row of the php.ini diff.
 enum DiffRow {
     /// A line both sides share.
@@ -405,6 +457,16 @@ pub struct Wisp {
     onboarding_nginx_combo: Option<Entity<ComboboxState<SearchableVec<String>>>>,
     /// Subscriptions held for their lifetime: dropping one stops its callback.
     subscriptions: Vec<Subscription>,
+
+    /// The loopback MCP listener while the setting is on.
+    mcp_endpoint: Option<mcp::endpoint::Endpoint>,
+    /// Feeds endpoint requests to the UI thread.
+    mcp_requests: Option<async_channel::Sender<mcp::endpoint::Incoming>>,
+    /// The last runtime install/removal failure, so the MCP bridge can report
+    /// why an install it waited for did not produce the expected version.
+    last_install_error: Option<String>,
+    /// Whether a hosts-file write is waiting on (or running under) elevation.
+    hosts_busy: bool,
 }
 
 impl Wisp {
@@ -504,7 +566,35 @@ impl Wisp {
             onboarding_php_combo: None,
             onboarding_nginx_combo: None,
             subscriptions: _subscriptions,
+            mcp_endpoint: None,
+            mcp_requests: None,
+            last_install_error: None,
+            hosts_busy: false,
         };
+
+        // MCP requests arrive on a background listener thread. `async_channel`
+        // wakes this task; `entity.update` then runs the handler on the UI
+        // thread, where all of the project and process state lives.
+        let (mcp_requests, mcp_incoming) =
+            async_channel::unbounded::<mcp::endpoint::Incoming>();
+        cx.spawn(async move |entity, cx| {
+            while let Ok(job) = mcp_incoming.recv().await {
+                let applied = entity.update(cx, |this, cx| this.handle_mcp(job.request, cx));
+                match applied {
+                    Ok(response) => {
+                        let _ = job.reply.send(response);
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+        this.mcp_requests = Some(mcp_requests);
+        if !this.settings.mcp_enabled {
+            // A previous run may have left its credentials behind.
+            mcp::endpoint::remove_discovery();
+        }
+
         this.reload(cx);
         // Show the first project on launch rather than an empty pane.
         if this.selected.is_none() {
@@ -525,6 +615,12 @@ impl Wisp {
         cx.set_global(tray::TrayHooks(Some(Box::new(move |request, cx| {
             let _ = weak.update(cx, |this, cx| this.handle_tray(request, cx));
         }))));
+
+        // Advertise the endpoint last: an auto-launched bridge must not see
+        // `mcp.json` before the project list and runtimes are loaded.
+        if this.settings.mcp_enabled {
+            this.start_mcp(cx);
+        }
 
         this
     }
@@ -1297,6 +1393,7 @@ impl Wisp {
         }
         let key = format!("{}/{}", kind.as_str(), release.version);
         self.busy_runtime = Some(key);
+        self.last_install_error = None;
         let progress = Arc::new(Mutex::new(0.0_f32));
         self.busy_progress = Some(progress.clone());
         cx.notify();
@@ -1338,6 +1435,7 @@ impl Wisp {
                             );
                         }
                         Err(error) => {
+                            this.last_install_error = Some(error.to_string());
                             this.push_toast(ToastKind::Error, error.to_string());
                         }
                     }
@@ -1423,6 +1521,7 @@ impl Wisp {
         }
         let key = format!("{}/{version}", kind.as_str());
         self.busy_runtime = Some(key);
+        self.last_install_error = None;
         cx.notify();
 
         let removing = version.clone();
@@ -1453,6 +1552,7 @@ impl Wisp {
                             );
                         }
                         Err(error) => {
+                            this.last_install_error = Some(error.to_string());
                             this.push_toast(ToastKind::Error, error.to_string());
                         }
                     }
@@ -1758,6 +1858,8 @@ impl Wisp {
         }
 
         let to_write = domains.clone();
+        self.hosts_busy = true;
+        cx.notify();
         cx.spawn(async move |entity, cx| {
             let outcome = cx
                 .background_executor()
@@ -1765,6 +1867,7 @@ impl Wisp {
                 .await;
             entity
                 .update(cx, |this, cx| {
+                    this.hosts_busy = false;
                     match outcome {
                         ActionOutcome::Done => {
                             let should_report = this.hosts_written.is_empty() && !domains.is_empty();
@@ -2286,6 +2389,7 @@ impl Wisp {
         let settings = SettingsView::new("wisp-settings").pages([
             general_settings_page(&entity),
             hosting_settings_page(&entity, self),
+            mcp_settings_page(&entity, self),
             updates_settings_page(&entity, self),
             about_settings_page(),
         ]);
@@ -2384,6 +2488,65 @@ impl Wisp {
     }
 
     // ---- updates ---------------------------------------------------------
+
+    // ---- MCP -------------------------------------------------------------
+
+    /// Start the loopback endpoint if it is not already running.
+    fn start_mcp(&mut self, cx: &mut Context<Self>) {
+        if self.mcp_endpoint.is_some() {
+            return;
+        }
+        let Some(requests) = self.mcp_requests.clone() else {
+            self.push_toast(
+                ToastKind::Error,
+                "The MCP request queue is unavailable.".to_string(),
+            );
+            return;
+        };
+        match mcp::endpoint::Endpoint::start(requests) {
+            Ok(endpoint) => {
+                self.mcp_endpoint = Some(endpoint);
+                cx.notify();
+            }
+            Err(error) => {
+                self.push_toast(
+                    ToastKind::Error,
+                    format!("Could not start the MCP server: {error}"),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    /// Drop the endpoint (which removes `mcp.json` and closes the port).
+    fn stop_mcp(&mut self) {
+        // Dropping the endpoint stops its listener and deletes the discovery
+        // file; there is no separate shutdown call.
+        self.mcp_endpoint = None;
+    }
+
+    fn set_mcp_enabled(&mut self, wanted: bool, cx: &mut Context<Self>) {
+        if wanted == self.settings.mcp_enabled {
+            return;
+        }
+        self.settings.mcp_enabled = wanted;
+        self.settings.save();
+        if wanted {
+            self.start_mcp(cx);
+        } else {
+            self.stop_mcp();
+        }
+        self.push_toast(
+            ToastKind::Success,
+            if wanted {
+                "Local MCP server is on \u{2014} CLI agents can now connect."
+            } else {
+                "Local MCP server is off."
+            }
+            .to_string(),
+        );
+        cx.notify();
+    }
 
     fn check_updates(&mut self, cx: &mut Context<Self>, manual: bool) {
         if matches!(
@@ -5023,6 +5186,1327 @@ impl Wisp {
                 ),
         )
     }
+
+    // ---- MCP requests ----------------------------------------------------
+
+    /// Dispatch one request from the loopback endpoint on the UI thread.
+    fn handle_mcp(
+        &mut self,
+        request: mcp::protocol::Request,
+        cx: &mut Context<Self>,
+    ) -> mcp::protocol::Response {
+        let mcp::protocol::Request {
+            id, method, params, ..
+        } = request;
+        let params = if params.is_null() {
+            serde_json::json!({})
+        } else {
+            params
+        };
+        match self.dispatch_mcp(&method, params, cx) {
+            Ok(result) => mcp::protocol::Response::ok(id, result),
+            Err(error) => mcp::protocol::Response::err(id, error.code, error.message),
+        }
+    }
+
+    fn dispatch_mcp(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        match method {
+            // ---- read ----------------------------------------------------
+            "ping" => Ok(serde_json::json!({
+                "ok": true,
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
+            })),
+            "wisp_status" => Ok(self.mcp_status()),
+            "get_operation_state" => Ok(self.mcp_operation_state()),
+            "list_projects" => Ok(serde_json::Value::Array(
+                self.projects
+                    .iter()
+                    .map(|project| self.mcp_project_json(project))
+                    .collect(),
+            )),
+            "get_project" => {
+                let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
+                let project = self.mcp_find(&args.project)?.clone();
+                Ok(self.mcp_project_detail(&project))
+            }
+            "list_runtimes" => Ok(self.mcp_runtimes()),
+            "list_available_runtimes" => Ok(self.mcp_available_runtimes(cx)),
+            "get_certificates" => Ok(self.mcp_certificates()),
+            "get_hosts_block" => Self::mcp_hosts_block(),
+            "read_log" => self.mcp_read_log(params),
+            "get_resources" => self.mcp_resources(params),
+            "get_php_ini" => self.mcp_php_ini(params),
+            "read_nginx_config" => self.mcp_nginx_config(params),
+            "get_config_paths" => Ok(self.mcp_config_paths()),
+            "get_settings" => Ok(self.mcp_settings()),
+
+            // ---- act -----------------------------------------------------
+            "start_project" => self.mcp_start_project(params, cx),
+            "stop_project" => self.mcp_stop_project(params, cx),
+            "restart_project" => self.mcp_restart_project(params, cx),
+            "set_service" => self.mcp_set_service(params, cx),
+            "all_services" => self.mcp_all_services(params, cx),
+            "install_runtime" => self.mcp_install_runtime(params, cx),
+            "uninstall_runtime" => self.mcp_uninstall_runtime(params, cx),
+            "set_active_nginx" => self.mcp_set_active_nginx(params, cx),
+            "set_project_php" => self.mcp_set_project_php(params, cx),
+            "set_project_https" => self.mcp_set_project_https(params, cx),
+            "set_php_ini_overrides" => self.mcp_set_php_ini(params, cx),
+            "reset_php_ini" => self.mcp_set_php_ini(
+                serde_json::json!({
+                    "project": parse_mcp::<mcp::protocol::ProjectOnlyParams>(params)?.project,
+                    "overrides": "",
+                }),
+                cx,
+            ),
+            "repair_hosts" => self.mcp_repair_hosts(cx),
+            "trust_ca" => self.mcp_trust_ca(cx),
+            "create_project" => self.mcp_create_project(params, cx),
+            "update_project" => self.mcp_update_project(params, cx),
+            "delete_project" => self.mcp_delete_project(params, cx),
+
+            other => Err(McpFailure::new(
+                "method_not_found",
+                format!("Unknown MCP method \"{other}\"."),
+            )),
+        }
+    }
+
+    fn mcp_find(&self, key: &str) -> Result<&Project, McpFailure> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(McpFailure::new("invalid_params", "A project is required."));
+        }
+        if let Ok(id) = key.parse::<i64>() {
+            if let Some(project) = self.projects.iter().find(|project| project.id == id) {
+                return Ok(project);
+            }
+        }
+        let needle = key.to_lowercase();
+        let matches: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|project| {
+                project.name.to_lowercase() == needle
+                    || project.domain.to_lowercase() == needle
+                    || project.slug().to_lowercase() == needle
+            })
+            .collect();
+        match matches.len() {
+            1 => Ok(matches[0]),
+            0 => Err(McpFailure::not_found(format!(
+                "No project matches \"{key}\". {}",
+                self.mcp_project_names()
+            ))),
+            _ => Err(McpFailure::new(
+                "ambiguous",
+                format!(
+                    "\"{key}\" matches more than one project: {}. Use the numeric id.",
+                    matches
+                        .iter()
+                        .map(|project| format!("#{} ({})", project.id, project.domain))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+
+    fn mcp_project_names(&self) -> String {
+        if self.projects.is_empty() {
+            return "There are no projects yet.".to_string();
+        }
+        format!(
+            "Projects: {}.",
+            self.projects
+                .iter()
+                .map(|project| format!("#{} {}", project.id, project.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    fn mcp_project_json(&self, project: &Project) -> serde_json::Value {
+        let (nginx, php) = self.project_state(project.id);
+        serde_json::json!({
+            "id": project.id,
+            "name": project.name,
+            "slug": project.slug(),
+            "app_name": project.app_name,
+            "domain": project.domain,
+            "url": format!(
+                "{}://{}/",
+                if project.ssl_enabled { "https" } else { "http" },
+                project.domain
+            ),
+            "root_path": project.root_path,
+            "root_exists": std::path::Path::new(&project.root_path).is_dir(),
+            "php_version": project.php_version,
+            "ssl_enabled": project.ssl_enabled,
+            "nginx": nginx,
+            "php": php,
+            "running": nginx || php,
+            "php_ini_overrides": project.php_ini_overrides,
+        })
+    }
+
+    fn mcp_project_detail(&self, project: &Project) -> serde_json::Value {
+        let mut value = self.mcp_project_json(project);
+        let slug = project.slug();
+        let site_dir = serve::config::site_dir(&slug);
+        let docroot = serve::config::resolve_docroot(std::path::Path::new(&project.root_path));
+        let vhost = self.settings.active_nginx.as_deref().map(|version| {
+            serve::config::vhosts_dir(&serve::config::nginx_prefix(version))
+                .join(format!("{slug}.conf"))
+                .to_string_lossy()
+                .to_string()
+        });
+        let certificate = if project.ssl_enabled {
+            let paths = tls::paths_for(&project.domain);
+            let expiry = tls::expiry(&project.domain);
+            Some(serde_json::json!({
+                "cert_path": paths.cert.to_string_lossy(),
+                "key_path": paths.key.to_string_lossy(),
+                "ready": paths.is_ready(),
+                "expires_at": expiry.and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339).ok()
+                }),
+                "days_left": expiry.map(|at| {
+                    (at - time::OffsetDateTime::now_utc()).whole_days()
+                }),
+            }))
+        } else {
+            None
+        };
+
+        if let Some(object) = value.as_object_mut() {
+            // The bridge probes this URL itself; it needs the real HTTP port,
+            // which can differ from 80 when WISP_HTTP_PORT is set.
+            let scheme = if project.ssl_enabled { "https" } else { "http" };
+            let port = if project.ssl_enabled {
+                443
+            } else {
+                serve::config::http_port()
+            };
+            let port_suffix = if (project.ssl_enabled && port == 443)
+                || (!project.ssl_enabled && port == 80)
+            {
+                String::new()
+            } else {
+                format!(":{port}")
+            };
+            object.insert(
+                "probe_url".into(),
+                serde_json::json!(format!("{scheme}://{}{port_suffix}/", project.domain)),
+            );
+            object.insert(
+                "docroot".into(),
+                serde_json::json!(docroot.to_string_lossy()),
+            );
+            object.insert(
+                "paths".into(),
+                serde_json::json!({
+                    "site": site_dir.to_string_lossy(),
+                    "logs": serve::config::site_logs(&slug).to_string_lossy(),
+                    "php_ini": site_dir.join("php.ini").to_string_lossy(),
+                    "vhost": vhost,
+                }),
+            );
+            object.insert(
+                "certificate".into(),
+                certificate.unwrap_or(serde_json::Value::Null),
+            );
+        }
+        value
+    }
+
+    fn mcp_status(&self) -> serde_json::Value {
+        let running = self
+            .projects
+            .iter()
+            .filter(|project| {
+                let (nginx, php) = self.project_state(project.id);
+                nginx || php
+            })
+            .count();
+        serde_json::json!({
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "mcp": {
+                "enabled": self.settings.mcp_enabled,
+                "port": self.mcp_endpoint.as_ref().map(mcp::endpoint::Endpoint::port),
+            },
+            "onboarding_complete": self.settings.onboarding_complete,
+            "ca_trusted": self.settings.ca_trusted,
+            "nginx": {
+                "running": self.serve_status.nginx_running,
+                "active_version": self.settings.active_nginx,
+            },
+            "projects": {
+                "total": self.projects.len(),
+                "running": running,
+            },
+            "serve_busy": self.serve_busy,
+            "serve_error": self.serve_error,
+            "hosts": {
+                "mode": mcp_mode_name(self.mode),
+                "busy": self.hosts_busy,
+                "error": self.hosts_error,
+            },
+            "trust_busy": self.trust_busy,
+            "install": {
+                "busy": self.busy_runtime,
+                "progress": self.current_progress(),
+                "last_error": self.last_install_error,
+            },
+            "catalog": {
+                "loaded": self.catalog.is_some(),
+                "loading": self.catalog_loading,
+                "error": self.catalog_error,
+                "fetched_at": self.catalog_fetched_at,
+            },
+            "available_version": self.settings.available_version,
+        })
+    }
+
+    fn mcp_operation_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "serve_busy": self.serve_busy,
+            "serve_error": self.serve_error,
+            "hosts_busy": self.hosts_busy,
+            "hosts_error": self.hosts_error,
+            "elevation_busy": self.elevation_busy,
+            "trust_busy": self.trust_busy,
+            "busy_runtime": self.busy_runtime,
+            "progress": self.current_progress(),
+            "last_install_error": self.last_install_error,
+            "catalog_loading": self.catalog_loading,
+        })
+    }
+
+    fn mcp_installed(&self, kind: RuntimeKind) -> Vec<serde_json::Value> {
+        self.installed(kind)
+            .into_iter()
+            .map(|runtime| {
+                serde_json::json!({
+                    "version": runtime.version,
+                    "line": runtime.line(),
+                    "path": runtime.path,
+                })
+            })
+            .collect()
+    }
+
+    fn mcp_runtimes(&self) -> serde_json::Value {
+        serde_json::json!({
+            "active_nginx": self.settings.active_nginx,
+            "php": self.mcp_installed(RuntimeKind::Php),
+            "nginx": self.mcp_installed(RuntimeKind::Nginx),
+        })
+    }
+
+    fn mcp_available_runtimes(&mut self, cx: &mut Context<Self>) -> serde_json::Value {
+        if self.catalog.is_none() && !self.catalog_loading && self.catalog_error.is_none() {
+            self.load_catalog(cx);
+        }
+        let php: Vec<serde_json::Value> = self
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .php
+                    .iter()
+                    .map(|release| {
+                        let installed = self.runtimes.iter().any(|runtime| {
+                            runtime.kind == "php" && runtime.version == release.version
+                        });
+                        serde_json::json!({
+                            "version": release.version,
+                            "vc": release.vc,
+                            "installed": installed,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let nginx: Vec<serde_json::Value> = self
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .nginx
+                    .iter()
+                    .map(|release| {
+                        let installed = self.runtimes.iter().any(|runtime| {
+                            runtime.kind == "nginx" && runtime.version == release.version
+                        });
+                        serde_json::json!({
+                            "version": release.version,
+                            "installed": installed,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_json::json!({
+            "loaded": self.catalog.is_some(),
+            "loading": self.catalog_loading,
+            "error": self.catalog_error,
+            "fetched_at": self.catalog_fetched_at,
+            "stale": self.catalog_is_stale(),
+            "php": php,
+            "nginx": nginx,
+        })
+    }
+
+    fn mcp_certificates(&self) -> serde_json::Value {
+        let certificates: Vec<serde_json::Value> = self
+            .projects
+            .iter()
+            .filter(|project| project.ssl_enabled)
+            .map(|project| {
+                let paths = tls::paths_for(&project.domain);
+                let expiry = tls::expiry(&project.domain);
+                serde_json::json!({
+                    "project_id": project.id,
+                    "project": project.name,
+                    "domain": project.domain,
+                    "cert_path": paths.cert.to_string_lossy(),
+                    "key_path": paths.key.to_string_lossy(),
+                    "ready": paths.is_ready(),
+                    "expires_at": expiry.and_then(|at| {
+                        at.format(&time::format_description::well_known::Rfc3339).ok()
+                    }),
+                    "days_left": expiry.map(|at| {
+                        (at - time::OffsetDateTime::now_utc()).whole_days()
+                    }),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "ca": {
+                "path": tls::ca_cert().to_string_lossy(),
+                "exists": tls::ca_cert().is_file(),
+                "trusted": self.settings.ca_trusted,
+            },
+            "certificates": certificates,
+        })
+    }
+
+    fn mcp_hosts_block() -> McpResult {
+        let contents = hosts::read().map_err(McpFailure::internal)?;
+        let mut present = false;
+        let mut in_block = false;
+        let mut block = Vec::new();
+        let mut entries = Vec::new();
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed == hosts::START {
+                present = true;
+                in_block = true;
+                continue;
+            }
+            if trimmed == hosts::END {
+                in_block = false;
+                continue;
+            }
+            if in_block {
+                block.push(line);
+                let mut fields = line.split_whitespace();
+                if let (Some(ip), Some(domain)) = (fields.next(), fields.next()) {
+                    entries.push(serde_json::json!({ "ip": ip, "domain": domain }));
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "path": hosts::hosts_path().to_string_lossy(),
+            "present": present,
+            "block": block.join("\r\n"),
+            "entries": entries,
+        }))
+    }
+
+    fn mcp_read_log(&self, params: serde_json::Value) -> McpResult {
+        let args: mcp::protocol::ReadLogParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?;
+        let (kind, file) = match args.kind {
+            mcp::protocol::LogKindParam::Access => ("access", "access.log"),
+            mcp::protocol::LogKindParam::Error => ("error", "error.log"),
+            mcp::protocol::LogKindParam::Php => ("php", "php-error.log"),
+            mcp::protocol::LogKindParam::Worker => ("worker", "php-cgi.log"),
+        };
+        let path = serve::config::site_logs(&project.slug()).join(file);
+
+        // A grep is applied to a generous window before the caller's line limit,
+        // otherwise a match older than the last 200 lines would look absent.
+        let scanned_lines = logs::tail(&path, 4 * 1024 * 1024, 20_000);
+        let scanned = scanned_lines.len();
+
+        let level = match args.level.as_deref() {
+            None | Some("") | Some("all") => None,
+            Some("error" | "fatal") => Some(LogLevel::Fatal),
+            Some("warning" | "warn") => Some(LogLevel::Warning),
+            Some("notice" | "info" | "deprecated") => Some(LogLevel::Notice),
+            Some("4xx") => Some(LogLevel::Client),
+            Some("5xx") => Some(LogLevel::Server),
+            Some(other) => {
+                return Err(McpFailure::new(
+                    "invalid_params",
+                    format!(
+                        "Unknown level \"{other}\". Use fatal, warning, notice, 4xx, 5xx, or all."
+                    ),
+                ));
+            }
+        };
+        let needle = args.grep.filter(|grep| !grep.is_empty());
+        let needle = needle.map(|needle| {
+            if args.case_sensitive {
+                needle
+            } else {
+                needle.to_lowercase()
+            }
+        });
+
+        let filtered: Vec<String> = scanned_lines
+            .into_iter()
+            .filter(|line| level.is_none_or(|level| line_has_level(line, level)))
+            .filter(|line| {
+                let Some(needle) = needle.as_deref() else {
+                    return true;
+                };
+                if args.case_sensitive {
+                    line.contains(needle)
+                } else {
+                    line.to_lowercase().contains(needle)
+                }
+            })
+            .collect();
+
+        let limit = args.lines.clamp(1, 2000) as usize;
+        let start = filtered.len().saturating_sub(limit);
+        let mut lines = filtered[start..].to_vec();
+        // Some Windows editors write a UTF-8 BOM; it is not log content.
+        if let Some(first) = lines.first_mut() {
+            if let Some(stripped) = first.strip_prefix('\u{FEFF}') {
+                *first = stripped.to_string();
+            }
+        }
+        let mut filter = Vec::new();
+        if let Some(needle) = needle.as_deref() {
+            filter.push(format!("grep=\"{needle}\""));
+        }
+        if let Some(level) = args.level.as_deref().filter(|level| !level.is_empty()) {
+            filter.push(format!("level={level}"));
+        }
+
+        Ok(serde_json::json!({
+            "project": project.name,
+            "kind": kind,
+            "path": path.to_string_lossy(),
+            "exists": path.is_file(),
+            "scanned": scanned,
+            "matched": filtered.len(),
+            "shown": lines.len(),
+            "filter": if filter.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(filter.join(" "))
+            },
+            "lines": lines,
+        }))
+    }
+
+    fn mcp_resources(&self, params: serde_json::Value) -> McpResult {
+        let args: mcp::protocol::GetResourcesParams = parse_mcp(params)?;
+        let only = match args.project.as_deref() {
+            Some(key) => Some(self.mcp_find(key)?.id),
+            None => None,
+        };
+        let services: Vec<serde_json::Value> = self
+            .service_metrics
+            .iter()
+            .filter(|sample| only.is_none_or(|id| sample.project == Some(id)))
+            .map(|sample| {
+                let (name, kind) = match sample.project {
+                    None => ("nginx".to_string(), "nginx"),
+                    Some(id) => (
+                        self.projects
+                            .iter()
+                            .find(|project| project.id == id)
+                            .map_or_else(|| format!("project {id}"), |project| project.name.clone()),
+                        "php",
+                    ),
+                };
+                serde_json::json!({
+                    "name": name,
+                    "kind": kind,
+                    "project_id": sample.project,
+                    "cpu_percent": sample.cpu,
+                    "ram_mb": sample.ram_bytes as f64 / (1024.0 * 1024.0),
+                    "cpu_history": sample.cpu_history,
+                    "ram_history": sample.ram_history,
+                })
+            })
+            .collect();
+        let (cpu, ram) = self
+            .machine_metrics
+            .back()
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        Ok(serde_json::json!({
+            "machine": {
+                "cpu_percent": cpu,
+                "ram_percent": ram,
+                "cpu_history": self.machine_metrics.iter().map(|(cpu, _)| *cpu).collect::<Vec<_>>(),
+            },
+            "services": services,
+        }))
+    }
+
+    fn mcp_php_ini(&self, params: serde_json::Value) -> McpResult {
+        let args: mcp::protocol::GetPhpIniParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        let path = serve::config::site_dir(&project.slug()).join("php.ini");
+        let generated = Self::generated_ini(&project, "");
+        let effective = Self::generated_ini(&project, &project.php_ini_overrides);
+        // The full file is mostly PHP's stock template; the diff is the part
+        // that answers "is this setting actually in effect?".
+        let diff: Vec<serde_json::Value> = diff_lines(&generated, &effective, 0)
+            .into_iter()
+            .filter_map(|row| match row {
+                // The append separator before a project block is not content.
+                DiffRow::Added(line) if line.trim().is_empty() => None,
+                DiffRow::Added(line) => {
+                    Some(serde_json::json!({ "change": "added", "line": line }))
+                }
+                DiffRow::Removed(line) => {
+                    Some(serde_json::json!({ "change": "removed", "line": line }))
+                }
+                DiffRow::Same(_) | DiffRow::Skipped(_) => None,
+            })
+            .collect();
+        let mut value = serde_json::json!({
+            "project": project.name,
+            "php_version": project.php_version,
+            "path": path.to_string_lossy(),
+            "exists": path.is_file(),
+            "overrides": project.php_ini_overrides,
+            "generated_lines": generated.lines().count(),
+            "effective_lines": effective.lines().count(),
+            "diff": diff,
+            "note": if project.php_version.is_none() {
+                serde_json::Value::String(
+                    "This project has no PHP version, so no php.ini is generated.".to_string(),
+                )
+            } else {
+                serde_json::Value::Null
+            },
+        });
+        if args.full {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "effective".into(),
+                    serde_json::Value::String(effective),
+                );
+            }
+        }
+        Ok(value)
+    }
+
+    fn mcp_nginx_config(&self, params: serde_json::Value) -> McpResult {
+        let args: mcp::protocol::ProjectOnlyParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?;
+        let Some(version) = self.settings.active_nginx.as_deref() else {
+            return Err(McpFailure::not_found(
+                "No active nginx version is set. Install and activate one first.",
+            ));
+        };
+        let path = serve::config::vhosts_dir(&serve::config::nginx_prefix(version))
+            .join(format!("{}.conf", project.slug()));
+        let contents = if path.is_file() {
+            std::fs::read_to_string(&path).map_err(McpFailure::internal)?
+        } else {
+            String::new()
+        };
+        Ok(serde_json::json!({
+            "project": project.name,
+            "path": path.to_string_lossy(),
+            "exists": path.is_file(),
+            "contents": contents,
+        }))
+    }
+
+    fn mcp_config_paths(&self) -> serde_json::Value {
+        let nginx_config = self.settings.active_nginx.as_deref().map(|version| {
+            serve::config::main_config_path(&serve::config::nginx_prefix(version))
+                .to_string_lossy()
+                .to_string()
+        });
+        serde_json::json!({
+            "root": crate::config::root().to_string_lossy(),
+            "database": crate::config::database().to_string_lossy(),
+            "runtimes": crate::config::runtimes().to_string_lossy(),
+            "nginx": crate::config::nginx().to_string_lossy(),
+            "sites": crate::config::sites().to_string_lossy(),
+            "certs": crate::config::certs().to_string_lossy(),
+            "ca": crate::config::ca().to_string_lossy(),
+            "hosts": hosts::hosts_path().to_string_lossy(),
+            "mcp_discovery": mcp::endpoint::discovery_path().to_string_lossy(),
+            "nginx_config": nginx_config,
+        })
+    }
+
+    fn mcp_settings(&self) -> serde_json::Value {
+        serde_json::json!({
+            "theme": match self.settings.theme {
+                ThemePreference::System => "system",
+                ThemePreference::Light => "light",
+                ThemePreference::Dark => "dark",
+            },
+            "background": self.settings.background,
+            "autostart": self.autostart,
+            "active_nginx": self.settings.active_nginx,
+            "ca_trusted": self.settings.ca_trusted,
+            "mcp_enabled": self.settings.mcp_enabled,
+            "onboarding_complete": self.settings.onboarding_complete,
+            "hosts_mode": mcp_mode_name(self.mode),
+            "available_version": self.settings.available_version,
+        })
+    }
+
+    // ---- MCP actions -----------------------------------------------------
+
+    fn mcp_require_idle(&self) -> Result<(), McpFailure> {
+        if self.serve_busy {
+            return Err(McpFailure::new(
+                "busy",
+                "Wisp is finishing another service operation; retry in a moment.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn mcp_require_php(project: &Project) -> Result<(), McpFailure> {
+        let Some(version) = project
+            .php_version
+            .as_deref()
+            .filter(|version| !version.is_empty())
+        else {
+            return Err(McpFailure::new(
+                "invalid_state",
+                format!(
+                    "\"{}\" has no PHP version set. Use set_project_php first.",
+                    project.name
+                ),
+            ));
+        };
+        if !runtime::php_cgi(version).is_file() {
+            return Err(McpFailure::new(
+                "invalid_state",
+                format!(
+                    "PHP {version} is not installed (needed by \"{}\"). Install it with install_runtime.",
+                    project.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mcp_installed_hint(&self, kind: RuntimeKind) -> String {
+        let installed: Vec<String> = self
+            .installed(kind)
+            .into_iter()
+            .map(|runtime| runtime.version)
+            .collect();
+        if installed.is_empty() {
+            "No versions are installed.".to_string()
+        } else {
+            format!("Installed: {}.", installed.join(", "))
+        }
+    }
+
+    fn mcp_latest_versions(&self, kind: RuntimeKind) -> String {
+        let Some(catalog) = &self.catalog else {
+            return "The catalog has not loaded yet.".to_string();
+        };
+        let releases = match kind {
+            RuntimeKind::Php => &catalog.php,
+            RuntimeKind::Nginx => &catalog.nginx,
+        };
+        let latest: Vec<&str> = releases
+            .iter()
+            .take(5)
+            .map(|release| release.version.as_str())
+            .collect();
+        if latest.is_empty() {
+            "The catalog is empty.".to_string()
+        } else {
+            format!("Latest available: {}.", latest.join(", "))
+        }
+    }
+
+    fn mcp_start_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        Self::mcp_require_php(&project)?;
+        self.mcp_require_idle()?;
+        let changed = self.nginx_on.insert(project.id) | self.php_on.insert(project.id);
+        let (nginx, php) = self.project_state(project.id);
+        if changed || !(nginx && php) || self.serve_error.is_some() {
+            self.sync_server(cx);
+        }
+        Ok(serde_json::json!({ "action": "start", "project": project.id }))
+    }
+
+    fn mcp_stop_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let changed = self.nginx_on.remove(&project.id) | self.php_on.remove(&project.id);
+        if changed {
+            self.sync_server(cx);
+        }
+        Ok(serde_json::json!({ "action": "stop", "project": project.id }))
+    }
+
+    fn mcp_restart_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        Self::mcp_require_php(&project)?;
+        self.mcp_require_idle()?;
+        self.nginx_on.insert(project.id);
+        self.php_on.insert(project.id);
+        self.restart_service(project.id, true, cx);
+        Ok(serde_json::json!({ "action": "restart", "project": project.id }))
+    }
+
+    fn mcp_set_service(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        use mcp::protocol::{ServiceAction, ServiceKind};
+
+        let args: mcp::protocol::SetServiceParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        match args.service {
+            ServiceKind::Nginx => match args.action {
+                ServiceAction::Start | ServiceAction::Restart => {
+                    self.nginx_on.insert(project.id);
+                    self.sync_server(cx);
+                }
+                ServiceAction::Stop => {
+                    if self.nginx_on.remove(&project.id) {
+                        self.sync_server(cx);
+                    }
+                }
+            },
+            ServiceKind::Php => {
+                if args.action != ServiceAction::Stop {
+                    Self::mcp_require_php(&project)?;
+                }
+                match args.action {
+                    ServiceAction::Start => {
+                        self.php_on.insert(project.id);
+                        self.sync_server(cx);
+                    }
+                    ServiceAction::Stop => {
+                        if self.php_on.remove(&project.id) {
+                            self.sync_server(cx);
+                        }
+                    }
+                    ServiceAction::Restart => {
+                        self.php_on.insert(project.id);
+                        self.restart_service(project.id, true, cx);
+                    }
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "project": project.id,
+            "service": match args.service { ServiceKind::Nginx => "nginx", ServiceKind::Php => "php" },
+            "action": match args.action {
+                ServiceAction::Start => "start",
+                ServiceAction::Stop => "stop",
+                ServiceAction::Restart => "restart",
+            },
+        }))
+    }
+
+    fn mcp_all_services(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        use mcp::protocol::ServiceAction;
+
+        let args: mcp::protocol::AllServicesParams = parse_mcp(params)?;
+        self.mcp_require_idle()?;
+        match args.action {
+            ServiceAction::Start => self.start_all(cx),
+            ServiceAction::Stop => self.stop_all(cx),
+            ServiceAction::Restart => self.restart_all(cx),
+        }
+        Ok(serde_json::json!({
+            "action": match args.action {
+                ServiceAction::Start => "start",
+                ServiceAction::Stop => "stop",
+                ServiceAction::Restart => "restart",
+            },
+        }))
+    }
+
+    fn mcp_install_runtime(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        use mcp::protocol::RuntimeKindParam;
+
+        let args: mcp::protocol::InstallRuntimeParams = parse_mcp(params)?;
+        let kind = match args.kind {
+            RuntimeKindParam::Php => RuntimeKind::Php,
+            RuntimeKindParam::Nginx => RuntimeKind::Nginx,
+        };
+        if let Some(busy) = &self.busy_runtime {
+            return Err(McpFailure::new(
+                "conflict",
+                format!("Wisp is already installing {busy}."),
+            ));
+        }
+        if self.runtimes.iter().any(|runtime| {
+            runtime.kind == kind.as_str() && runtime.version == args.version
+        }) {
+            return Err(McpFailure::new(
+                "conflict",
+                format!("{} {} is already installed.", kind.label(), args.version),
+            ));
+        }
+
+        let in_catalog = self.catalog.as_ref().is_some_and(|catalog| match kind {
+            RuntimeKind::Php => catalog.php.iter().any(|release| release.version == args.version),
+            RuntimeKind::Nginx => catalog
+                .nginx
+                .iter()
+                .any(|release| release.version == args.version),
+        });
+        if !in_catalog && (self.catalog.is_none() || self.catalog_is_stale()) {
+            if !self.catalog_loading {
+                self.load_catalog(cx);
+            }
+            return Err(McpFailure::new(
+                "catalog_loading",
+                "The runtime catalog is loading or stale; retry in a moment.",
+            ));
+        }
+
+        let release = match kind {
+            RuntimeKind::Php => self
+                .catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog
+                        .php
+                        .iter()
+                        .find(|release| release.version == args.version)
+                })
+                .cloned(),
+            RuntimeKind::Nginx => self
+                .catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog
+                        .nginx
+                        .iter()
+                        .find(|release| release.version == args.version)
+                })
+                .cloned(),
+        }
+        .ok_or_else(|| {
+            McpFailure::not_found(format!(
+                "{} {} is not in the catalog. {}",
+                kind.label(),
+                args.version,
+                self.mcp_latest_versions(kind)
+            ))
+        })?;
+
+        self.install_release(kind, release, cx);
+        Ok(serde_json::json!({
+            "started": true,
+            "kind": kind.as_str(),
+            "version": args.version,
+        }))
+    }
+
+    fn mcp_uninstall_runtime(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        use mcp::protocol::RuntimeKindParam;
+
+        let args: mcp::protocol::UninstallRuntimeParams = parse_mcp(params)?;
+        let kind = match args.kind {
+            RuntimeKindParam::Php => RuntimeKind::Php,
+            RuntimeKindParam::Nginx => RuntimeKind::Nginx,
+        };
+        if let Some(busy) = &self.busy_runtime {
+            return Err(McpFailure::new(
+                "conflict",
+                format!("Wisp is already installing or removing {busy}."),
+            ));
+        }
+        if !self
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.kind == kind.as_str() && runtime.version == args.version)
+        {
+            return Err(McpFailure::not_found(format!(
+                "{} {} is not installed. {}",
+                kind.label(),
+                args.version,
+                self.mcp_installed_hint(kind)
+            )));
+        }
+        self.uninstall_runtime(kind, args.version.clone(), cx);
+        Ok(serde_json::json!({
+            "started": true,
+            "kind": kind.as_str(),
+            "version": args.version,
+        }))
+    }
+
+    fn mcp_set_active_nginx(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::SetActiveNginxParams = parse_mcp(params)?;
+        self.mcp_require_idle()?;
+        let version = args.version.trim().to_string();
+        if version.is_empty() {
+            self.settings.active_nginx = None;
+            self.settings.save();
+        } else {
+            if !self
+                .installed(RuntimeKind::Nginx)
+                .iter()
+                .any(|runtime| runtime.version == version)
+            {
+                return Err(McpFailure::not_found(format!(
+                    "nginx {version} is not installed. {}",
+                    self.mcp_installed_hint(RuntimeKind::Nginx)
+                )));
+            }
+            self.set_active_nginx(version, cx);
+        }
+        if self.serve_status.nginx_running || !self.nginx_on.is_empty() {
+            self.sync_server(cx);
+        }
+        Ok(self.mcp_runtimes())
+    }
+
+    fn mcp_set_project_php(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::SetProjectPhpParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let version = args.version.trim().to_string();
+        if !version.is_empty()
+            && !self
+                .installed_php_versions()
+                .iter()
+                .any(|installed| installed == &version)
+        {
+            return Err(McpFailure::not_found(format!(
+                "PHP {version} is not installed. {}",
+                self.mcp_installed_hint(RuntimeKind::Php)
+            )));
+        }
+        let mut draft = ProjectDraft::from_project(&project);
+        draft.php_version = if version.is_empty() {
+            None
+        } else {
+            Some(version.clone())
+        };
+        self.mcp_update_project_row(project.id, &draft)?;
+        self.reload(cx);
+        if self.php_on.contains(&project.id) {
+            if version.is_empty() {
+                self.php_on.remove(&project.id);
+                self.sync_server(cx);
+            } else {
+                self.restart_service(project.id, true, cx);
+            }
+        }
+        Ok(serde_json::json!({
+            "project": project.id,
+            "php_version": draft.php_version,
+        }))
+    }
+
+    fn mcp_set_project_https(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::SetProjectHttpsParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let mut draft = ProjectDraft::from_project(&project);
+        draft.ssl_enabled = args.enabled;
+        self.mcp_update_project_row(project.id, &draft)?;
+        self.reload(cx);
+        if self.nginx_on.contains(&project.id) {
+            self.sync_server(cx);
+        }
+        Ok(serde_json::json!({
+            "project": project.id,
+            "ssl_enabled": args.enabled,
+        }))
+    }
+
+    fn mcp_set_php_ini(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::SetPhpIniParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let mut draft = ProjectDraft::from_project(&project);
+        draft.php_ini_overrides = args.overrides;
+        self.mcp_update_project_row(project.id, &draft)?;
+        self.reload(cx);
+        if self.php_on.contains(&project.id) {
+            self.restart_service(project.id, true, cx);
+        }
+        Ok(serde_json::json!({
+            "project": project.id,
+            "overrides": draft.php_ini_overrides,
+        }))
+    }
+
+    fn mcp_update_project_row(&self, id: i64, draft: &ProjectDraft) -> Result<(), McpFailure> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            McpFailure::new("unavailable", "The project database is unavailable.")
+        })?;
+        store.update_project(id, draft).map_err(mcp_db_error)
+    }
+
+    fn mcp_repair_hosts(&mut self, cx: &mut Context<Self>) -> McpResult {
+        // Clearing the remembered set forces a real check even when the
+        // domains have not changed since the last write.
+        self.hosts_written.clear();
+        self.hosts_error = None;
+        self.sync_hosts(cx);
+        Ok(serde_json::json!({ "requested": true }))
+    }
+
+    fn mcp_trust_ca(&mut self, cx: &mut Context<Self>) -> McpResult {
+        if self.trust_busy {
+            return Err(McpFailure::new(
+                "busy",
+                "Wisp is already trusting the certificate.",
+            ));
+        }
+        self.trust_ca(cx);
+        Ok(serde_json::json!({ "requested": true }))
+    }
+
+    fn mcp_create_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::CreateProjectParams = parse_mcp(params)?;
+        let name = args.name.trim().to_string();
+        let app_name = args
+            .app_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| db::slugify(&name), ToString::to_string);
+        let domain = args
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || format!("{}.test", db::slugify(&app_name)),
+                ToString::to_string,
+            );
+        let php_version = args
+            .php_version
+            .map(|version| version.trim().to_string())
+            .filter(|version| !version.is_empty());
+        if let Some(version) = &php_version {
+            if !self
+                .installed_php_versions()
+                .iter()
+                .any(|installed| installed == version)
+            {
+                return Err(McpFailure::not_found(format!(
+                    "PHP {version} is not installed. {}",
+                    self.mcp_installed_hint(RuntimeKind::Php)
+                )));
+            }
+        }
+        let draft = ProjectDraft {
+            name,
+            app_name,
+            root_path: args.root_path.trim().to_string(),
+            domain,
+            php_version,
+            ssl_enabled: args.ssl_enabled.unwrap_or(true),
+            php_ini_overrides: args.php_ini_overrides.unwrap_or_default(),
+            icon_path: None,
+        };
+        let store = self.store.as_ref().ok_or_else(|| {
+            McpFailure::new("unavailable", "The project database is unavailable.")
+        })?;
+        let id = store.create_project(&draft).map_err(mcp_db_error)?;
+        self.reload(cx);
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                McpFailure::internal("The new project is missing from the database.")
+            })?;
+        Ok(serde_json::json!({
+            "created": true,
+            "project": self.mcp_project_detail(&project),
+        }))
+    }
+
+    fn mcp_update_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::UpdateProjectParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        let mut draft = ProjectDraft::from_project(&project);
+        let mut restart_worker = false;
+        let mut sync_site = false;
+
+        if let Some(name) = args.name {
+            draft.name = name;
+        }
+        if let Some(app_name) = args.app_name {
+            draft.app_name = app_name;
+            sync_site = true;
+        }
+        if let Some(root_path) = args.root_path {
+            draft.root_path = root_path;
+            sync_site = true;
+        }
+        if let Some(domain) = args.domain {
+            draft.domain = domain;
+            sync_site = true;
+        }
+        if let Some(version) = args.php_version {
+            let version = version.trim().to_string();
+            if !version.is_empty()
+                && !self
+                    .installed_php_versions()
+                    .iter()
+                    .any(|installed| installed == &version)
+            {
+                return Err(McpFailure::not_found(format!(
+                    "PHP {version} is not installed. {}",
+                    self.mcp_installed_hint(RuntimeKind::Php)
+                )));
+            }
+            draft.php_version = if version.is_empty() {
+                None
+            } else {
+                Some(version)
+            };
+            restart_worker = true;
+        }
+        if let Some(ssl_enabled) = args.ssl_enabled {
+            draft.ssl_enabled = ssl_enabled;
+            sync_site = true;
+        }
+        if let Some(overrides) = args.php_ini_overrides {
+            draft.php_ini_overrides = overrides;
+            restart_worker = true;
+        }
+
+        if restart_worker || sync_site {
+            self.mcp_require_idle()?;
+        }
+        self.mcp_update_project_row(project.id, &draft)?;
+        self.reload(cx);
+
+        if restart_worker && self.php_on.contains(&project.id) {
+            self.restart_service(project.id, true, cx);
+        } else if sync_site && (self.nginx_on.contains(&project.id) || self.php_on.contains(&project.id)) {
+            self.sync_server(cx);
+        }
+
+        let project = self
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == project.id)
+            .cloned()
+            .ok_or_else(|| McpFailure::internal("The updated project is missing from the database."))?;
+        Ok(self.mcp_project_detail(&project))
+    }
+
+    fn mcp_delete_project(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let store = self.store.as_ref().ok_or_else(|| {
+            McpFailure::new("unavailable", "The project database is unavailable.")
+        })?;
+        store.delete_project(project.id).map_err(mcp_db_error)?;
+        self.nginx_on.remove(&project.id);
+        self.php_on.remove(&project.id);
+        if self.selected == Some(project.id) {
+            self.selected = None;
+        }
+        self.reload(cx);
+        // Regenerating the site list drops the vhost and stops the worker; the
+        // hosts write at the end of the sync drops the domain too.
+        self.sync_server(cx);
+        Ok(serde_json::json!({
+            "deleted": true,
+            "project": project.id,
+            "name": project.name,
+        }))
+    }
 }
 
 impl Render for Wisp {
@@ -5285,6 +6769,178 @@ fn hosting_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
                                 }
                             })
                     }
+                })),
+        )
+}
+
+/// The local MCP server and the configuration each client needs.
+fn mcp_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
+    let read = entity.clone();
+    let write = entity.clone();
+    let enabled = wisp.settings.mcp_enabled;
+    let port = wisp
+        .mcp_endpoint
+        .as_ref()
+        .map(mcp::endpoint::Endpoint::port);
+    let status = match (enabled, port) {
+        (true, Some(port)) => format!("Listening on 127.0.0.1:{port}"),
+        (true, None) => {
+            "Enabled, but the listener is not running. Turn it off and on again.".to_string()
+        }
+        (false, _) => "Off \u{2014} CLI agents cannot connect.".to_string(),
+    };
+    let discovery = mcp::endpoint::discovery_path().to_string_lossy().to_string();
+
+    let server_items = vec![
+        SettingItem::new(
+            "Local MCP server",
+            SettingField::switch(
+                move |cx: &App| read.read(cx).settings.mcp_enabled,
+                move |value: bool, cx: &mut App| {
+                    write.update(cx, |this, cx| this.set_mcp_enabled(value, cx));
+                },
+            ),
+        )
+        .description(
+            "Let CLI agents inspect and control Wisp on this computer. Off by default; \
+             the endpoint accepts loopback connections only.",
+        ),
+        SettingItem::render(move |_options, _window, cx| {
+            let listening = enabled && port.is_some();
+            let color = if listening {
+                cx.theme().success
+            } else if enabled {
+                cx.theme().warning
+            } else {
+                cx.theme().muted_foreground
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::dot(color))
+                        .child(div().text_sm().child(status.clone())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("Credentials: {discovery}")),
+                )
+        }),
+    ];
+
+    let exe = std::env::current_exe().unwrap_or_default();
+    let client_items: Vec<SettingItem> = mcp::snippets::all(&exe)
+        .into_iter()
+        .map(|snippet| {
+            let entity = entity.clone();
+            SettingItem::render(move |_options, _window, cx| {
+                client_snippet_card(&snippet, &entity, cx)
+            })
+        })
+        .collect();
+
+    SettingPage::new("MCP")
+        .icon(icon(IconName::Bot))
+        .description("Let local CLI agents inspect and control Wisp.")
+        .group(SettingGroup::new().title("Server").items(server_items))
+        .group(
+            SettingGroup::new()
+                .title("Connect a client")
+                .description(
+                    "Each client launches `wisp --mcp`; the bridge starts Wisp when it \
+                     is not already running.",
+                )
+                .items(client_items),
+        )
+}
+
+/// One client's snippet, with a copy button.
+fn client_snippet_card(
+    snippet: &mcp::snippets::ClientSnippet,
+    entity: &Entity<Wisp>,
+    cx: &App,
+) -> impl IntoElement {
+    let copy_text = snippet.snippet.clone();
+    let copy_entity = entity.clone();
+    let name = snippet.name;
+    let id = SharedString::from(format!("mcp-copy-{}", snippet.id));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .py_3()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        // Without this the long location string claims the
+                        // whole row and pushes the copy button out of view.
+                        .min_w(px(0.))
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(snippet.location),
+                        ),
+                )
+                .child(
+                    Button::new(id)
+                        .ghost()
+                        .small()
+                        .flex_shrink_0()
+                        .icon(icon(IconName::Copy))
+                        .label("Copy")
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                            copy_entity.update(cx, |this, cx| {
+                                this.push_toast(
+                                    ToastKind::Success,
+                                    format!("Copied the {name} configuration."),
+                                );
+                                cx.notify();
+                            });
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .p_3()
+                .rounded(px(6.))
+                .bg(cx.theme().muted)
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_xs()
+                .children(snippet.snippet.lines().map(|line| {
+                    div().child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line.to_string()
+                    })
                 })),
         )
 }

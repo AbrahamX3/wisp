@@ -40,9 +40,13 @@ version, and the app fetches the runtime it needs.
   you can pick an image.
 - **Live resource use** — CPU and memory for the nginx and PHP processes Wisp
   started, sampled every two seconds, not just whole-machine figures.
-- **Ctrl-K** — jump to a screen, open a project, or start, stop and restart
+- **Ctrl-K** - jump to a screen, open a project, or start, stop and restart
   everything.
-- **Windows-native** — optional start-with-Windows, lives in the tray with a
+- **Local MCP server** - off by default. Turn it on in Settings → MCP and a CLI
+  agent (Claude Code, OpenCode, Codex, Cursor, VS Code) can read logs, check
+  sites, control services and manage projects over a loopback-only endpoint.
+  See [docs/mcp.md](docs/mcp.md).
+- **Windows-native** - optional start-with-Windows, lives in the tray with a
   submenu per site, and updates itself from GitHub Releases.
 
 ## Where it keeps things
@@ -51,7 +55,8 @@ Everything lives under `%USERPROFILE%\.config\wisp`:
 
 ```
 wisp.db        projects and installed runtimes (SQLite)
-settings.json  theme, background mode, update cache
+settings.json  theme, background mode, update cache, MCP toggle
+mcp.json       MCP endpoint port and per-launch token (only while enabled)
 runtimes/      installed PHP and nginx builds
 nginx/         the running nginx's configuration
 sites/<slug>/  each project's generated nginx config and php.ini
@@ -61,6 +66,21 @@ certs/         the local certificate authority and issued certificates
 Wisp owns the block between `# wisp:start` and `# wisp:end` in your hosts file
 and leaves every other line alone. Writing it needs administrator rights once;
 Wisp sets up a scheduled task for that automatically so it never prompts again.
+
+## Local MCP server
+
+Wisp can expose the running app to a CLI agent over the Model Context Protocol.
+It is off by default. Enable it in **Settings → MCP**, then copy the generated
+configuration for Claude Code, OpenCode, Codex CLI, Cursor, VS Code, or any
+client that accepts the common `mcpServers` JSON.
+
+The GUI hosts a loopback-only endpoint and `wisp.exe --mcp` is the stdio bridge
+the client launches. The bridge starts Wisp when it is not running and forwards
+each call to the app, so an agent sees and changes exactly the state you see.
+Tools cover projects, logs, certificates, hosts, runtimes, services and a
+`check_site` probe, plus a `diagnose-site` prompt.
+[`docs/mcp.md`](docs/mcp.md) has the full reference, the security model, and
+troubleshooting.
 
 ## Requirements
 
@@ -96,8 +116,10 @@ src/
   serve/         # the supervisor: nginx config, per-project php.ini, workers
   elevation.rs   # the elevated-control helper and its scheduled task
   logs.rs        # tailing a log file
-  settings.rs    # theme, background mode, update cache
+  settings.rs    # theme, background mode, update cache, MCP toggle
+  mcp/           # local MCP: wire protocol, loopback endpoint, stdio bridge, snippets
   update.rs      # self-update from GitHub Releases
+docs/            # user documentation, including the MCP reference
 build.rs         # rasterises assets/icon.svg into the .ico + tray pixels
 packaging/       # Inno Setup installer script
 scripts/         # release notes, icon export, window capture

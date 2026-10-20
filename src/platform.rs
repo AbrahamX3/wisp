@@ -11,8 +11,9 @@
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindowAsync, SW_HIDE, SW_RESTORE,
+    FindWindowW, SetForegroundWindow, ShowWindowAsync, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL,
 };
 
 /// Window title. Also how the tray and a second instance find the window.
@@ -99,6 +100,36 @@ pub fn show_window(title: &str, visible: bool) -> bool {
         }
     }
     true
+}
+
+/// Start `exe` as a detached GUI process.
+///
+/// `std::process::Command` creates the child with handle inheritance enabled,
+/// so a GUI child inherits the caller's stdout/stderr pipes even when its own
+/// standard handles point at `NUL`. The MCP bridge launches the app this way,
+/// and an inherited pipe would stay open until the app exits, which can hang a
+/// client that waits for the bridge's stderr to close.
+///
+/// `ShellExecuteW` asks the shell to start the process and inherits nothing.
+#[expect(unsafe_code, reason = "ShellExecuteW has no safe wrapper")]
+pub fn spawn_detached(exe: &std::path::Path) -> bool {
+    let file = wide(&exe.to_string_lossy());
+
+    // Safety: `file` is NUL-terminated and outlives the call. The other
+    // arguments ask for the default verb, no parameters, the current
+    // directory, and a normally-shown window.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute's documented success range is greater than 32.
+    result as isize > 32
 }
 
 /// A NUL-terminated UTF-16 copy of `text`, for the `*W` Win32 entry points.
