@@ -57,6 +57,25 @@ pub fn ca() -> PathBuf {
     root().join("ca")
 }
 
+/// A stable id for a non-default config root, or `None` for the normal profile.
+///
+/// The single-instance mutex is keyed by profile: a portable or test profile
+/// (`WISP_CONFIG_DIR`) is a separate install with its own database and
+/// runtimes, so it must be able to run alongside the installed app. The default
+/// profile keeps the historical mutex name.
+pub fn profile_id() -> Option<String> {
+    let root = root();
+    if root == default_root() {
+        return None;
+    }
+    // Windows paths are case-insensitive, so equal directories must hash alike.
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.to_string_lossy().to_lowercase().hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 /// Create the directory tree if it is missing. Best-effort: a failure surfaces
 /// later, when the specific write is attempted.
 pub fn ensure() {

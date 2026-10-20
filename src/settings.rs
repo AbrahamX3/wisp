@@ -53,6 +53,13 @@ pub struct Settings {
     /// Whether the first-run onboarding has been completed.
     #[serde(default)]
     pub onboarding_complete: bool,
+    /// Host the local MCP endpoint so CLI agents can inspect and control Wisp.
+    ///
+    /// Off by default: an agent-facing control surface should be an explicit
+    /// choice, and a stale endpoint file from an earlier version is removed on
+    /// start when this is off.
+    #[serde(default)]
+    pub mcp_enabled: bool,
 }
 
 impl Settings {
@@ -80,11 +87,16 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::ThemePreference;
+    use super::{Settings, ThemePreference};
 
     #[test]
     fn theme_preference_defaults_to_system() {
         assert_eq!(ThemePreference::default(), ThemePreference::System);
+    }
+
+    #[test]
+    fn the_mcp_server_is_off_by_default() {
+        assert!(!Settings::default().mcp_enabled);
     }
 
     #[test]

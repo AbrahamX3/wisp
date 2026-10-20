@@ -18,6 +18,7 @@ mod fonts;
 mod helper_task;
 mod hosts;
 mod logs;
+mod mcp;
 mod platform;
 mod runtime;
 mod serve;
@@ -53,13 +54,25 @@ fn main() {
         // Remove Wisp's managed block (and its markers) from the hosts file.
         // Needs administrator rights; used by the testing reset script.
         Some("--clear-hosts") => std::process::exit(clear_hosts()),
+        // The stdio MCP server a client launches. It must run *alongside* the
+        // GUI app, so it is handled before the single-instance guard.
+        Some("--mcp") => std::process::exit(mcp::stdio::run()),
         _ => {}
     }
 
     // Starting with Windows makes a second launch likely (autostart plus a
     // manual open), so surface the window that already exists instead of
     // adding a duplicate. Held for the rest of `main`.
-    let Some(_instance) = platform::SingleInstance::acquire("Wisp.single-instance") else {
+    //
+    // The name follows the config profile: a portable or test profile is a
+    // separate install and may run alongside the normal one. Two profiles both
+    // serving sites still contend for ports 80/443, which surfaces as a serve
+    // error rather than silently sharing state.
+    let instance_name = config::profile_id().map_or_else(
+        || "Wisp.single-instance".to_string(),
+        |id| format!("Wisp.single-instance-{id}"),
+    );
+    let Some(_instance) = platform::SingleInstance::acquire(&instance_name) else {
         platform::focus_window(platform::WINDOW_TITLE);
         return;
     };
@@ -82,11 +95,17 @@ fn main() {
             // holding port 80 or a FastCGI port.
             let _ = cx.on_app_quit(|cx| {
                 cx.global_mut::<app::ServerGlobal>().0.stop_all();
+                // The endpoint file must not outlive the process that owns the
+                // port; a stale one sends the next bridge to a dead port.
+                mcp::endpoint::remove_discovery();
                 async {}
             });
             // An in-app restart (the updater's) replaces the process too.
             let _ = cx.on_app_restart(|cx| {
                 cx.global_mut::<app::ServerGlobal>().0.stop_all();
+                // The replacement process writes a new endpoint; this one's
+                // port must not be advertised in the gap.
+                mcp::endpoint::remove_discovery();
             });
 
             // Register the bundled typeface before the first window, so the

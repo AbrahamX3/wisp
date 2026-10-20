@@ -10,6 +10,14 @@ build = "build.rs"
 
 [dependencies]
 gpui-kit = "0.7.3"
+# The local MCP bridge (`wisp --mcp`) is a stdio server spawned by the client;
+# rmcp owns the protocol and tokio gives it a runtime. `async-channel` carries
+# requests from the endpoint thread to the UI, the same way gpui-tray posts its
+# events.
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+async-channel = "2"
+uuid = { version = "1", features = ["v4"] }
 # System tray for "run in background". Purpose-built for GPUI: tray events are
 # posted onto GPUI's own foreground executor rather than a second event loop.
 # The `gpui-kit` feature selects the `gpui-pre` backend we already depend on.
@@ -45,6 +53,7 @@ winreg = "0.56"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 runas = "1.2.0"
