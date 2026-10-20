@@ -44,6 +44,7 @@ use gpui_kit::component::empty::{
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -462,6 +463,12 @@ pub struct Wisp {
     mcp_endpoint: Option<mcp::endpoint::Endpoint>,
     /// Feeds endpoint requests to the UI thread.
     mcp_requests: Option<async_channel::Sender<mcp::endpoint::Incoming>>,
+    /// Which client's configuration is selected in Settings → MCP.
+    mcp_client_tab: usize,
+    /// Client snippets and their selectable text views. Both are fixed for the
+    /// life of the process (they only depend on the executable path and theme).
+    mcp_snippets: Vec<mcp::snippets::ClientSnippet>,
+    mcp_snippet_views: Vec<Entity<TextViewState>>,
     /// The last runtime install/removal failure, so the MCP bridge can report
     /// why an install it waited for did not produce the expected version.
     last_install_error: Option<String>,
@@ -507,6 +514,19 @@ impl Wisp {
         let log_case = settings.log_case.unwrap_or(false);
         let sidebar_collapsed = settings.sidebar_collapsed.unwrap_or(false);
         let onboarding_complete = settings.onboarding_complete;
+
+        // The snippets are static for this process. Creating their text views
+        // once keeps the settings page from rebuilding selection state on every
+        // render, and makes the code selectable (the plain div it replaced was
+        // not).
+        let mcp_snippets = mcp::snippets::all(&std::env::current_exe().unwrap_or_default());
+        let mcp_snippet_views = mcp_snippets
+            .iter()
+            .map(|snippet| {
+                let markdown = format!("```\n{}\n```", snippet.snippet.trim_end());
+                cx.new(|cx| TextViewState::markdown(&markdown, cx))
+            })
+            .collect();
 
         let mut this = Self {
             theme: settings.theme,            settings,
@@ -568,6 +588,9 @@ impl Wisp {
             subscriptions: _subscriptions,
             mcp_endpoint: None,
             mcp_requests: None,
+            mcp_client_tab: 0,
+            mcp_snippets,
+            mcp_snippet_views,
             last_install_error: None,
             hosts_busy: false,
         };
@@ -3679,6 +3702,7 @@ impl Wisp {
             );
 
         let tabs = TabBar::new("project-tabs")
+            .underline()
             .selected_index(self.project_tab.index())
             .children(vec![
                 Tab::new().label("Services"),
@@ -4347,6 +4371,7 @@ impl Wisp {
         }
 
         let tabs = TabBar::new("runtime-tabs")
+            .underline()
             .selected_index(self.runtime_tab.index())
             .children(vec![
                 Tab::new().label("PHP"),
@@ -6836,16 +6861,49 @@ fn mcp_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
         }),
     ];
 
-    let exe = std::env::current_exe().unwrap_or_default();
-    let client_items: Vec<SettingItem> = mcp::snippets::all(&exe)
-        .into_iter()
-        .map(|snippet| {
-            let entity = entity.clone();
-            SettingItem::render(move |_options, _window, cx| {
-                client_snippet_card(&snippet, &entity, cx)
-            })
-        })
-        .collect();
+    let snippets = wisp.mcp_snippets.clone();
+    let views = wisp.mcp_snippet_views.clone();
+    let client_entity = entity.clone();
+    let client_item = SettingItem::render(move |_options, _window, cx| {
+        let active = client_entity
+            .read(cx)
+            .mcp_client_tab
+            .min(snippets.len().saturating_sub(1));
+        let Some(snippet) = snippets.get(active) else {
+            return div().into_any_element();
+        };
+        let Some(view) = views.get(active) else {
+            return div().into_any_element();
+        };
+        let click_entity = client_entity.clone();
+        let tabs = TabBar::new("mcp-client-tabs")
+            .underline()
+            .small()
+            .menu(true)
+            .w_full()
+            .selected_index(active)
+            .children(
+                snippets
+                    .iter()
+                    .map(|snippet| Tab::new().label(snippet.short_name)),
+            )
+            .on_click(move |index, _window, cx| {
+                click_entity.update(cx, |this, cx| {
+                    this.mcp_client_tab = *index;
+                    cx.notify();
+                });
+            });
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .py_2()
+            .child(tabs)
+            .child(client_snippet_panel(snippet, view, &client_entity, cx))
+            .into_any_element()
+    });
 
     SettingPage::new("MCP")
         .icon(icon(IconName::Bot))
@@ -6858,13 +6916,14 @@ fn mcp_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
                     "Each client launches `wisp --mcp`; the bridge starts Wisp when it \
                      is not already running.",
                 )
-                .items(client_items),
+                .item(client_item),
         )
 }
 
-/// One client's snippet, with a copy button.
-fn client_snippet_card(
+/// One client's snippet for the selected tab, with a copy button.
+fn client_snippet_panel(
     snippet: &mcp::snippets::ClientSnippet,
+    view: &Entity<TextViewState>,
     entity: &Entity<Wisp>,
     cx: &App,
 ) -> impl IntoElement {
@@ -6874,10 +6933,10 @@ fn client_snippet_card(
     let id = SharedString::from(format!("mcp-copy-{}", snippet.id));
 
     div()
+        .w_full()
         .flex()
         .flex_col()
-        .gap_2()
-        .py_3()
+        .gap_3()
         .child(
             div()
                 .flex()
@@ -6887,25 +6946,13 @@ fn client_snippet_card(
                 .gap_2()
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
                         .flex_1()
                         // Without this the long location string claims the
                         // whole row and pushes the copy button out of view.
                         .min_w(px(0.))
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(snippet.location),
-                        ),
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(snippet.location),
                 )
                 .child(
                     Button::new(id)
@@ -6927,21 +6974,11 @@ fn client_snippet_card(
                 ),
         )
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .p_3()
-                .rounded(px(6.))
-                .bg(cx.theme().muted)
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_xs()
-                .children(snippet.snippet.lines().map(|line| {
-                    div().child(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line.to_string()
-                    })
-                })),
+            div().w_full().text_xs().child(
+                TextView::new(view)
+                    .selectable(true)
+                    .scrollable(false),
+            ),
         )
 }
 

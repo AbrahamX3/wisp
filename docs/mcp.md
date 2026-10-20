@@ -69,18 +69,14 @@ user scope.
 
 ### OpenCode
 
-Merge into `opencode.json`, or `~/.config/opencode/opencode.json`:
+Add this entry inside the `mcp` object in `opencode.json`, or
+`~/.config/opencode/opencode.json`:
 
 ```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "wisp": {
-      "type": "local",
-      "command": ["<wisp.exe>", "--mcp"],
-      "enabled": true
-    }
-  }
+"wisp": {
+  "type": "local",
+  "command": ["<wisp.exe>", "--mcp"],
+  "enabled": true
 }
 ```
 
@@ -96,48 +92,37 @@ args = ["--mcp"]
 
 ### Cursor
 
-Merge into `.cursor/mcp.json`, or `~/.cursor/mcp.json`:
+Add this entry inside `mcpServers` in `.cursor/mcp.json`, or
+`~/.cursor/mcp.json`:
 
 ```json
-{
-  "mcpServers": {
-    "wisp": {
-      "command": "<wisp.exe>",
-      "args": ["--mcp"]
-    }
-  }
+"wisp": {
+  "command": "<wisp.exe>",
+  "args": ["--mcp"]
 }
 ```
 
 ### VS Code
 
-Merge into `.vscode/mcp.json` in the workspace:
+Add this entry inside `servers` in `.vscode/mcp.json` in the workspace:
 
 ```json
-{
-  "servers": {
-    "wisp": {
-      "type": "stdio",
-      "command": "<wisp.exe>",
-      "args": ["--mcp"]
-    }
-  }
+"wisp": {
+  "type": "stdio",
+  "command": "<wisp.exe>",
+  "args": ["--mcp"]
 }
 ```
 
 ### Other clients
 
 Clients that accept the common `mcpServers` shape (Claude Desktop, Windsurf,
-and others) can use:
+and others) can use this entry inside `mcpServers`:
 
 ```json
-{
-  "mcpServers": {
-    "wisp": {
-      "command": "<wisp.exe>",
-      "args": ["--mcp"]
-    }
-  }
+"wisp": {
+  "command": "<wisp.exe>",
+  "args": ["--mcp"]
 }
 ```
 
