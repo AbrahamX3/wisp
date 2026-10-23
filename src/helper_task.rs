@@ -283,7 +283,9 @@ pub fn run_via_task() -> Result<(), TaskError> {
         .status()
         .map_err(TaskError::Io)?;
     if !status.success() {
-        return Err(TaskError::Helper("could not start the elevated task".to_string()));
+        return Err(TaskError::Helper(
+            "could not start the elevated task".to_string(),
+        ));
     }
     wait_for_response(&response)
 }
@@ -437,7 +439,10 @@ mod tests {
     #[test]
     fn unescapes_an_ampersand_in_the_path() {
         let xml = r"<Command>C:\Tools &amp; Bits\wisp.exe</Command>";
-        assert_eq!(extract_command(xml).as_deref(), Some(r"C:\Tools & Bits\wisp.exe"));
+        assert_eq!(
+            extract_command(xml).as_deref(),
+            Some(r"C:\Tools & Bits\wisp.exe")
+        );
     }
 
     #[test]

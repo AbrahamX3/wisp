@@ -8869,10 +8869,11 @@ dependencies = [
 
 [[package]]
 name = "wisp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-channel",
+ "base64 0.23.1",
  "gpui-kit",
  "gpui-tray",
  "rcgen",
@@ -8881,6 +8882,7 @@ dependencies = [
  "rmcp",
  "runas",
  "rusqlite",
+ "rustls-native-certs",
  "schemars",
  "self_update",
  "serde",

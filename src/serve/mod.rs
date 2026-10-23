@@ -94,10 +94,7 @@ impl Supervisor {
         let mut tracked = Vec::new();
         if self.nginx.as_mut().is_some_and(process::is_running) {
             if let Some(pid) = self.nginx.as_ref().map(Child::id) {
-                tracked.push(Tracked {
-                    project: None,
-                    pid,
-                });
+                tracked.push(Tracked { project: None, pid });
             }
         }
         for (id, worker) in &mut self.workers {
@@ -113,10 +110,7 @@ impl Supervisor {
 
     /// Reap exited processes and report what is still alive.
     pub fn status(&mut self) -> Status {
-        let nginx_running = self
-            .nginx
-            .as_mut()
-            .is_some_and(process::is_running);
+        let nginx_running = self.nginx.as_mut().is_some_and(process::is_running);
         if !nginx_running {
             self.nginx = None;
             self.nginx_version = None;
@@ -183,7 +177,9 @@ impl Supervisor {
             })?;
             let prefix = config::nginx_prefix(version);
             if !prefix.join("nginx.exe").is_file() {
-                return Err(ServeError::Missing(format!("nginx {version} is not installed.")));
+                return Err(ServeError::Missing(format!(
+                    "nginx {version} is not installed."
+                )));
             }
             self.write_vhosts(&prefix, sites)?;
             self.ensure_nginx(version, &prefix)?;
@@ -299,7 +295,12 @@ impl Supervisor {
         let error_log = dir.join("logs").join("php-error.log");
 
         let path = dir.join("php.ini");
-        let contents = config::php_ini(&template, &extension_dir, &error_log, &site.php_ini_overrides);
+        let contents = config::php_ini(
+            &template,
+            &extension_dir,
+            &error_log,
+            &site.php_ini_overrides,
+        );
         let changed = match std::fs::read_to_string(&path) {
             Ok(existing) => existing != contents,
             Err(_) => true,
@@ -492,7 +493,8 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
 }
 
 /// A localhost port the OS says is free.
-fn free_port() -> u16 {    std::net::TcpListener::bind("127.0.0.1:0")
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|listener| listener.local_addr().ok())
         .map_or(9070, |addr| addr.port())
@@ -534,7 +536,7 @@ fn read_log_tail(path: &Path, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{SiteSpec, Supervisor};
-    use crate::runtime::{self, RuntimeKind, Release};
+    use crate::runtime::{self, Release, RuntimeKind};
 
     fn ensure_nginx(version: &str) {
         let dir = runtime::install_dir(RuntimeKind::Nginx, version);
@@ -670,7 +672,10 @@ mod tests {
         let mut tracked = supervisor.tracked();
         tracked.sort_by_key(|entry| entry.project);
         assert_eq!(
-            tracked.iter().filter(|entry| entry.project.is_none()).count(),
+            tracked
+                .iter()
+                .filter(|entry| entry.project.is_none())
+                .count(),
             1,
             "the shared nginx should be tracked once: {tracked:?}"
         );
@@ -694,14 +699,7 @@ mod tests {
                 super::config::http_port()
             };
             let output = std::process::Command::new("curl.exe")
-                .args([
-                    "-skL",
-                    "-o",
-                    "NUL",
-                    "-w",
-                    "%{http_code}",
-                    "--resolve",
-                ])
+                .args(["-skL", "-o", "NUL", "-w", "%{http_code}", "--resolve"])
                 .arg(format!("{}:{}:127.0.0.1", spec.domain, port))
                 .arg(format!("{scheme}://{}/", spec.domain))
                 .output()

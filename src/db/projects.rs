@@ -99,7 +99,9 @@ impl ProjectDraft {
             ));
         }
         if self.root_path.is_empty() {
-            return Err(Error::Validation("Choose the project's root folder.".into()));
+            return Err(Error::Validation(
+                "Choose the project's root folder.".into(),
+            ));
         }
         if let Err(message) = validate_domain(&self.domain) {
             return Err(Error::Validation(message));
@@ -334,7 +336,10 @@ mod tests {
             ("api.shop".into(), ".test".into())
         );
         // An unknown suffix stays part of the label.
-        assert_eq!(split_domain("myapp.dev"), ("myapp.dev".into(), ".test".into()));
+        assert_eq!(
+            split_domain("myapp.dev"),
+            ("myapp.dev".into(), ".test".into())
+        );
     }
 
     #[test]

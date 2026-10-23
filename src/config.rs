@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use base64::Engine as _;
+
 /// Root of the Wisp data directory.
 ///
 /// `WISP_CONFIG_DIR` overrides it, which the tests and a portable layout use.
@@ -57,6 +59,48 @@ pub fn ca() -> PathBuf {
     root().join("ca")
 }
 
+/// Public CA bundle used by PHP's curl and openssl extensions.
+pub fn ca_bundle() -> PathBuf {
+    ca().join("cacert.pem")
+}
+
+/// Materialise the Windows trust store as a PEM bundle for PHP.
+///
+/// PHP's OpenSSL build has no CA file of its own, so every request that uses
+/// curl (Composer, AWS, HTTP clients) fails TLS verification until
+/// `curl.cainfo` / `openssl.cafile` point at one. Generating it from the OS
+/// store keeps it current with Windows Update and includes enterprise roots.
+fn ensure_ca_bundle() {
+    ensure_ca_bundle_at(&ca_bundle());
+}
+
+fn ensure_ca_bundle_at(path: &std::path::Path) {
+    let result = rustls_native_certs::load_native_certs();
+    if result.certs.is_empty() {
+        return;
+    }
+
+    let mut pem = String::new();
+    for cert in result.certs {
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == pem) {
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, pem);
+}
+
 /// A stable id for a non-default config root, or `None` for the normal profile.
 ///
 /// The single-instance mutex is keyed by profile: a portable or test profile
@@ -81,6 +125,30 @@ pub fn profile_id() -> Option<String> {
 pub fn ensure() {
     for dir in [root(), runtimes(), nginx(), sites(), certs(), ca()] {
         let _ = std::fs::create_dir_all(dir);
+    }
+    ensure_ca_bundle();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_store_becomes_a_pem_bundle() {
+        let path = std::env::temp_dir().join("wisp-ca-bundle-test.pem");
+        let _ = std::fs::remove_file(&path);
+
+        ensure_ca_bundle_at(&path);
+
+        let pem = std::fs::read_to_string(&path).expect("CA bundle should be generated");
+        let count = pem.matches("BEGIN CERTIFICATE").count();
+        assert!(
+            count > 0,
+            "the native store should contain at least one root"
+        );
+        eprintln!("native roots: {count}");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 

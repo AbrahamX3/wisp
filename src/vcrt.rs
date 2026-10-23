@@ -55,7 +55,8 @@ pub fn description() -> String {
 /// sees a single UAC prompt; we cannot wait for the interactive install.
 pub fn launch_installer() -> Result<(), String> {
     let dest = std::env::temp_dir().join("wisp-vc_redist.x64.exe");
-    super::runtime::download::download_to(INSTALLER_URL, &dest).map_err(|error| error.to_string())?;
+    super::runtime::download::download_to(INSTALLER_URL, &dest)
+        .map_err(|error| error.to_string())?;
     std::process::Command::new(&dest)
         .spawn()
         .map_err(|error| error.to_string())?;

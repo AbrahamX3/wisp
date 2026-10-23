@@ -40,12 +40,7 @@ pub fn spawn_logged(
         .spawn()
 }
 
-fn build(
-    exe: &Path,
-    args: &[String],
-    env: &[(&str, String)],
-    cwd: Option<&Path>,
-) -> Command {
+fn build(exe: &Path, args: &[String], env: &[(&str, String)], cwd: Option<&Path>) -> Command {
     use std::os::windows::process::CommandExt as _;
 
     let mut command = Command::new(exe);

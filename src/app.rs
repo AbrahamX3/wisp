@@ -5,9 +5,9 @@
 //! and the primary action, and nothing else carries colour.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -15,37 +15,37 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::empty::{
+    Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
+};
 use gpui_kit::component::form::{Field, Form};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::separator::Separator;
 use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
-use gpui_kit::component::separator::Separator;
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarItem, SidebarMenu,
     SidebarMenuItem, SidebarToggleButton,
 };
-use gpui_kit::component::Collapsible;
-use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::IndexPath;
-use gpui_kit::component::stepper::{Stepper, StepperItem};
-use gpui_kit::component::Placement;
-use gpui_kit::component::empty::{
-    Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
-};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::skeleton::Skeleton;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::stepper::{Stepper, StepperItem};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::{TextView, TextViewState};
-use gpui_kit::component::switch::Switch;
+use gpui_kit::component::Collapsible;
+use gpui_kit::component::IndexPath;
+use gpui_kit::component::Placement;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Side, Sizable as _, Theme, ThemeMode, WindowExt as _,
 };
@@ -79,10 +79,7 @@ const CATALOG_TTL_SECS: u64 = 12 * 60 * 60;
 /// CPU/RAM samples kept for the sparklines: 150 at 2s each is five minutes.
 const METRIC_SAMPLES: usize = 150;
 
-actions!(
-    wisp,
-    [TogglePalette, GoRuntimes, GoSettings, NewProject]
-);
+actions!(wisp, [TogglePalette, GoRuntimes, GoSettings, NewProject]);
 
 /// Seconds since the Unix epoch.
 fn now_unix() -> u64 {
@@ -242,7 +239,8 @@ impl LogKind {
 
 /// The create/edit dialog's live state. `id` is `None` while creating.
 struct EditorState {
-    id: Option<i64>,    name: Entity<InputState>,
+    id: Option<i64>,
+    name: Entity<InputState>,
     app_name: Entity<InputState>,
     root_path: Entity<InputState>,
     domain: Entity<InputState>,
@@ -487,7 +485,8 @@ impl Wisp {
         };
 
         // Filters the project list; typing re-renders the sidebar.
-        let project_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
+        let project_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
         let log_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find in log"));
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let _subscriptions = vec![
@@ -529,7 +528,8 @@ impl Wisp {
             .collect();
 
         let mut this = Self {
-            theme: settings.theme,            settings,
+            theme: settings.theme,
+            settings,
             toasts: Vec::new(),
             update: UpdateState::Idle,
             update_dismissed: false,
@@ -598,8 +598,7 @@ impl Wisp {
         // MCP requests arrive on a background listener thread. `async_channel`
         // wakes this task; `entity.update` then runs the handler on the UI
         // thread, where all of the project and process state lives.
-        let (mcp_requests, mcp_incoming) =
-            async_channel::unbounded::<mcp::endpoint::Incoming>();
+        let (mcp_requests, mcp_incoming) = async_channel::unbounded::<mcp::endpoint::Incoming>();
         cx.spawn(async move |entity, cx| {
             while let Ok(job) = mcp_incoming.recv().await {
                 let applied = entity.update(cx, |this, cx| this.handle_mcp(job.request, cx));
@@ -739,24 +738,16 @@ impl Wisp {
         });
 
         // The domain mirrors the app name until the user edits it directly.
-        let app_sub = cx.subscribe_in(
-            &app_name,
-            window,
-            |this, _state, event, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.sync_domain(window, cx);
-                }
-            },
-        );
-        let domain_sub = cx.subscribe_in(
-            &domain,
-            window,
-            |this, _state, event, _window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.note_domain_edit(cx);
-                }
-            },
-        );
+        let app_sub = cx.subscribe_in(&app_name, window, |this, _state, event, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.sync_domain(window, cx);
+            }
+        });
+        let domain_sub = cx.subscribe_in(&domain, window, |this, _state, event, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.note_domain_edit(cx);
+            }
+        });
 
         self.editor = Some(EditorState {
             id: existing.as_ref().map(|p| p.id),
@@ -770,7 +761,9 @@ impl Wisp {
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
             overrides,
-            icon: existing.as_ref().and_then(|project| project.icon_path.clone()),
+            icon: existing
+                .as_ref()
+                .and_then(|project| project.icon_path.clone()),
             icon_source: None,
             error: None,
             _subscriptions: vec![app_sub, domain_sub],
@@ -820,12 +813,7 @@ impl Wisp {
     }
 
     /// Open the php.ini editor for a project.
-    fn open_ini_editor(
-        &mut self,
-        project: Project,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_ini_editor(&mut self, project: Project, window: &mut Window, cx: &mut Context<Self>) {
         let overrides = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("upload_max_filesize = 128M\nmax_execution_time = 300")
@@ -982,7 +970,10 @@ impl Wisp {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let picked = rfd::FileDialog::new()
-                .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"])
+                .add_filter(
+                    "Image",
+                    &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"],
+                )
                 .set_title("Choose a project icon")
                 .pick_file();
             let _ = sender.send(picked);
@@ -1027,10 +1018,7 @@ impl Wisp {
 
     /// Copy a picked image next to the project's generated config under a token
     /// name, returning where it landed.
-    fn adopt_icon(
-        source: &std::path::Path,
-        slug: &str,
-    ) -> std::io::Result<String> {
+    fn adopt_icon(source: &std::path::Path, slug: &str) -> std::io::Result<String> {
         let extension = source
             .extension()
             .and_then(|extension| extension.to_str())
@@ -1145,10 +1133,7 @@ impl Wisp {
             match Self::adopt_icon(&source, &db::slugify(&draft.app_name)) {
                 Ok(path) => draft.icon_path = Some(path),
                 Err(error) => {
-                    self.set_editor_error(
-                        format!("Could not save that image: {error}"),
-                        cx,
-                    );
+                    self.set_editor_error(format!("Could not save that image: {error}"), cx);
                     return false;
                 }
             }
@@ -1241,9 +1226,7 @@ impl Wisp {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "Its files on disk stay untouched \u{2014} {root}"
-                        )),
+                        .child(format!("Its files on disk stay untouched \u{2014} {root}")),
                 );
 
             let cancel = Button::new("delete-cancel")
@@ -1286,10 +1269,7 @@ impl Wisp {
             .map(|p| p.name.clone())
             .unwrap_or_default();
 
-        let outcome = self
-            .store
-            .as_ref()
-            .map(|store| store.delete_project(id));
+        let outcome = self.store.as_ref().map(|store| store.delete_project(id));
 
         match outcome {
             Some(Ok(())) => {
@@ -1533,12 +1513,7 @@ impl Wisp {
         .detach();
     }
 
-    fn uninstall_runtime(
-        &mut self,
-        kind: RuntimeKind,
-        version: String,
-        cx: &mut Context<Self>,
-    ) {
+    fn uninstall_runtime(&mut self, kind: RuntimeKind, version: String, cx: &mut Context<Self>) {
         if self.busy_runtime.is_some() {
             return;
         }
@@ -1600,7 +1575,8 @@ impl Wisp {
         cx.notify();
     }
 
-    fn install_vcrt(&mut self, cx: &mut Context<Self>) {        match vcrt::launch_installer() {
+    fn install_vcrt(&mut self, cx: &mut Context<Self>) {
+        match vcrt::launch_installer() {
             Ok(()) => self.push_toast(
                 ToastKind::Success,
                 "The Visual C++ installer is opening. Restart Wisp when it finishes.".to_string(),
@@ -1685,7 +1661,10 @@ impl Wisp {
                 continue;
             }
 
-            let php = project.php_version.clone().filter(|value| !value.is_empty());
+            let php = project
+                .php_version
+                .clone()
+                .filter(|value| !value.is_empty());
             if worker {
                 let Some(php) = php.clone() else {
                     return Err(format!(
@@ -2039,19 +2018,17 @@ impl Wisp {
 
     /// Poll the selected project's log while the Projects screen is open.
     fn spawn_log_poll(cx: &mut Context<Self>) {
-        cx.spawn(async move |entity, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(2000))
-                    .await;
-                let applied = entity.update(cx, |this, cx| {
-                    if this.screen == Screen::Projects {
-                        this.refresh_logs(cx);
-                    }
-                });
-                if applied.is_err() {
-                    break;
+        cx.spawn(async move |entity, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(2000))
+                .await;
+            let applied = entity.update(cx, |this, cx| {
+                if this.screen == Screen::Projects {
+                    this.refresh_logs(cx);
                 }
+            });
+            if applied.is_err() {
+                break;
             }
         })
         .detach();
@@ -2067,10 +2044,7 @@ impl Wisp {
                     .timer(Duration::from_millis(2000))
                     .await;
 
-                let wanted = tracked
-                    .lock()
-                    .map(|slot| slot.clone())
-                    .unwrap_or_default();
+                let wanted = tracked.lock().map(|slot| slot.clone()).unwrap_or_default();
 
                 system.refresh_cpu_usage();
                 system.refresh_memory();
@@ -2115,7 +2089,11 @@ impl Wisp {
     /// The lines the log view is currently showing, in order.
     fn visible_log_lines(&self, cx: &App) -> Vec<String> {
         let raw = self.log_filter.read(cx).value().to_string();
-        let needle = if self.log_case { raw } else { raw.to_lowercase() };
+        let needle = if self.log_case {
+            raw
+        } else {
+            raw.to_lowercase()
+        };
         self.log_lines
             .iter()
             .filter(|line| line_has_level(line, self.log_level))
@@ -2149,7 +2127,11 @@ impl Wisp {
     )]
     fn step_log_match(&mut self, forward: bool, cx: &mut Context<Self>) {
         let raw = self.log_filter.read(cx).value().to_string();
-        let needle = if self.log_case { raw } else { raw.to_lowercase() };
+        let needle = if self.log_case {
+            raw
+        } else {
+            raw.to_lowercase()
+        };
         if needle.is_empty() {
             return;
         }
@@ -2191,7 +2173,8 @@ impl Wisp {
         cx.notify();
     }
 
-    fn clear_log(&mut self, cx: &mut Context<Self>) {        if let Some(path) = self.selected_log_path() {
+    fn clear_log(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_log_path() {
             let _ = std::fs::write(&path, "");
         }
         self.refresh_logs(cx);
@@ -2199,7 +2182,9 @@ impl Wisp {
 
     fn open_log_folder(&mut self, cx: &mut Context<Self>) {
         if let Some(slug) = self.selected_project().map(Project::slug) {
-            let path = serve::config::site_logs(&slug).to_string_lossy().to_string();
+            let path = serve::config::site_logs(&slug)
+                .to_string_lossy()
+                .to_string();
             self.open_folder(&path, cx);
         }
     }
@@ -2263,7 +2248,8 @@ impl Wisp {
         // Removing the ini makes the next sync restart just this worker.
         if php {
             if let Some(project) = self.projects.iter().find(|project| project.id == id) {
-                let _ = std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
+                let _ =
+                    std::fs::remove_file(serve::config::site_dir(&project.slug()).join("php.ini"));
             }
         }
         self.sync_server(cx);
@@ -2338,13 +2324,13 @@ impl Wisp {
                     }
                 }
                 tray::SiteCommand::Open => {
-                    let url = self
-                        .projects
-                        .iter()
-                        .find(|project| project.id == id)
-                        .map(|project| {
-                            format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain)
-                        });
+                    let url =
+                        self.projects
+                            .iter()
+                            .find(|project| project.id == id)
+                            .map(|project| {
+                                format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain)
+                            });
                     if let Some(url) = url {
                         self.open_domain(&url, cx);
                     }
@@ -2371,11 +2357,7 @@ impl Wisp {
                 tray::TraySite {
                     id,
                     name: project.name.clone(),
-                    url: format!(
-                        "{}{}",
-                        scheme_prefix(project.ssl_enabled),
-                        project.domain
-                    ),
+                    url: format!("{}{}", scheme_prefix(project.ssl_enabled), project.domain),
                     running: nginx && php,
                     partial: nginx || php,
                 }
@@ -2398,7 +2380,8 @@ impl Wisp {
         }
     }
 
-    fn set_hosting_control(&mut self, wanted: bool, cx: &mut Context<Self>) {        if wanted {
+    fn set_hosting_control(&mut self, wanted: bool, cx: &mut Context<Self>) {
+        if wanted {
             self.setup_elevated(cx);
         } else {
             self.remove_elevated(cx);
@@ -2885,10 +2868,10 @@ impl Wisp {
             let labelled = compact;
 
             let button = |element_id: &'static str,
-                              icon_name: IconName,
-                              label: &'static str,
-                              tip: String,
-                              enabled: bool| {
+                          icon_name: IconName,
+                          label: &'static str,
+                          tip: String,
+                          enabled: bool| {
                 let button = Button::new(element_id)
                     .ghost()
                     .xsmall()
@@ -3181,7 +3164,8 @@ impl Wisp {
             .collapsed(self.sidebar_collapsed)
             .header(header)
             .child(menu)
-            .footer(nav.render("sidebar-nav", window, cx))    }
+            .footer(nav.render("sidebar-nav", window, cx))
+    }
     fn content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.screen {
             Screen::Projects => self.projects_content(window, cx),
@@ -3198,12 +3182,14 @@ impl Wisp {
 
         let step = self.onboarding_step;
         let php_versions = self.installed_php_versions();
-        let nginx_installed = !self.installed(crate::runtime::RuntimeKind::Nginx).is_empty();
+        let nginx_installed = !self
+            .installed(crate::runtime::RuntimeKind::Nginx)
+            .is_empty();
         let php_done = !php_versions.is_empty();
         let nginx_done = nginx_installed && self.settings.active_nginx.is_some();
         let cert_done = self.settings.ca_trusted;
-        let hosts_done = self.mode != crate::elevation::ControlMode::Uac
-            || !self.hosts_written.is_empty();
+        let hosts_done =
+            self.mode != crate::elevation::ControlMode::Uac || !self.hosts_written.is_empty();
 
         let (step_title, step_desc): (&str, &str) = match step {
             0 => (
@@ -3245,7 +3231,12 @@ impl Wisp {
                     );
                 }
                 if self.catalog_loading {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading versions\u{2026}"));
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading versions\u{2026}"),
+                    );
                 } else if self.catalog.is_some() {
                     let busy = self.busy_runtime.is_some();
                     self.ensure_onboarding_combos(window, cx);
@@ -3302,31 +3293,40 @@ impl Wisp {
                                     }
                                     this.onboarding_php_queue = queue;
                                     // kick off first
-                                    if let Some(first) = this.onboarding_php_queue.first().cloned() {
+                                    if let Some(first) = this.onboarding_php_queue.first().cloned()
+                                    {
                                         this.onboarding_php_queue.remove(0);
-                                        this.install_release(crate::runtime::RuntimeKind::Php, first, cx);
+                                        this.install_release(
+                                            crate::runtime::RuntimeKind::Php,
+                                            first,
+                                            cx,
+                                        );
                                     }
                                 }
                             })),
                     );
                 } else if let Some(err) = self.catalog_error.clone() {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
+                    action_area =
+                        action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
                 }
             }
             1 => {
                 if nginx_done {
+                    action_area =
+                        action_area.child(div().text_sm().text_color(cx.theme().success).child(
+                            format!(
+                                "Active: nginx {}",
+                                self.settings.active_nginx.clone().unwrap_or_default()
+                            ),
+                        ));
+                }
+                if self.catalog_loading {
                     action_area = action_area.child(
                         div()
                             .text_sm()
-                            .text_color(cx.theme().success)
-                            .child(format!(
-                                "Active: nginx {}",
-                                self.settings.active_nginx.clone().unwrap_or_default()
-                            )),
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading versions\u{2026}"),
                     );
-                }
-                if self.catalog_loading {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading versions\u{2026}"));
                 } else if self.catalog.is_some() {
                     let busy = self.busy_runtime.is_some();
                     let installed = self.installed(crate::runtime::RuntimeKind::Nginx);
@@ -3343,7 +3343,10 @@ impl Wisp {
                     }
 
                     // Determine action for selected version.
-                    let selected = self.onboarding_nginx_selected.clone().or_else(|| installed.first().map(|r| r.version.clone()));
+                    let selected = self
+                        .onboarding_nginx_selected
+                        .clone()
+                        .or_else(|| installed.first().map(|r| r.version.clone()));
                     if let Some(version) = selected {
                         let is_installed = installed.iter().any(|r| r.version == version);
                         if is_installed {
@@ -3359,7 +3362,9 @@ impl Wisp {
                                 );
                             }
                         } else if let Some(catalog) = self.catalog.clone() {
-                            if let Some(release) = catalog.nginx.iter().find(|r| r.version == version).cloned() {
+                            if let Some(release) =
+                                catalog.nginx.iter().find(|r| r.version == version).cloned()
+                            {
                                 action_area = action_area.child(
                                     Button::new("onb-install-nginx")
                                         .primary()
@@ -3370,21 +3375,36 @@ impl Wisp {
                                         })
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, _window, cx| {
-                                            this.install_release(crate::runtime::RuntimeKind::Nginx, release.clone(), cx);
+                                            this.install_release(
+                                                crate::runtime::RuntimeKind::Nginx,
+                                                release.clone(),
+                                                cx,
+                                            );
                                         })),
                                 );
                             }
                         }
                     }
                 } else if let Some(err) = self.catalog_error.clone() {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
+                    action_area =
+                        action_area.child(div().text_sm().text_color(cx.theme().danger).child(err));
                 }
             }
             2 => {
                 if cert_done {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().success).child("Trusted."));
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().success)
+                            .child("Trusted."),
+                    );
                 } else if self.trust_busy {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Trusting\u{2026}"));
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Trusting\u{2026}"),
+                    );
                 } else {
                     action_area = action_area.child(
                         Button::new("onb-trust")
@@ -3415,13 +3435,20 @@ impl Wisp {
                             .child(reason),
                     );
                 } else if self.elevation_busy {
-                    action_area = action_area.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Setting up\u{2026}"));
+                    action_area = action_area.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Setting up\u{2026}"),
+                    );
                 } else {
                     action_area = action_area.child(
                         Button::new("onb-hosts")
                             .primary()
                             .label("Set up no-prompt hosts access")
-                            .on_click(cx.listener(|this, _, _window, cx| this.set_hosting_control(true, cx))),
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.set_hosting_control(true, cx)
+                            })),
                     );
                     action_area = action_area.child(
                         div()
@@ -3434,7 +3461,13 @@ impl Wisp {
         }
 
         // Navigation row.
-        let mut nav = div().flex().flex_row().items_center().justify_between().gap_3().mt(px(8.));
+        let mut nav = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .mt(px(8.));
         // Back
         if step > 0 {
             nav = nav.child(
@@ -3454,19 +3487,16 @@ impl Wisp {
         // Skip (steps 2,3) + Continue/Finish
         let mut right = div().flex().flex_row().gap_2();
         if skippable {
-            right = right.child(
-                Button::new("onb-skip")
-                    .ghost()
-                    .label("Skip")
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        if this.onboarding_step < 3 {
-                            this.onboarding_step += 1;
-                        } else {
-                            this.finish_onboarding(cx);
-                        }
-                        cx.notify();
-                    })),
-            );
+            right = right.child(Button::new("onb-skip").ghost().label("Skip").on_click(
+                cx.listener(|this, _, _window, cx| {
+                    if this.onboarding_step < 3 {
+                        this.onboarding_step += 1;
+                    } else {
+                        this.finish_onboarding(cx);
+                    }
+                    cx.notify();
+                }),
+            ));
         }
         if step < 3 {
             right = right.child(
@@ -3512,8 +3542,18 @@ impl Wisp {
                             .items_center()
                             .gap_2()
                             .child(div().size(px(40.)).child(img(APP_ICON).size(px(40.))))
-                            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Welcome to Wisp"))
-                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Let\u{2019}s get you set up in a few steps.")),
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Welcome to Wisp"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Let\u{2019}s get you set up in a few steps."),
+                            ),
                     )
                     .child(
                         Stepper::new("onboarding-stepper")
@@ -3533,8 +3573,19 @@ impl Wisp {
                             .flex_col()
                             .items_center()
                             .gap_2()
-                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(step_title))
-                            .child(div().text_sm().text_color(cx.theme().muted_foreground).text_center().child(step_desc)),
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(step_title),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_center()
+                                    .child(step_desc),
+                            ),
                     )
                     .child(action_area)
                     .child(nav),
@@ -3690,7 +3741,11 @@ impl Wisp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if serving || worker { "Serving" } else { "Stopped" }),
+                                    .child(if serving || worker {
+                                        "Serving"
+                                    } else {
+                                        "Stopped"
+                                    }),
                             )
                             .child(
                                 Link::new("header-domain")
@@ -3928,12 +3983,7 @@ impl Wisp {
 
         ui::section(
             cx,
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(header)
-                .child(rows),
+            div().flex().flex_col().gap_1().child(header).child(rows),
         )
         .into_any_element()
     }
@@ -3991,12 +4041,7 @@ impl Wisp {
 
         ui::section(
             cx,
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(header)
-                .child(body),
+            div().flex().flex_col().gap_1().child(header).child(body),
         )
         .into_any_element()
     }
@@ -4019,7 +4064,8 @@ impl Wisp {
     }
 
     /// Collapse or expand the sidebar, and remember the choice.
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {        self.sidebar_collapsed = !self.sidebar_collapsed;
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
         self.settings.sidebar_collapsed = Some(self.sidebar_collapsed);
         self.settings.save();
         cx.notify();
@@ -4572,7 +4618,12 @@ impl Wisp {
                             cx.notify();
                         }))
                     })
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(count.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(count.clone()),
+                    )
                     .child(
                         Button::new("log-prev")
                             .ghost()
@@ -4580,7 +4631,9 @@ impl Wisp {
                             .icon(icon(IconName::ChevronLeft))
                             .tooltip("Previous match")
                             .disabled(!matching)
-                            .on_click(cx.listener(|this, _, _window, cx| this.step_log_match(false, cx))),
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.step_log_match(false, cx)),
+                            ),
                     )
                     .child(
                         Button::new("log-next")
@@ -4589,7 +4642,9 @@ impl Wisp {
                             .icon(icon(IconName::ChevronRight))
                             .tooltip("Next match")
                             .disabled(!matching)
-                            .on_click(cx.listener(|this, _, _window, cx| this.step_log_match(true, cx))),
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.step_log_match(true, cx)),
+                            ),
                     )
                     .child({
                         let button = Button::new("log-follow")
@@ -4687,10 +4742,13 @@ impl Wisp {
             let lines: Vec<AnyElement> = visible
                 .iter()
                 .map(|(index, line)| {
-                    let mut row = div()
-                        .w_full()
-                        .px(px(2.))
-                        .child(log_line(line, &needle, self.log_case, self.log_wrap, cx));
+                    let mut row = div().w_full().px(px(2.)).child(log_line(
+                        line,
+                        &needle,
+                        self.log_case,
+                        self.log_wrap,
+                        cx,
+                    ));
                     if index % 2 == 1 {
                         row = row.bg(stripe);
                     }
@@ -4818,7 +4876,12 @@ impl Wisp {
                 .child("No projects yet, so nothing has been issued.")
                 .into_any_element()
         } else {
-            div().flex().flex_col().gap_3().children(rows).into_any_element()
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .children(rows)
+                .into_any_element()
         };
 
         ui::section(
@@ -4846,9 +4909,7 @@ impl Wisp {
         let state = match mode {
             ControlMode::Elevated => "Wisp is running elevated, so hosts changes never prompt.",
             ControlMode::Task => "Set up once \u{2014} hosts changes never prompt.",
-            ControlMode::Uac => {
-                "Wisp prompts once on first use, then sets up no-prompt control."
-            }
+            ControlMode::Uac => "Wisp prompts once on first use, then sets up no-prompt control.",
         };
         let action: AnyElement = match mode {
             ControlMode::Elevated => div().into_any_element(),
@@ -5003,10 +5064,7 @@ impl Wisp {
                 .items_center()
                 .gap_4()
                 .p(px(18.))
-                .child(
-                    icon(IconName::TriangleAlert)
-                        .text_color(cx.theme().primary),
-                )
+                .child(icon(IconName::TriangleAlert).text_color(cx.theme().primary))
                 .child(
                     div()
                         .flex()
@@ -5098,7 +5156,11 @@ impl Wisp {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(section_header("PHP", "Choose a version per project. Updates replace the old patch.", cx))
+                .child(section_header(
+                    "PHP",
+                    "Choose a version per project. Updates replace the old patch.",
+                    cx,
+                ))
                 .child(body),
         )
     }
@@ -5174,13 +5236,17 @@ impl Wisp {
                         for release in &installable {
                             let release = release.clone();
                             let entity = entity.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(release.version.clone()).on_click(move |_, _, cx| {
+                            menu = menu.item(PopupMenuItem::new(release.version.clone()).on_click(
+                                move |_, _, cx| {
                                     entity.update(cx, |this, cx| {
-                                        this.install_release(RuntimeKind::Nginx, release.clone(), cx);
+                                        this.install_release(
+                                            RuntimeKind::Nginx,
+                                            release.clone(),
+                                            cx,
+                                        );
                                     });
-                                }),
-                            );
+                                },
+                            ));
                         }
                         menu
                     }
@@ -5419,13 +5485,12 @@ impl Wisp {
             } else {
                 serve::config::http_port()
             };
-            let port_suffix = if (project.ssl_enabled && port == 443)
-                || (!project.ssl_enabled && port == 80)
-            {
-                String::new()
-            } else {
-                format!(":{port}")
-            };
+            let port_suffix =
+                if (project.ssl_enabled && port == 443) || (!project.ssl_enabled && port == 80) {
+                    String::new()
+                } else {
+                    format!(":{port}")
+                };
             object.insert(
                 "probe_url".into(),
                 serde_json::json!(format!("{scheme}://{}{port_suffix}/", project.domain)),
@@ -5764,7 +5829,10 @@ impl Wisp {
                         self.projects
                             .iter()
                             .find(|project| project.id == id)
-                            .map_or_else(|| format!("project {id}"), |project| project.name.clone()),
+                            .map_or_else(
+                                || format!("project {id}"),
+                                |project| project.name.clone(),
+                            ),
                         "php",
                     ),
                 };
@@ -5779,11 +5847,7 @@ impl Wisp {
                 })
             })
             .collect();
-        let (cpu, ram) = self
-            .machine_metrics
-            .back()
-            .copied()
-            .unwrap_or((0.0, 0.0));
+        let (cpu, ram) = self.machine_metrics.back().copied().unwrap_or((0.0, 0.0));
         Ok(serde_json::json!({
             "machine": {
                 "cpu_percent": cpu,
@@ -5835,10 +5899,7 @@ impl Wisp {
         });
         if args.full {
             if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "effective".into(),
-                    serde_json::Value::String(effective),
-                );
+                object.insert("effective".into(), serde_json::Value::String(effective));
             }
         }
         Ok(value)
@@ -5993,11 +6054,7 @@ impl Wisp {
         Ok(serde_json::json!({ "action": "start", "project": project.id }))
     }
 
-    fn mcp_stop_project(
-        &mut self,
-        params: serde_json::Value,
-        cx: &mut Context<Self>,
-    ) -> McpResult {
+    fn mcp_stop_project(&mut self, params: serde_json::Value, cx: &mut Context<Self>) -> McpResult {
         let args: mcp::protocol::ProjectRef = parse_mcp(params)?;
         let project = self.mcp_find(&args.project)?.clone();
         self.mcp_require_idle()?;
@@ -6023,11 +6080,7 @@ impl Wisp {
         Ok(serde_json::json!({ "action": "restart", "project": project.id }))
     }
 
-    fn mcp_set_service(
-        &mut self,
-        params: serde_json::Value,
-        cx: &mut Context<Self>,
-    ) -> McpResult {
+    fn mcp_set_service(&mut self, params: serde_json::Value, cx: &mut Context<Self>) -> McpResult {
         use mcp::protocol::{ServiceAction, ServiceKind};
 
         let args: mcp::protocol::SetServiceParams = parse_mcp(params)?;
@@ -6077,11 +6130,7 @@ impl Wisp {
         }))
     }
 
-    fn mcp_all_services(
-        &mut self,
-        params: serde_json::Value,
-        cx: &mut Context<Self>,
-    ) -> McpResult {
+    fn mcp_all_services(&mut self, params: serde_json::Value, cx: &mut Context<Self>) -> McpResult {
         use mcp::protocol::ServiceAction;
 
         let args: mcp::protocol::AllServicesParams = parse_mcp(params)?;
@@ -6118,9 +6167,11 @@ impl Wisp {
                 format!("Wisp is already installing {busy}."),
             ));
         }
-        if self.runtimes.iter().any(|runtime| {
-            runtime.kind == kind.as_str() && runtime.version == args.version
-        }) {
+        if self
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.kind == kind.as_str() && runtime.version == args.version)
+        {
             return Err(McpFailure::new(
                 "conflict",
                 format!("{} {} is already installed.", kind.label(), args.version),
@@ -6128,7 +6179,10 @@ impl Wisp {
         }
 
         let in_catalog = self.catalog.as_ref().is_some_and(|catalog| match kind {
-            RuntimeKind::Php => catalog.php.iter().any(|release| release.version == args.version),
+            RuntimeKind::Php => catalog
+                .php
+                .iter()
+                .any(|release| release.version == args.version),
             RuntimeKind::Nginx => catalog
                 .nginx
                 .iter()
@@ -6314,11 +6368,7 @@ impl Wisp {
         }))
     }
 
-    fn mcp_set_php_ini(
-        &mut self,
-        params: serde_json::Value,
-        cx: &mut Context<Self>,
-    ) -> McpResult {
+    fn mcp_set_php_ini(&mut self, params: serde_json::Value, cx: &mut Context<Self>) -> McpResult {
         let args: mcp::protocol::SetPhpIniParams = parse_mcp(params)?;
         let project = self.mcp_find(&args.project)?.clone();
         self.mcp_require_idle()?;
@@ -6420,9 +6470,7 @@ impl Wisp {
             .iter()
             .find(|project| project.id == id)
             .cloned()
-            .ok_or_else(|| {
-                McpFailure::internal("The new project is missing from the database.")
-            })?;
+            .ok_or_else(|| McpFailure::internal("The new project is missing from the database."))?;
         Ok(serde_json::json!({
             "created": true,
             "project": self.mcp_project_detail(&project),
@@ -6492,7 +6540,9 @@ impl Wisp {
 
         if restart_worker && self.php_on.contains(&project.id) {
             self.restart_service(project.id, true, cx);
-        } else if sync_site && (self.nginx_on.contains(&project.id) || self.php_on.contains(&project.id)) {
+        } else if sync_site
+            && (self.nginx_on.contains(&project.id) || self.php_on.contains(&project.id))
+        {
             self.sync_server(cx);
         }
 
@@ -6501,7 +6551,9 @@ impl Wisp {
             .iter()
             .find(|candidate| candidate.id == project.id)
             .cloned()
-            .ok_or_else(|| McpFailure::internal("The updated project is missing from the database."))?;
+            .ok_or_else(|| {
+                McpFailure::internal("The updated project is missing from the database.")
+            })?;
         Ok(self.mcp_project_detail(&project))
     }
 
@@ -6656,7 +6708,8 @@ impl Render for Wisp {
             .child(status);
 
         if self.palette_open {
-            page.child(self.palette_overlay(window, cx)).into_any_element()
+            page.child(self.palette_overlay(window, cx))
+                .into_any_element()
         } else {
             page.into_any_element()
         }
@@ -6721,7 +6774,8 @@ fn general_settings_page(entity: &Entity<Wisp>) -> SettingPage {
                         SettingField::switch(
                             move |cx: &App| background_read.read(cx).settings.background,
                             move |value: bool, cx: &mut App| {
-                                background_write.update(cx, |this, cx| this.set_background(value, cx));
+                                background_write
+                                    .update(cx, |this, cx| this.set_background(value, cx));
                             },
                         ),
                     )
@@ -6729,20 +6783,18 @@ fn general_settings_page(entity: &Entity<Wisp>) -> SettingPage {
                 ),
         )
         .group(
-            SettingGroup::new()
-                .title("Startup")
-                .item(
-                    SettingItem::new(
-                        "Start with Windows",
-                        SettingField::switch(
-                            move |cx: &App| autostart_read.read(cx).autostart,
-                            move |value: bool, cx: &mut App| {
-                                autostart_write.update(cx, |this, cx| this.set_autostart(value, cx));
-                            },
-                        ),
-                    )
-                    .description("Opens Wisp when you sign in."),
-                ),
+            SettingGroup::new().title("Startup").item(
+                SettingItem::new(
+                    "Start with Windows",
+                    SettingField::switch(
+                        move |cx: &App| autostart_read.read(cx).autostart,
+                        move |value: bool, cx: &mut App| {
+                            autostart_write.update(cx, |this, cx| this.set_autostart(value, cx));
+                        },
+                    ),
+                )
+                .description("Opens Wisp when you sign in."),
+            ),
         )
 }
 
@@ -6788,7 +6840,8 @@ fn hosting_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
                                 let entity = entity.clone();
                                 move |_, _, cx| {
                                     entity.update(cx, |this, cx| {
-                                        let path = crate::config::root().to_string_lossy().to_string();
+                                        let path =
+                                            crate::config::root().to_string_lossy().to_string();
                                         this.open_folder(&path, cx);
                                     });
                                 }
@@ -6814,7 +6867,9 @@ fn mcp_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
         }
         (false, _) => "Off \u{2014} CLI agents cannot connect.".to_string(),
     };
-    let discovery = mcp::endpoint::discovery_path().to_string_lossy().to_string();
+    let discovery = mcp::endpoint::discovery_path()
+        .to_string_lossy()
+        .to_string();
 
     let server_items = vec![
         SettingItem::new(
@@ -6974,11 +7029,10 @@ fn client_snippet_panel(
                 ),
         )
         .child(
-            div().w_full().text_xs().child(
-                TextView::new(view)
-                    .selectable(true)
-                    .scrollable(false),
-            ),
+            div()
+                .w_full()
+                .text_xs()
+                .child(TextView::new(view).selectable(true).scrollable(false)),
         )
 }
 
@@ -7037,33 +7091,31 @@ fn about_settings_page() -> SettingPage {
     SettingPage::new("About")
         .icon(icon(IconName::Info))
         .description(env!("CARGO_PKG_DESCRIPTION"))
-        .group(
-            SettingGroup::new().title("Wisp").item(SettingItem::render(
-                |_options, _window, cx| {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                        )
-                        .child(
-                            Link::new("about-repository")
-                                .href(REPOSITORY_URL)
-                                .text_sm()
-                                .child(repository_label()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{} licensed", env!("CARGO_PKG_LICENSE"))),
-                        )
-                },
-            )),
-        )
+        .group(SettingGroup::new().title("Wisp").item(SettingItem::render(
+            |_options, _window, cx| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(
+                        Link::new("about-repository")
+                            .href(REPOSITORY_URL)
+                            .text_sm()
+                            .child(repository_label()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{} licensed", env!("CARGO_PKG_LICENSE"))),
+                    )
+            },
+        )))
 }
 
 /// One project row in the sidebar, as the group's entry type.
@@ -7083,7 +7135,6 @@ fn project_entry(
         on_click: Rc::new(cx.listener(move |this, _, _window, cx| this.select(id, cx))),
     }))
 }
-
 
 /// `part` as a percentage of `whole`, or 0 when `whole` is 0.
 ///
@@ -7470,7 +7521,6 @@ fn project_service_row(
         )
 }
 
-
 /// A `file:///` URL for a Windows path, so the shell opens it in Explorer.
 fn folder_url(path: &str) -> String {
     format!("file:///{}", path.replace('\\', "/"))
@@ -7801,8 +7851,18 @@ fn diff_row(marker: &str, text: &str, color: Hsla, cx: &App) -> AnyElement {
         .gap_2()
         .px(px(10.))
         .whitespace_nowrap()
-        .child(div().w(px(8.)).flex_shrink(0.0).text_color(color).child(marker.to_string()))
-        .child(div().text_color(cx.theme().foreground).child(text.to_string()))
+        .child(
+            div()
+                .w(px(8.))
+                .flex_shrink(0.0)
+                .text_color(color)
+                .child(marker.to_string()),
+        )
+        .child(
+            div()
+                .text_color(cx.theme().foreground)
+                .child(text.to_string()),
+        )
         .into_any_element()
 }
 
@@ -7925,16 +7985,15 @@ fn ini_editor_footer(entity: Entity<Wisp>, error: Option<String>) -> impl IntoEl
         footer = footer.child(div().text_xs().text_color(cx_error()).child(message));
     }
 
-    footer
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .justify_between()
-                .gap_2()
-                .child(reset)
-                .child(div().flex().flex_row().gap_2().child(cancel).child(save)),
-        )
+    footer.child(
+        div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .gap_2()
+            .child(reset)
+            .child(div().flex().flex_row().gap_2().child(cancel).child(save)),
+    )
 }
 
 /// The body of the create/edit form.
@@ -7952,11 +8011,10 @@ fn editor_form(
     _window: &mut Window,
     cx: &App,
 ) -> impl IntoElement {
-
-    let php_label = editor
-        .php_version
-        .clone()
-        .map_or_else(|| "Choose a version".to_string(), |version| format!("PHP {version}"));
+    let php_label = editor.php_version.clone().map_or_else(
+        || "Choose a version".to_string(),
+        |version| format!("PHP {version}"),
+    );
 
     let php_menu: AnyElement = if php_versions.is_empty() {
         div()
@@ -8117,60 +8175,61 @@ fn editor_form(
                             Button::new("domain-suffix")
                                 .outline()
                                 .label(current.clone())
-                                .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                                    let entity = entity.clone();
-                                    let mut menu = menu
-                                        .check_side(Side::Right)
-                                        .item(PopupMenuItem::new("Suffix").disabled(true))
-                                        .separator();
-                                    for suffix in db::DOMAIN_SUFFIXES {
-                                        let suffix = (*suffix).to_string();
-                                        let is_current = suffix == current;
-                                        menu = menu.item(
-                                            PopupMenuItem::new(suffix.clone())
-                                                .checked(is_current)
-                                                .on_click({
-                                                    let entity = entity.clone();
-                                                    move |_, _, cx| {
-                                                        let suffix = suffix.clone();
-                                                        entity.update(cx, |this, cx| {
-                                                            if let Some(editor) =
-                                                                this.editor.as_mut()
-                                                            {
-                                                                editor
-                                                                    .domain_suffix
-                                                                    .clone_from(&suffix);
-                                                            }
-                                                            cx.notify();
-                                                        });
-                                                    }
-                                                }),
-                                        );
-                                    }
-                                    menu
-                                })
+                                .dropdown_menu_with_anchor(
+                                    Anchor::BottomRight,
+                                    move |menu, _, _| {
+                                        let entity = entity.clone();
+                                        let mut menu = menu
+                                            .check_side(Side::Right)
+                                            .item(PopupMenuItem::new("Suffix").disabled(true))
+                                            .separator();
+                                        for suffix in db::DOMAIN_SUFFIXES {
+                                            let suffix = (*suffix).to_string();
+                                            let is_current = suffix == current;
+                                            menu = menu.item(
+                                                PopupMenuItem::new(suffix.clone())
+                                                    .checked(is_current)
+                                                    .on_click({
+                                                        let entity = entity.clone();
+                                                        move |_, _, cx| {
+                                                            let suffix = suffix.clone();
+                                                            entity.update(cx, |this, cx| {
+                                                                if let Some(editor) =
+                                                                    this.editor.as_mut()
+                                                                {
+                                                                    editor
+                                                                        .domain_suffix
+                                                                        .clone_from(&suffix);
+                                                                }
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    },
+                                )
                                 .into_any_element()
                         }),
                 ),
         )
         .child(Field::new().label("PHP Version").child(php_menu))
-        .child(
-            Field::new().label("HTTPS").child({
-                let entity = entity.clone();
-                Switch::new("ssl")
-                    .checked(editor.ssl_enabled)
-                    .label("Trusted certificate")
-                    .on_change(move |checked, _, cx| {
-                        let checked = *checked;
-                        entity.update(cx, |this, cx| {
-                            if let Some(editor) = this.editor.as_mut() {
-                                editor.ssl_enabled = checked;
-                            }
-                            cx.notify();
-                        });
-                    })
-            }),
-        )
+        .child(Field::new().label("HTTPS").child({
+            let entity = entity.clone();
+            Switch::new("ssl")
+                .checked(editor.ssl_enabled)
+                .label("Trusted certificate")
+                .on_change(move |checked, _, cx| {
+                    let checked = *checked;
+                    entity.update(cx, |this, cx| {
+                        if let Some(editor) = this.editor.as_mut() {
+                            editor.ssl_enabled = checked;
+                        }
+                        cx.notify();
+                    });
+                })
+        }))
         .child(
             Field::new()
                 .label("php.ini overrides")
@@ -8221,7 +8280,11 @@ fn editor_footer(entity: Entity<Wisp>, is_new: bool) -> impl IntoElement {
         });
 
     let save = Button::new("editor-save")
-        .label(if is_new { "Create project" } else { "Save changes" })
+        .label(if is_new {
+            "Create project"
+        } else {
+            "Save changes"
+        })
         .primary()
         .on_click(move |_, window, cx| {
             let saved = entity.update(cx, Wisp::save_editor);
@@ -8298,11 +8361,7 @@ fn measure_services(
     wanted: &[serve::Tracked],
 ) -> Vec<(Option<i64>, f64, u64)> {
     let processes = system.processes();
-    let parent_of = |pid: sysinfo::Pid| {
-        processes
-            .get(&pid)
-            .and_then(sysinfo::Process::parent)
-    };
+    let parent_of = |pid: sysinfo::Pid| processes.get(&pid).and_then(sysinfo::Process::parent);
 
     wanted
         .iter()
@@ -8403,11 +8462,7 @@ impl LogLevel {
     /// Which filters are worth offering for a given source.
     fn for_kind(kind: LogKind) -> &'static [LogLevel] {
         match kind {
-            LogKind::Access => &[
-                LogLevel::All,
-                LogLevel::Client,
-                LogLevel::Server,
-            ],
+            LogKind::Access => &[LogLevel::All, LogLevel::Client, LogLevel::Server],
             _ => &[
                 LogLevel::All,
                 LogLevel::Fatal,
@@ -8438,12 +8493,7 @@ fn access_status(line: &str) -> Option<u16> {
     let mut quotes = line.split('"');
     quotes.next()?;
     quotes.next()?;
-    quotes
-        .next()?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+    quotes.next()?.split_whitespace().next()?.parse().ok()
 }
 
 /// One log line, with every hit on the search term emphasised.
@@ -8564,8 +8614,7 @@ fn random_token() -> String {
 /// Where a project's chosen icon is kept: with its generated config, under a
 /// token name.
 fn project_icon_path(slug: &str, token: &str, extension: &str) -> std::path::PathBuf {
-    serve::config::site_dir(slug)
-        .join(format!("icon-{token}.{extension}"))
+    serve::config::site_dir(slug).join(format!("icon-{token}.{extension}"))
 }
 
 /// A stable hue for a name, so a project's generated icon keeps its colour.
@@ -8720,10 +8769,7 @@ impl Collapsible for ProjectEntry {
 
     fn collapsed(self, collapsed: bool) -> Self {
         match self {
-            ProjectEntry::Row(row) => ProjectEntry::Row(Box::new(ProjectRow {
-                collapsed,
-                ..*row
-            })),
+            ProjectEntry::Row(row) => ProjectEntry::Row(Box::new(ProjectRow { collapsed, ..*row })),
             ProjectEntry::Note(note) => ProjectEntry::Note(note),
         }
     }
@@ -8852,16 +8898,10 @@ fn about_content(cx: &App) -> impl IntoElement {
                         .child(repository_label()),
                 ),
         )
-        .child(
-            div()
-                .w_full()
-                .text_xs()
-                .text_color(muted)
-                .child(format!(
-                    "Built with Rust and GPUI Kit \u{00b7} {} licensed",
-                    env!("CARGO_PKG_LICENSE")
-                )),
-        )
+        .child(div().w_full().text_xs().text_color(muted).child(format!(
+            "Built with Rust and GPUI Kit \u{00b7} {} licensed",
+            env!("CARGO_PKG_LICENSE")
+        )))
 }
 
 fn repository_label() -> &'static str {
@@ -9074,7 +9114,10 @@ mod tests {
         // 3 -> 2 -> 1, and 9 standing on its own.
         let table: HashMap<u32, u32> = [(2_u32, 1_u32), (3, 2)].into_iter().collect();
         let parent_of = |pid: sysinfo::Pid| {
-            table.get(&pid.as_u32()).copied().map(sysinfo::Pid::from_u32)
+            table
+                .get(&pid.as_u32())
+                .copied()
+                .map(sysinfo::Pid::from_u32)
         };
 
         assert!(descends_from(&parent_of, pid(1), pid(1)));
@@ -9088,7 +9131,10 @@ mod tests {
     fn a_cycle_in_the_process_table_does_not_hang_the_walk() {
         let table: HashMap<u32, u32> = [(1_u32, 2_u32), (2, 1)].into_iter().collect();
         let parent_of = |pid: sysinfo::Pid| {
-            table.get(&pid.as_u32()).copied().map(sysinfo::Pid::from_u32)
+            table
+                .get(&pid.as_u32())
+                .copied()
+                .map(sysinfo::Pid::from_u32)
         };
 
         assert!(!descends_from(&parent_of, pid(1), pid(7)));
@@ -9144,10 +9190,7 @@ mod tests {
             ram_history: history,
         };
         let mut kept = vec![existing];
-        merge_samples(
-            &mut kept,
-            vec![(Some(1), 9.0, 2048), (None, 1.0, 512)],
-        );
+        merge_samples(&mut kept, vec![(Some(1), 9.0, 2048), (None, 1.0, 512)]);
 
         assert_eq!(kept.len(), 2);
         let project = &kept[0];
@@ -9166,7 +9209,10 @@ mod tests {
 
     #[test]
     fn a_search_term_is_located_wherever_it_appears() {
-        assert_eq!(find_ranges("nginx error nginx", "nginx", true), vec![(0, 5), (12, 17)]);
+        assert_eq!(
+            find_ranges("nginx error nginx", "nginx", true),
+            vec![(0, 5), (12, 17)]
+        );
         assert_eq!(find_ranges("nothing here", "nginx", true), vec![]);
         assert_eq!(find_ranges("", "nginx", true), vec![]);
         assert_eq!(find_ranges("nginx", "", true), vec![]);
@@ -9239,7 +9285,10 @@ mod tests {
                 _ => None,
             })
             .sum();
-        assert!(skipped >= 90, "the unchanged bulk should collapse: {skipped}");
+        assert!(
+            skipped >= 90,
+            "the unchanged bulk should collapse: {skipped}"
+        );
 
         let context = rows
             .iter()

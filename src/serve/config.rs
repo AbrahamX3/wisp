@@ -173,12 +173,7 @@ server {{
 ///
 /// `extension_dir` must be set before any `extension=` line, or PHP cannot find
 /// the DLLs, so it goes at the very top, ahead of the template.
-pub fn php_ini(
-    template: &str,
-    extension_dir: &Path,
-    error_log: &Path,
-    overrides: &str,
-) -> String {
+pub fn php_ini(template: &str, extension_dir: &Path, error_log: &Path, overrides: &str) -> String {
     let lookup_dir = extension_dir.to_path_buf();
     let extension_dir = nginx_path(extension_dir);
     let error_log = nginx_path(error_log);
@@ -209,10 +204,23 @@ max_execution_time=120\n\
 ",
     );
 
+    let ca_bundle = crate::config::ca_bundle();
+    if ca_bundle.is_file() {
+        let ca_bundle = nginx_path(&ca_bundle);
+        let _ = write!(
+            out,
+            r#"curl.cainfo="{ca_bundle}"
+openssl.cafile="{ca_bundle}"
+"#
+        );
+    }
+
     let overrides = overrides.trim();
     // An older record may hold the placeholder empty object; ignore it.
     if !overrides.is_empty() && overrides != "{}" {
-        out.push_str("\n; ---- Project overrides ------------------------------------------------\n");
+        out.push_str(
+            "\n; ---- Project overrides ------------------------------------------------\n",
+        );
         out.push_str(overrides);
         out.push('\n');
     }
@@ -291,7 +299,9 @@ mod tests {
         assert!(vhost.contains("root  \"C:/Sites/myapp/public\";"));
         assert!(vhost.contains("fastcgi_pass   127.0.0.1:9071;"));
         assert!(vhost.contains("try_files $uri $uri/ /index.php?$query_string;"));
-        assert!(vhost.contains(r#"error_log   "C:/Users/me/.config/wisp/sites/myapp/logs/error.log";"#));
+        assert!(
+            vhost.contains(r#"error_log   "C:/Users/me/.config/wisp/sites/myapp/logs/error.log";"#)
+        );
     }
 
     #[test]
@@ -340,11 +350,9 @@ mod tests {
             "an extension without a DLL stays off"
         );
         assert!(!ini.lines().any(|line| line.trim() == "extension=snmp"));
-        assert!(
-            !ini
-                .lines()
-                .any(|line| line.trim() == "extension=pdo_firebird")
-        );
+        assert!(!ini
+            .lines()
+            .any(|line| line.trim() == "extension=pdo_firebird"));
         let dir_at = ini.find("extension_dir=").expect("extension_dir is set");
         let intl_at = ini.find("extension=intl").expect("intl is enabled");
         assert!(
@@ -393,7 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn a_public_folder_is_used_when_present() {        let root = std::env::temp_dir().join("wisp-docroot-test");
+    fn a_public_folder_is_used_when_present() {
+        let root = std::env::temp_dir().join("wisp-docroot-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("public")).unwrap();
         std::fs::write(root.join("public").join("index.php"), "<?php").unwrap();
@@ -443,7 +452,10 @@ mod tests {
             .output()
             .expect("php.exe should run");
         let modules = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        assert!(modules.contains("intl"), "intl should be loaded:\n{modules}");
+        assert!(
+            modules.contains("intl"),
+            "intl should be loaded:\n{modules}"
+        );
         assert!(modules.contains("curl"), "curl should be loaded");
 
         let _ = std::fs::remove_file(&ini_path);

@@ -39,4 +39,3 @@ fn section_base(cx: &App) -> Div {
 pub fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(8.)).rounded_full().bg(color)
 }
-

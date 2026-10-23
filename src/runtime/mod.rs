@@ -134,7 +134,10 @@ mod tests {
         };
 
         let dir = install(RuntimeKind::Nginx, &release, &|_| {}).expect("install should succeed");
-        assert!(dir.join("nginx.exe").is_file(), "nginx.exe should be unpacked");
+        assert!(
+            dir.join("nginx.exe").is_file(),
+            "nginx.exe should be unpacked"
+        );
         assert!(dir.join("conf").join("nginx.conf").is_file());
         assert!(dir.join("logs").is_dir());
         assert!(dir.join("temp").is_dir());

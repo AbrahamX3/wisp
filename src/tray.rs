@@ -16,7 +16,10 @@ use gpui_tray::{Icon, Tray};
 const ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-32.rgba"));
 const ICON_SIZE: u32 = 32;
 
-actions!(wisp_tray, [OpenWindow, QuitApp, StartAll, StopAll, RestartAll]);
+actions!(
+    wisp_tray,
+    [OpenWindow, QuitApp, StartAll, StopAll, RestartAll]
+);
 
 /// What a site's submenu can ask for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -113,7 +116,8 @@ impl Global for TrayState {}
 
 /// True while closing the window should hide to the tray instead of exiting.
 pub fn is_enabled(cx: &App) -> bool {
-    cx.try_global::<TrayState>().is_some_and(|state| state.enabled)
+    cx.try_global::<TrayState>()
+        .is_some_and(|state| state.enabled)
 }
 
 /// Rebuild the tray menu from the current [`TrayMenuData`]. A no-op when the
@@ -188,7 +192,13 @@ fn site_submenu(site: &TraySite) -> MenuItem {
     // A short hint of the address, so the submenu is identifiable at a glance.
     if !site.url.is_empty() {
         items.push(MenuItem::separator());
-        items.push(MenuItem::action(site.url.clone(), SiteAction { id, command: SiteCommand::Open }));
+        items.push(MenuItem::action(
+            site.url.clone(),
+            SiteAction {
+                id,
+                command: SiteCommand::Open,
+            },
+        ));
     }
 
     MenuItem::submenu(Menu {

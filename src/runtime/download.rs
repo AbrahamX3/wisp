@@ -35,11 +35,7 @@ const MAX_BODY: u64 = 1024 * 1024 * 1024;
 /// `progress` is called with a fraction between 0 and 1 as bytes arrive, and
 /// only when the server said how large the file is; archives served without a
 /// length simply report nothing.
-pub fn download_to_reporting(
-    url: &str,
-    dest: &Path,
-    progress: &dyn Fn(f32),
-) -> Result<()> {
+pub fn download_to_reporting(url: &str, dest: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let mut response = ureq::get(url)
         .call()
         .map_err(|error| http_error(url, error))?;
@@ -163,10 +159,7 @@ mod tests {
 
     #[test]
     fn keeps_everything_when_nothing_is_stripped() {
-        assert_eq!(
-            strip_components("php.exe", 0).as_deref(),
-            Some("php.exe")
-        );
+        assert_eq!(strip_components("php.exe", 0).as_deref(), Some("php.exe"));
         assert_eq!(
             strip_components("ext/php_curl.dll", 0).as_deref(),
             Some("ext/php_curl.dll")
@@ -199,7 +192,9 @@ mod tests {
             let mut writer = zip::ZipWriter::new(&mut buffer);
             let options = zip::write::SimpleFileOptions::default();
             writer.add_directory("nginx-1.27.0/", options).unwrap();
-            writer.start_file("nginx-1.27.0/nginx.exe", options).unwrap();
+            writer
+                .start_file("nginx-1.27.0/nginx.exe", options)
+                .unwrap();
             writer.write_all(b"binary").unwrap();
             writer
                 .start_file("nginx-1.27.0/conf/nginx.conf", options)

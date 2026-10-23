@@ -70,10 +70,7 @@ pub fn parse_php(pages: &[(&str, &str)]) -> Vec<Release> {
 
 /// Parse the nginx download index.
 pub fn parse_nginx(html: &str) -> Vec<Release> {
-    let mut out: Vec<Release> = hrefs(html)
-        .into_iter()
-        .filter_map(nginx_release)
-        .collect();
+    let mut out: Vec<Release> = hrefs(html).into_iter().filter_map(nginx_release).collect();
     sort_desc(&mut out);
     out.truncate(24);
     out
@@ -139,7 +136,8 @@ fn hrefs(html: &str) -> Vec<&str> {
 /// A plain `x.y.z` version, with no release-candidate suffix.
 fn is_stable(version: &str) -> bool {
     let mut parts = version.split('.');
-    let (Some(a), Some(b), Some(c), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return false;
     };
@@ -207,7 +205,10 @@ mod tests {
         let newer = r#"<a href="php-8.3.35-nts-Win32-vs16-x64.zip">x</a>"#;
         let releases = parse_php(&[(newer, "https://a/"), (older, "https://b/")]);
         assert_eq!(releases.len(), 1);
-        assert_eq!(releases[0].url, "https://a/php-8.3.35-nts-Win32-vs16-x64.zip");
+        assert_eq!(
+            releases[0].url,
+            "https://a/php-8.3.35-nts-Win32-vs16-x64.zip"
+        );
     }
 
     #[test]

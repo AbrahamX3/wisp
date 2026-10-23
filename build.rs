@@ -52,8 +52,8 @@ fn set_main_thread_stack() {
 
 /// Rasterise the SVG and write the `.ico` and the tray pixels.
 fn generate_icons(ico_path: &Path, tray_path: &Path) {
-    let svg = std::fs::read_to_string("assets/icon.svg")
-        .expect("assets/icon.svg should be readable");
+    let svg =
+        std::fs::read_to_string("assets/icon.svg").expect("assets/icon.svg should be readable");
     let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
         .expect("assets/icon.svg should be valid SVG");
 
@@ -120,8 +120,7 @@ fn build_ico(tree: &resvg::usvg::Tree) -> Vec<u8> {
     reason = "icon sizes are small integers, exact in f32"
 )]
 fn render_pixmap(tree: &resvg::usvg::Tree, size: u32) -> resvg::tiny_skia::Pixmap {
-    let mut pixmap =
-        resvg::tiny_skia::Pixmap::new(size, size).expect("a non-zero pixmap size");
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("a non-zero pixmap size");
     let scale = size as f32 / VIEWBOX;
     resvg::render(
         tree,
@@ -160,7 +159,11 @@ fn embed_windows_metadata(ico_path: &Path) {
     res.set("CompanyName", "AbrahamX3");
     res.set("LegalCopyright", "Copyright (c) 2026 AbrahamX3");
     res.set("OriginalFilename", "wisp.exe");
-    res.set_icon(ico_path.to_str().expect("the icon path should be valid UTF-8"));
+    res.set_icon(
+        ico_path
+            .to_str()
+            .expect("the icon path should be valid UTF-8"),
+    );
     if let Err(error) = res.compile() {
         eprintln!("winresource failed: {error}");
     }

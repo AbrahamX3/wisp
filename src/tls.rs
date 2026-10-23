@@ -122,8 +122,7 @@ pub fn issue(domain: &str) -> Result<TlsPaths> {
     let ca_pem = std::fs::read_to_string(ca_cert())?;
     let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
 
-    let mut params =
-        CertificateParams::new(vec![domain.to_string(), format!("*.{domain}")])?;
+    let mut params = CertificateParams::new(vec![domain.to_string(), format!("*.{domain}")])?;
     params.distinguished_name.push(DnType::CommonName, domain);
     params.subject_alt_names.extend([
         SanType::DnsName("localhost".try_into()?),
@@ -172,7 +171,7 @@ pub fn trust_ca() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ca_cert, paths_for, ensure_ca, issue};
+    use super::{ca_cert, ensure_ca, issue, paths_for};
 
     /// Exercises real certificate generation. Touches no certificate store.
     #[test]

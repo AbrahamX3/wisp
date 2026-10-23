@@ -112,7 +112,8 @@ mod tests {
 
     #[test]
     fn replaces_an_existing_block_without_duplicating() {
-        let existing = "127.0.0.1 localhost\r\n\r\n# wisp:start\r\n127.0.0.1\told.test\r\n# wisp:end\r\n";
+        let existing =
+            "127.0.0.1 localhost\r\n\r\n# wisp:start\r\n127.0.0.1\told.test\r\n# wisp:end\r\n";
         let updated = apply(existing, &domains(&["new.test"]));
         assert!(!updated.contains("old.test"));
         assert!(updated.contains("127.0.0.1\tnew.test"));
