@@ -238,6 +238,17 @@ pub struct SetPhpIniParams {
     pub overrides: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SetNginxOverridesParams {
+    /// Project id, name, slug, or domain.
+    pub project: String,
+    /// Raw nginx directives for the project's server block, placed ahead of
+    /// Wisp's generated locations. `$wisp_php` is the project's PHP worker
+    /// (`fastcgi_pass $wisp_php;`). This replaces the whole block; pass an
+    /// empty string to clear.
+    pub overrides: String,
+}
+
 /// Arguments for `get_php_ini`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProjectOnlyParams {
@@ -287,6 +298,9 @@ pub struct CreateProjectParams {
     /// Initial php.ini directives, one per line.
     #[serde(default)]
     pub php_ini_overrides: Option<String>,
+    /// Initial nginx directives for the project's server block.
+    #[serde(default)]
+    pub nginx_overrides: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -309,6 +323,9 @@ pub struct UpdateProjectParams {
     /// Replacement php.ini directives; an empty string clears them.
     #[serde(default)]
     pub php_ini_overrides: Option<String>,
+    /// Replacement nginx directives; an empty string clears them.
+    #[serde(default)]
+    pub nginx_overrides: Option<String>,
 }
 
 #[cfg(test)]

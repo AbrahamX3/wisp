@@ -28,6 +28,12 @@ version, and the app fetches the runtime it needs.
 - **Per-project `php.ini`** — generated from the runtime's own template, with
   your overrides applied last. An editor shows the generated file, your
   overrides, and a diff of what they change; saving restarts the worker.
+- **Per-project nginx overrides** — your own directives in the project's server
+  block, ahead of the generated locations: a second front controller
+  (`location ^~ /api/ { ... fastcgi_pass $wisp_php; }`), extra headers, a
+  redirect. `$wisp_php` is the project's PHP worker. nginx checks the result
+  (`nginx -t`) before it is applied, and refuses it without stopping the other
+  sites.
 - **Per-service control** — start, stop and restart a project's nginx entry and
   its PHP worker independently, or both together, from the window or the tray.
 - **HTTPS by default** — a local certificate authority issues a certificate per

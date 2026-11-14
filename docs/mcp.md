@@ -183,6 +183,7 @@ accepts `fatal`/`error`, `warning`, `notice`/`info` for error-like logs, and
 | `set_project_https` | `project`, `enabled` | Issues a certificate and adds the TLS server block, or turns HTTPS off (the certificate file stays on disk). |
 | `set_php_ini_overrides` | `project`, `overrides` | Replaces the project's raw php.ini directives (one per line). Restarts the worker. |
 | `reset_php_ini` | `project` | Clears the overrides. Restarts the worker. |
+| `set_nginx_overrides` | `project`, `overrides` | Replaces the project's raw nginx directives, placed in its server block ahead of the generated locations. `$wisp_php` is the project's PHP worker (`fastcgi_pass $wisp_php;`). Checked with `nginx -t` first: if nginx refuses it, the previous configuration keeps serving and the error is returned. An empty string clears it. |
 | `repair_hosts` | — | Rewrites Wisp's hosts block. May show a UAC prompt; the tool waits for it. |
 | `trust_ca` | — | Trusts Wisp's local CA for the current user. May show a Windows prompt; the tool waits. |
 
