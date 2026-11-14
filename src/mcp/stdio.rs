@@ -28,8 +28,8 @@ use super::endpoint;
 use super::protocol::{
     AllServicesParams, CreateProjectParams, GetPhpIniParams, GetResourcesParams,
     InstallRuntimeParams, ProjectOnlyParams, ProjectRef, ReadLogParams, SetActiveNginxParams,
-    SetPhpIniParams, SetProjectHttpsParams, SetProjectPhpParams, SetServiceParams,
-    UninstallRuntimeParams, UpdateProjectParams,
+    SetNginxOverridesParams, SetPhpIniParams, SetProjectHttpsParams, SetProjectPhpParams,
+    SetServiceParams, UninstallRuntimeParams, UpdateProjectParams,
 };
 
 /// A local call is cheap; an action that waits on a sync or a UAC prompt is
@@ -819,6 +819,20 @@ impl WispServer {
             .fetch("set_php_ini_overrides", params(&arguments))
             .await
         {
+            Ok(_) => self.after_serving(&arguments.project).await,
+            Err(error) => Ok(error.into_result()),
+        }
+    }
+
+    #[tool(
+        description = "Replace a project's nginx directives: raw nginx text added to the project's server block, ahead of Wisp's generated locations (for example a `location ^~ /api/ { ... }` block for a second front controller). `$wisp_php` is the project's PHP worker, so use `fastcgi_pass $wisp_php;`. This replaces the whole block; an empty string clears it. nginx checks the result (`nginx -t`) before it is applied; if nginx refuses it, the previous configuration keeps serving and the error is returned.",
+        annotations(destructive_hint = false)
+    )]
+    async fn set_nginx_overrides(
+        &self,
+        Parameters(arguments): Parameters<SetNginxOverridesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.fetch("set_nginx_overrides", params(&arguments)).await {
             Ok(_) => self.after_serving(&arguments.project).await,
             Err(error) => Ok(error.into_result()),
         }

@@ -40,6 +40,15 @@ pub fn spawn_logged(
         .spawn()
 }
 
+/// Run a process with no window to completion and capture what it printed.
+/// Used for `nginx -t`, whose verdict is on stderr.
+pub fn output(exe: &Path, args: &[String]) -> std::io::Result<std::process::Output> {
+    build(exe, args, &[], None)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+}
+
 fn build(exe: &Path, args: &[String], env: &[(&str, String)], cwd: Option<&Path>) -> Command {
     use std::os::windows::process::CommandExt as _;
 

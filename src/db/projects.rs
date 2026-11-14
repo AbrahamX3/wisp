@@ -21,6 +21,9 @@ pub struct Project {
     pub ssl_enabled: bool,
     /// Per-project `php.ini` overrides, as a JSON object string.
     pub php_ini_overrides: String,
+    /// Raw nginx directives added to the project's server block, ahead of the
+    /// generated locations (for a second front controller, extra headers...).
+    pub nginx_overrides: String,
     /// The icon this project chose, if any. Empty means the generated
     /// squircle is used, so existing projects need nothing written for them.
     pub icon_path: Option<String>,
@@ -52,6 +55,7 @@ pub struct ProjectDraft {
     pub php_version: Option<String>,
     pub ssl_enabled: bool,
     pub php_ini_overrides: String,
+    pub nginx_overrides: String,
     /// The chosen icon, carried through the form.
     pub icon_path: Option<String>,
 }
@@ -72,6 +76,7 @@ impl ProjectDraft {
             } else {
                 project.php_ini_overrides.clone()
             },
+            nginx_overrides: project.nginx_overrides.clone(),
         }
     }
 
@@ -88,6 +93,10 @@ impl ProjectDraft {
         // Older records stored an empty JSON object; treat it as "none".
         if self.php_ini_overrides == "{}" {
             self.php_ini_overrides.clear();
+        }
+        self.nginx_overrides = self.nginx_overrides.trim().to_string();
+        if let Err(message) = validate_nginx_overrides(&self.nginx_overrides) {
+            return Err(Error::Validation(message));
         }
 
         if self.name.is_empty() {
@@ -116,7 +125,8 @@ impl Store {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT id, name, app_name, root_path, domain, php_version,
-                    ssl_enabled, php_ini_overrides, created_at, updated_at, icon_path
+                    ssl_enabled, php_ini_overrides, nginx_overrides, created_at, updated_at,
+                    icon_path
              FROM projects ORDER BY name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], row_to_project)?;
@@ -134,8 +144,9 @@ impl Store {
         conn.execute(
             "INSERT INTO projects
                 (name, app_name, root_path, domain, php_version,
-                 ssl_enabled, php_ini_overrides, icon_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?9, ?8, ?8)",
+                 ssl_enabled, php_ini_overrides, icon_path, created_at, updated_at,
+                 nginx_overrides)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?9, ?8, ?8, ?10)",
             rusqlite::params![
                 draft.name,
                 draft.app_name,
@@ -146,6 +157,7 @@ impl Store {
                 draft.php_ini_overrides,
                 now,
                 draft.icon_path,
+                draft.nginx_overrides,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -162,7 +174,7 @@ impl Store {
             "UPDATE projects SET
                 name = ?2, app_name = ?3, root_path = ?4, domain = ?5,
                 php_version = ?6, ssl_enabled = ?7, php_ini_overrides = ?8,
-                icon_path = ?10, updated_at = ?9
+                icon_path = ?10, updated_at = ?9, nginx_overrides = ?11
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -175,6 +187,7 @@ impl Store {
                 draft.php_ini_overrides,
                 now_unix(),
                 draft.icon_path,
+                draft.nginx_overrides,
             ],
         )?;
         Ok(())
@@ -218,6 +231,7 @@ fn row_to_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         php_version: row.get("php_version")?,
         ssl_enabled: row.get::<_, i64>("ssl_enabled")? != 0,
         php_ini_overrides: row.get("php_ini_overrides")?,
+        nginx_overrides: row.get("nginx_overrides")?,
         icon_path: row.get("icon_path")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -299,9 +313,111 @@ pub fn validate_domain(domain: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// A first check of a project's nginx overrides, so the editor can point at an
+/// obvious mistake. nginx itself (`nginx -t`) has the final word before the
+/// snippet is applied; this only catches what would otherwise surface as a
+/// confusing error about another line of the generated file.
+pub fn validate_nginx_overrides(text: &str) -> std::result::Result<(), String> {
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut word = String::new();
+    let mut words_before_block: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if let Some(open) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == open {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '#' => break, // the rest of the line is a comment
+                '"' | '\'' => quote = Some(ch),
+                '{' => {
+                    // `server` or `http` blocks belong to Wisp: a snippet lives
+                    // inside the project's own server block.
+                    let first = words_before_block.first().map(String::as_str);
+                    if depth == 0 && matches!(first, Some("server" | "http" | "events")) {
+                        return Err(format!(
+                            "nginx overrides go inside the project's server block, so they cannot open a `{}` block.",
+                            first.unwrap_or_default()
+                        ));
+                    }
+                    depth += 1;
+                    words_before_block.clear();
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err("The nginx overrides close a block that was never opened (an extra `}`).".into());
+                    }
+                    words_before_block.clear();
+                }
+                ';' => words_before_block.clear(),
+                c if c.is_whitespace() => {
+                    if !word.is_empty() {
+                        words_before_block.push(std::mem::take(&mut word));
+                    }
+                }
+                c => {
+                    word.push(c);
+                    if chars
+                        .peek()
+                        .is_none_or(|next| next.is_whitespace() || matches!(next, '{' | '}' | ';'))
+                    {
+                        words_before_block.push(std::mem::take(&mut word));
+                    }
+                }
+            }
+        }
+        if !word.is_empty() {
+            words_before_block.push(std::mem::take(&mut word));
+        }
+    }
+
+    if quote.is_some() {
+        return Err("The nginx overrides leave a quote open.".into());
+    }
+    if depth > 0 {
+        return Err(
+            "The nginx overrides open a block that is never closed (a missing `}`).".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{slugify, split_domain, validate_domain};
+    use super::{slugify, split_domain, validate_domain, validate_nginx_overrides};
+
+    #[test]
+    fn a_location_block_is_accepted_as_nginx_overrides() {
+        let snippet = "location ^~ /api/ {\n    include fastcgi_params;\n    fastcgi_param SCRIPT_FILENAME $document_root/api/index.php;\n    fastcgi_pass $wisp_php; # the project's PHP\n}\nadd_header X-Test \"a { b }\";";
+        assert!(validate_nginx_overrides(snippet).is_ok());
+        assert!(validate_nginx_overrides("").is_ok());
+    }
+
+    #[test]
+    fn unbalanced_nginx_overrides_are_rejected() {
+        assert!(validate_nginx_overrides("location / {\n  return 200;\n").is_err());
+        assert!(validate_nginx_overrides("return 200; }").is_err());
+        assert!(validate_nginx_overrides("add_header X-Test \"open;").is_err());
+    }
+
+    #[test]
+    fn nginx_overrides_cannot_open_a_server_block() {
+        assert!(validate_nginx_overrides("server {\n  listen 81;\n}").is_err());
+        assert!(validate_nginx_overrides("server{ listen 81; }").is_err());
+        // The word inside another block is fine (a location named after it).
+        assert!(validate_nginx_overrides("location /server {\n  return 204;\n}").is_ok());
+    }
 
     #[test]
     fn slugify_lowercases_and_dashes() {
@@ -365,6 +481,7 @@ mod store_tests {
             php_version: Some("8.3".to_string()),
             ssl_enabled: true,
             php_ini_overrides: "{}".to_string(),
+            nginx_overrides: String::new(),
         }
     }
 
@@ -396,10 +513,20 @@ mod store_tests {
 
         let mut edit = draft("My Shop", "shop.test");
         edit.name = "Renamed".to_string();
+        edit.nginx_overrides = "  location /health {\n    return 204;\n}\n".to_string();
         store.update_project(id, &edit).unwrap();
         let projects = store.list_projects().unwrap();
         assert_eq!(projects[0].name, "Renamed");
         assert_eq!(projects[0].domain, "shop.test");
+        assert_eq!(
+            projects[0].nginx_overrides, "location /health {\n    return 204;\n}",
+            "nginx overrides are stored trimmed"
+        );
+
+        // A snippet nginx could not read is refused before it is stored.
+        let mut broken = edit.clone();
+        broken.nginx_overrides = "location / {".to_string();
+        assert!(store.update_project(id, &broken).is_err());
 
         store.delete_project(id).unwrap();
         assert!(store.list_projects().unwrap().is_empty());

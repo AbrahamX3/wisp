@@ -253,6 +253,8 @@ struct EditorState {
     ssl_enabled: bool,
     /// Extra `php.ini` directives, one per line, appended last.
     overrides: Entity<TextareaState>,
+    /// Extra nginx directives for the project's server block.
+    nginx_overrides: Entity<TextareaState>,
     /// The project's chosen icon, or `None` for the generated one.
     icon: Option<String>,
     /// A file picked from disk this session, copied into place on save.
@@ -736,6 +738,13 @@ impl Wisp {
                 .placeholder("upload_max_filesize = 128M\nmax_execution_time = 300")
                 .default_value(draft.php_ini_overrides.clone())
         });
+        let nginx_overrides = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(
+                    "location ^~ /api/ {\n    include fastcgi_params;\n    fastcgi_param SCRIPT_FILENAME $document_root/api/index.php;\n    fastcgi_pass $wisp_php;\n}",
+                )
+                .default_value(draft.nginx_overrides.clone())
+        });
 
         // The domain mirrors the app name until the user edits it directly.
         let app_sub = cx.subscribe_in(&app_name, window, |this, _state, event, window, cx| {
@@ -761,6 +770,7 @@ impl Wisp {
             php_version: draft.php_version,
             ssl_enabled: draft.ssl_enabled,
             overrides,
+            nginx_overrides,
             icon: existing
                 .as_ref()
                 .and_then(|project| project.icon_path.clone()),
@@ -1123,6 +1133,7 @@ impl Wisp {
             php_version: editor.php_version.clone(),
             ssl_enabled: editor.ssl_enabled,
             php_ini_overrides: editor.overrides.read(cx).value().to_string(),
+            nginx_overrides: editor.nginx_overrides.read(cx).value().to_string(),
             icon_path: chosen_icon,
         };
 
@@ -1688,6 +1699,7 @@ impl Wisp {
                 php_version: php.unwrap_or_default(),
                 ssl_enabled: project.ssl_enabled,
                 php_ini_overrides: project.php_ini_overrides.clone(),
+                nginx_overrides: project.nginx_overrides.clone(),
                 vhost,
                 worker,
             });
@@ -5349,6 +5361,7 @@ impl Wisp {
             "set_project_php" => self.mcp_set_project_php(params, cx),
             "set_project_https" => self.mcp_set_project_https(params, cx),
             "set_php_ini_overrides" => self.mcp_set_php_ini(params, cx),
+            "set_nginx_overrides" => self.mcp_set_nginx_overrides(params, cx),
             "reset_php_ini" => self.mcp_set_php_ini(
                 serde_json::json!({
                     "project": parse_mcp::<mcp::protocol::ProjectOnlyParams>(params)?.project,
@@ -5444,6 +5457,7 @@ impl Wisp {
             "php": php,
             "running": nginx || php,
             "php_ini_overrides": project.php_ini_overrides,
+            "nginx_overrides": project.nginx_overrides,
         })
     }
 
@@ -6385,6 +6399,35 @@ impl Wisp {
         }))
     }
 
+    fn mcp_set_nginx_overrides(
+        &mut self,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> McpResult {
+        let args: mcp::protocol::SetNginxOverridesParams = parse_mcp(params)?;
+        let project = self.mcp_find(&args.project)?.clone();
+        self.mcp_require_idle()?;
+        let mut draft = ProjectDraft::from_project(&project);
+        draft.nginx_overrides = args.overrides;
+        self.mcp_update_project_row(project.id, &draft)?;
+        self.reload(cx);
+        if self.nginx_on.contains(&project.id) {
+            self.sync_server(cx);
+        }
+        let saved = self
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == project.id)
+            .map(|candidate| candidate.nginx_overrides.clone())
+            .unwrap_or_default();
+        // nginx -t runs in the sync that just started; the bridge waits for it
+        // (`after_serving`) and reports a refusal from there.
+        Ok(serde_json::json!({
+            "project": project.id,
+            "overrides": saved,
+        }))
+    }
+
     fn mcp_update_project_row(&self, id: i64, draft: &ProjectDraft) -> Result<(), McpFailure> {
         let store = self.store.as_ref().ok_or_else(|| {
             McpFailure::new("unavailable", "The project database is unavailable.")
@@ -6458,6 +6501,7 @@ impl Wisp {
             php_version,
             ssl_enabled: args.ssl_enabled.unwrap_or(true),
             php_ini_overrides: args.php_ini_overrides.unwrap_or_default(),
+            nginx_overrides: args.nginx_overrides.unwrap_or_default(),
             icon_path: None,
         };
         let store = self.store.as_ref().ok_or_else(|| {
@@ -6530,6 +6574,10 @@ impl Wisp {
         if let Some(overrides) = args.php_ini_overrides {
             draft.php_ini_overrides = overrides;
             restart_worker = true;
+        }
+        if let Some(overrides) = args.nginx_overrides {
+            draft.nginx_overrides = overrides;
+            sync_site = true;
         }
 
         if restart_worker || sync_site {
@@ -8235,6 +8283,14 @@ fn editor_form(
                 .label("php.ini overrides")
                 .description("One directive per line, applied last.")
                 .child(Textarea::new(&editor.overrides).h(px(96.))),
+        )
+        .child(
+            Field::new()
+                .label("nginx overrides")
+                .description(
+                    "Directives added to the server block, ahead of the generated locations. $wisp_php is this project's PHP worker. Checked with nginx -t before it is applied.",
+                )
+                .child(Textarea::new(&editor.nginx_overrides).h(px(120.))),
         );
 
     if let Some(message) = error {
@@ -8966,6 +9022,7 @@ fn service_config_changed(before: &Project, after: &Project) -> bool {
         || before.domain != after.domain
         || before.php_version != after.php_version
         || before.ssl_enabled != after.ssl_enabled
+        || before.nginx_overrides != after.nginx_overrides
 }
 
 /// Whether a domain value counts as hand-edited rather than still auto-filled.
@@ -9063,9 +9120,18 @@ mod tests {
             php_version: Some("8.3.35".to_string()),
             ssl_enabled: true,
             php_ini_overrides: "{}".to_string(),
+            nginx_overrides: String::new(),
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn new_nginx_overrides_change_the_serving_config() {
+        let before = project("My App");
+        let mut after = project("My App");
+        after.nginx_overrides = "location /health {\n    return 204;\n}".to_string();
+        assert!(service_config_changed(&before, &after));
     }
 
     #[test]

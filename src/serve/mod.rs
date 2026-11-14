@@ -32,6 +32,11 @@ pub enum ServeError {
     /// A certificate could not be created.
     #[error("{0}")]
     Tls(#[from] crate::tls::TlsError),
+
+    /// nginx refused the generated configuration (a project's nginx overrides);
+    /// the previous configuration was put back.
+    #[error("{0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, ServeError>;
@@ -47,6 +52,8 @@ pub struct SiteSpec {
     pub ssl_enabled: bool,
     /// Raw `php.ini` directives the project adds, appended last.
     pub php_ini_overrides: String,
+    /// Raw nginx directives the project adds to its server block.
+    pub nginx_overrides: String,
     /// Whether nginx should serve this site's server block.
     pub vhost: bool,
     /// Whether a php-cgi worker should run for this site.
@@ -236,16 +243,49 @@ impl Supervisor {
     // ---- internals -------------------------------------------------------
 
     /// Write the server block for every served site, and drop the rest.
+    ///
+    /// A project's nginx overrides are text nginx has never seen, and one bad
+    /// line stops nginx for every site, since they share one server. So when
+    /// any are present the result is checked with `nginx -t` first, and the
+    /// previous files are put back if nginx refuses them: the running server
+    /// keeps serving what it had, and the error names the problem.
     fn write_vhosts(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<()> {
         let vhosts = config::vhosts_dir(prefix);
         std::fs::create_dir_all(&vhosts)?;
+        let before = snapshot_conf_files(&vhosts)?;
 
+        if let Err(error) = self.write_vhost_files(prefix, &vhosts, sites) {
+            restore_conf_files(&vhosts, &before);
+            return Err(error);
+        }
+
+        let has_overrides = sites
+            .iter()
+            .any(|site| site.vhost && !site.nginx_overrides.trim().is_empty());
+        if has_overrides {
+            if let Err(message) = test_nginx_config(prefix) {
+                restore_conf_files(&vhosts, &before);
+                return Err(ServeError::Config(format!(
+                    "nginx refused the project's nginx overrides, so the previous configuration was kept. {message}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The writing half of [`Self::write_vhosts`], which checks and undoes it.
+    fn write_vhost_files(
+        &mut self,
+        prefix: &Path,
+        vhosts: &Path,
+        sites: &[SiteSpec],
+    ) -> Result<()> {
         let wanted: HashSet<&str> = sites
             .iter()
             .filter(|site| site.vhost)
             .map(|site| site.slug.as_str())
             .collect();
-        for entry in std::fs::read_dir(&vhosts)? {
+        for entry in std::fs::read_dir(vhosts)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(slug) = name.strip_suffix(".conf") {
@@ -274,6 +314,7 @@ impl Supervisor {
                 listen_port: config::http_port(),
                 log_dir: &log_dir,
                 tls: tls.as_ref(),
+                overrides: &site.nginx_overrides,
             }
             .render();
             std::fs::write(vhosts.join(format!("{}.conf", site.slug)), vhost)?;
@@ -477,6 +518,61 @@ pub fn sweep_orphans() {
     }
 }
 
+/// The `.conf` files in a directory and their contents, to put back later.
+fn snapshot_conf_files(dir: &Path) -> std::io::Result<HashMap<PathBuf, Vec<u8>>> {
+    let mut files = HashMap::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "conf") {
+            files.insert(path.clone(), std::fs::read(&path)?);
+        }
+    }
+    Ok(files)
+}
+
+/// Put a directory's `.conf` files back as [`snapshot_conf_files`] saw them:
+/// rewrite those that were there and delete the ones added since.
+fn restore_conf_files(dir: &Path, before: &HashMap<PathBuf, Vec<u8>>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "conf") && !before.contains_key(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    for (path, contents) in before {
+        let _ = std::fs::write(path, contents);
+    }
+}
+
+/// Ask nginx whether the configuration Wisp wrote is valid (`nginx -t`),
+/// returning what nginx said when it is not.
+fn test_nginx_config(prefix: &Path) -> std::result::Result<(), String> {
+    let exe = prefix.join("nginx.exe");
+    let output = process::output(&exe, &nginx_args(prefix, &["-t"]))
+        .map_err(|error| format!("nginx could not check the configuration: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    // nginx ends with "configuration file ... test failed"; the line before it
+    // names the problem and the file and line it is on.
+    let reason = said
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains("test failed"))
+        .map(|line| line.strip_prefix("nginx: ").unwrap_or(line))
+        .map(|line| line.strip_prefix("[emerg] ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(if reason.is_empty() {
+        "nginx -t failed without saying why.".to_string()
+    } else {
+        reason
+    })
+}
+
 /// Wait until something accepts connections on `port`, or the timeout passes.
 fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -595,6 +691,7 @@ mod tests {
             php_version: "8.3.35".to_string(),
             ssl_enabled: false,
             php_ini_overrides: String::new(),
+            nginx_overrides: String::new(),
             vhost: true,
             worker: true,
         };
@@ -651,6 +748,7 @@ mod tests {
                     php_version: php,
                     ssl_enabled: project.ssl_enabled,
                     php_ini_overrides: project.php_ini_overrides.clone(),
+                    nginx_overrides: project.nginx_overrides.clone(),
                     vhost: true,
                     worker: true,
                 })
@@ -744,6 +842,7 @@ mod tests {
             php_version: "8.3.35".to_string(),
             ssl_enabled: true,
             php_ini_overrides: String::new(),
+            nginx_overrides: String::new(),
             vhost: true,
             worker: true,
         };
