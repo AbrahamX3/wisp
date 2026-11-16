@@ -73,6 +73,12 @@ Wisp owns the block between `# wisp:start` and `# wisp:end` in your hosts file
 and leaves every other line alone. Writing it needs administrator rights once;
 Wisp sets up a scheduled task for that automatically so it never prompts again.
 
+The domains point at `127.0.0.1`. If another program takes ports 80 and 443
+there (a Docker engine in WSL that publishes them, for example), your sites
+open that program instead: Wisp then refuses to start and names it. To keep
+both, give Wisp its own address in **Settings → Hosting → Loopback address**,
+such as `127.0.0.2`. Any address that starts with 127 is still this computer.
+
 ## Local MCP server
 
 Wisp can expose the running app to a CLI agent over the Model Context Protocol.

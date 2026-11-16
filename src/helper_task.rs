@@ -231,26 +231,36 @@ fn is_registered() -> bool {
 }
 
 /// Write the request the helper will act on.
-pub fn write_request(domains: &[String]) -> std::io::Result<()> {
+pub fn write_request(address: std::net::Ipv4Addr, domains: &[String]) -> std::io::Result<()> {
     let path = request_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let payload = serde_json::json!({ "domains": domains });
+    let payload = serde_json::json!({ "address": address.to_string(), "domains": domains });
     std::fs::write(path, payload.to_string())
 }
 
 /// Read the request. Used by the helper process.
-pub fn read_request() -> Option<Vec<String>> {
+///
+/// The helper runs as an administrator on a file any process of the user can
+/// write, so the address is checked again here: only a loopback address goes
+/// into the hosts file. A request without one is from before the setting
+/// existed and means `127.0.0.1`.
+pub fn read_request() -> Option<(std::net::Ipv4Addr, Vec<String>)> {
     let text = std::fs::read_to_string(request_path()).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let address = match value.get("address") {
+        None | Some(serde_json::Value::Null) => std::net::Ipv4Addr::LOCALHOST,
+        Some(address) => crate::settings::parse_loopback(address.as_str()?)?,
+    };
     let domains = value.get("domains")?.as_array()?;
-    Some(
+    Some((
+        address,
         domains
             .iter()
             .filter_map(|item| item.as_str().map(str::to_string))
             .collect(),
-    )
+    ))
 }
 
 /// Write the helper's result atomically (temp file + rename).
