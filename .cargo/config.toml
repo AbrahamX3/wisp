@@ -1,0 +1,14 @@
+# `/Brepro` makes the MSVC linker write the same bytes for the same inputs
+# (no timestamp in the file header).
+#
+# It is here for the build cache. Proc-macro crates are DLLs, which sccache
+# cannot cache, so they are linked again on every CI run. Without this flag
+# each link gave a different file, every crate that uses a derive macro then
+# got a new cache key, and 47 crates (serde, tokio, the GPUI crates) were
+# compiled again on a warm cache: about four minutes of every run.
+#
+# With no `--target` on the command line these flags also reach proc macros
+# and build scripts, which is what matters here. `ci.yml` and `release.yml`
+# build that way; keep it so.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]
