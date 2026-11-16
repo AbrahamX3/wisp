@@ -87,14 +87,17 @@ winresource = "0.1"
 # icon has a single source of truth and no generated binaries are committed.
 resvg = "0.48.1"
 
-# Release: one codegen unit and thin LTO trade a slightly longer CI build for a
-# smaller, faster binary; the symbols are stripped because nothing ships a crash
-# reporter. `panic = "abort"` is deliberately left off: the UI framework catches
-# panics in places, and aborting would turn those into hard exits.
+# Release: no cross-crate LTO and the default 16 codegen units. Thin LTO with
+# one codegen unit made a 3 MB smaller exe (34 MB against 37 MB), but it redid
+# the whole dependency graph at link time on every build, which no cache can
+# skip: about three and a half minutes of each CI and release run. The symbols
+# are stripped because nothing ships a crash reporter. `panic = "abort"` is
+# deliberately left off: the UI framework catches panics in places, and
+# aborting would turn those into hard exits.
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
 strip = true
 
 # Keep framework dependencies optimized in Debug so the app stays responsive
