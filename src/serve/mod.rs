@@ -9,6 +9,7 @@ pub mod config;
 pub mod process;
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
@@ -146,7 +147,15 @@ impl Supervisor {
     ///
     /// A site can be served (`vhost`) and/or have a worker (`worker`)
     /// independently, so nginx only runs while at least one site is served.
-    pub fn sync(&mut self, nginx_version: Option<&str>, sites: &[SiteSpec]) -> Result<()> {
+    ///
+    /// `loopback` is the address the domains resolve to (`127.0.0.1` unless
+    /// Settings says otherwise); nginx binds it.
+    pub fn sync(
+        &mut self,
+        nginx_version: Option<&str>,
+        sites: &[SiteSpec],
+        loopback: Ipv4Addr,
+    ) -> Result<()> {
         // A previous run may have been killed without stopping its workers,
         // leaving them holding ports and stale config. Clear them once.
         if !self.swept {
@@ -188,8 +197,12 @@ impl Supervisor {
                     "nginx {version} is not installed."
                 )));
             }
-            self.write_vhosts(&prefix, sites)?;
-            self.ensure_nginx(version, &prefix)?;
+            self.write_vhosts(&prefix, sites, loopback)?;
+            let mut ports = vec![config::http_port()];
+            if sites.iter().any(|site| site.vhost && site.ssl_enabled) {
+                ports.push(443);
+            }
+            self.ensure_nginx(version, &prefix, loopback, &ports)?;
         } else {
             // Nothing is served, so nginx has nothing to do.
             self.stop_nginx_only();
@@ -249,12 +262,17 @@ impl Supervisor {
     /// any are present the result is checked with `nginx -t` first, and the
     /// previous files are put back if nginx refuses them: the running server
     /// keeps serving what it had, and the error names the problem.
-    fn write_vhosts(&mut self, prefix: &Path, sites: &[SiteSpec]) -> Result<()> {
+    fn write_vhosts(
+        &mut self,
+        prefix: &Path,
+        sites: &[SiteSpec],
+        loopback: Ipv4Addr,
+    ) -> Result<()> {
         let vhosts = config::vhosts_dir(prefix);
         std::fs::create_dir_all(&vhosts)?;
         let before = snapshot_conf_files(&vhosts)?;
 
-        if let Err(error) = self.write_vhost_files(prefix, &vhosts, sites) {
+        if let Err(error) = self.write_vhost_files(prefix, &vhosts, sites, loopback) {
             restore_conf_files(&vhosts, &before);
             return Err(error);
         }
@@ -279,6 +297,7 @@ impl Supervisor {
         prefix: &Path,
         vhosts: &Path,
         sites: &[SiteSpec],
+        address: Ipv4Addr,
     ) -> Result<()> {
         let wanted: HashSet<&str> = sites
             .iter()
@@ -295,6 +314,12 @@ impl Supervisor {
             }
         }
 
+        // The first block on each port carries its `bind` option; see
+        // `config::Loopback`.
+        let ipv6 = config::ipv6_loopback_available();
+        let mut http_bound = false;
+        let mut tls_bound = false;
+
         for site in sites.iter().filter(|site| site.vhost) {
             let port = self.port_for(site.id);
             let docroot = config::resolve_docroot(&site.root);
@@ -307,11 +332,21 @@ impl Supervisor {
                 None
             };
 
+            let loopback = config::Loopback {
+                address,
+                bind_http: !http_bound,
+                bind_tls: tls.is_some() && !tls_bound,
+                ipv6,
+            };
+            http_bound = true;
+            tls_bound |= tls.is_some();
+
             let vhost = config::Vhost {
                 domain: &site.domain,
                 docroot: &docroot,
                 port,
                 listen_port: config::http_port(),
+                loopback,
                 log_dir: &log_dir,
                 tls: tls.as_ref(),
                 overrides: &site.nginx_overrides,
@@ -407,7 +442,13 @@ impl Supervisor {
         Ok(child)
     }
 
-    fn ensure_nginx(&mut self, version: &str, prefix: &Path) -> Result<()> {
+    fn ensure_nginx(
+        &mut self,
+        version: &str,
+        prefix: &Path,
+        loopback: Ipv4Addr,
+        ports: &[u16],
+    ) -> Result<()> {
         let running = self.nginx.as_mut().is_some_and(process::is_running);
         if running {
             if self.nginx_version.as_deref() == Some(version) {
@@ -423,6 +464,25 @@ impl Supervisor {
             } else {
                 self.stop_nginx(prefix);
             }
+        }
+
+        // nginx is not running here, so anything answering on loopback is
+        // another program. nginx would still start beside it (Windows lets both
+        // bind), and then every site would open that program instead.
+        if let Some(port) = ports
+            .iter()
+            .copied()
+            .find(|port| loopback_port_taken(loopback, *port))
+        {
+            let holder = loopback_port_holder(loopback, port).map_or_else(
+                || "another program".to_string(),
+                |name| format!("{name}.exe"),
+            );
+            return Err(ServeError::Start(format!(
+                "Port {port} on {loopback} is already taken by {holder}, so your sites would open that instead of Wisp. \
+                 Stop it or move it off port {port}, or give Wisp another loopback address in Settings \u{203a} Hosting, then start again. \
+                 (wslrelay.exe is WSL publishing a port for a Linux program, such as a Docker engine or its local domains.)"
+            )));
         }
 
         let exe = prefix.join("nginx.exe");
@@ -588,6 +648,38 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// Whether something already accepts connections on `address:port`.
+fn loopback_port_taken(address: Ipv4Addr, port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((address, port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+}
+
+/// The name of the process listening on `port` for loopback connections, to
+/// name it in the error. The one bound to the address itself is preferred over
+/// a wildcard listener, since it is the one that gets the connections.
+fn loopback_port_holder(address: Ipv4Addr, port: u16) -> Option<String> {
+    let script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'\n\
+         $c = Get-NetTCPConnection -LocalPort {port} -State Listen \
+         | Where-Object {{ $_.LocalAddress -in '{address}','0.0.0.0','::' }} \
+         | Sort-Object {{ $_.LocalAddress -ne '{address}' }} | Select-Object -First 1\n\
+         if ($c) {{ (Get-Process -Id $c.OwningProcess).ProcessName }}"
+    );
+    let powershell = system32()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let args = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script,
+    ];
+    let output = process::output(&powershell, &args).ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// A localhost port the OS says is free.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -633,6 +725,7 @@ fn read_log_tail(path: &Path, label: &str) -> String {
 mod tests {
     use super::{SiteSpec, Supervisor};
     use crate::runtime::{self, Release, RuntimeKind};
+    use std::net::Ipv4Addr;
 
     fn ensure_nginx(version: &str) {
         let dir = runtime::install_dir(RuntimeKind::Nginx, version);
@@ -698,7 +791,7 @@ mod tests {
 
         let mut supervisor = Supervisor::default();
         supervisor
-            .sync(Some("1.27.0"), &[spec])
+            .sync(Some("1.27.0"), &[spec], Ipv4Addr::LOCALHOST)
             .expect("sync should start nginx and a worker");
 
         std::thread::sleep(std::time::Duration::from_millis(900));
@@ -759,7 +852,11 @@ mod tests {
         let settings = crate::settings::Settings::load();
         let mut supervisor = Supervisor::default();
         supervisor
-            .sync(settings.active_nginx.as_deref(), &specs)
+            .sync(
+                settings.active_nginx.as_deref(),
+                &specs,
+                settings.loopback(),
+            )
             .expect("sync should start the server");
 
         // Let nginx and the workers settle.
@@ -849,7 +946,7 @@ mod tests {
 
         let mut supervisor = Supervisor::default();
         supervisor
-            .sync(Some("1.27.0"), &[spec])
+            .sync(Some("1.27.0"), &[spec], Ipv4Addr::LOCALHOST)
             .expect("sync should start https");
 
         std::thread::sleep(std::time::Duration::from_millis(900));

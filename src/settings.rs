@@ -60,9 +60,37 @@ pub struct Settings {
     /// start when this is off.
     #[serde(default)]
     pub mcp_enabled: bool,
+    /// The loopback address the `.test` domains point at and nginx binds,
+    /// when it is not `127.0.0.1`.
+    ///
+    /// Another program can hold ports 80 and 443 on `127.0.0.1` (WSL does, for
+    /// a Docker engine that publishes them), and then it gets the requests
+    /// instead of Wisp. Any other address in `127.0.0.0/8` is still this
+    /// computer, and nobody else listens there.
+    #[serde(default)]
+    pub loopback_address: Option<String>,
+}
+
+/// Read a loopback address the user typed: an IPv4 address in `127.0.0.0/8`.
+///
+/// Only those are accepted because the address goes into the hosts file, which
+/// is written with administrator rights, and into nginx's `listen` lines.
+pub fn parse_loopback(text: &str) -> Option<std::net::Ipv4Addr> {
+    text.trim()
+        .parse::<std::net::Ipv4Addr>()
+        .ok()
+        .filter(std::net::Ipv4Addr::is_loopback)
 }
 
 impl Settings {
+    /// The loopback address to serve on; `127.0.0.1` unless another was set.
+    pub fn loopback(&self) -> std::net::Ipv4Addr {
+        self.loopback_address
+            .as_deref()
+            .and_then(parse_loopback)
+            .unwrap_or(std::net::Ipv4Addr::LOCALHOST)
+    }
+
     fn file() -> PathBuf {
         config::root().join("settings.json")
     }
@@ -97,6 +125,29 @@ mod tests {
     #[test]
     fn the_mcp_server_is_off_by_default() {
         assert!(!Settings::default().mcp_enabled);
+    }
+
+    #[test]
+    fn the_loopback_address_defaults_to_localhost_and_stays_on_loopback() {
+        use super::parse_loopback;
+        use std::net::Ipv4Addr;
+
+        assert_eq!(Settings::default().loopback(), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            parse_loopback(" 127.0.0.2 "),
+            Some(Ipv4Addr::new(127, 0, 0, 2))
+        );
+        assert_eq!(parse_loopback("192.168.1.10"), None, "not this computer");
+        assert_eq!(parse_loopback("0.0.0.0"), None);
+        assert_eq!(parse_loopback("::1"), None);
+        assert_eq!(parse_loopback("127.0.0.2 evil.test"), None);
+
+        // A bad value in the file falls back instead of breaking serving.
+        let settings = Settings {
+            loopback_address: Some("10.0.0.1".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(settings.loopback(), Ipv4Addr::LOCALHOST);
     }
 
     #[test]

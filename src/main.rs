@@ -173,7 +173,7 @@ fn main() {
 
 /// `--clear-hosts`: drop Wisp's managed hosts block, markers included.
 fn clear_hosts() -> i32 {
-    match hosts::write(&[]) {
+    match hosts::write(std::net::Ipv4Addr::LOCALHOST, &[]) {
         Ok(()) => {
             let _ = writeln!(std::io::stdout(), "wisp: hosts block cleared");
             0

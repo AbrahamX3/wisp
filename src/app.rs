@@ -414,6 +414,11 @@ pub struct Wisp {
     elevation_busy: bool,
     /// The domains last written to the hosts file, so we only elevate on change.
     hosts_written: Vec<String>,
+    /// Served domains that a hosts line outside Wisp's block sends somewhere
+    /// other than the loopback address, so they may open another program.
+    hosts_conflicts: Vec<String>,
+    /// The loopback address being typed on the Hosting settings page.
+    loopback_input: Entity<InputState>,
     /// A folder chosen in the native picker, applied to the editor on next render
     /// (which is where a `Window` is available).
     pending_root: Option<String>,
@@ -490,6 +495,11 @@ impl Wisp {
         let project_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search projects"));
         let log_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find in log"));
+        let loopback_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("127.0.0.1")
+                .default_value(settings.loopback().to_string())
+        });
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let _subscriptions = vec![
             cx.subscribe_in(
@@ -561,6 +571,8 @@ impl Wisp {
             mode: ControlMode::Uac,
             elevation_busy: false,
             hosts_written: Vec::new(),
+            hosts_conflicts: Vec::new(),
+            loopback_input,
             pending_root: None,
             pending_icon: None,
             log_kind: LogKind::Php,
@@ -1750,6 +1762,7 @@ impl Wisp {
         domains.sort();
         let mode = self.mode;
         let version = self.settings.active_nginx.clone();
+        let loopback = self.settings.loopback();
         let mut supervisor = std::mem::take(&mut cx.global_mut::<ServerGlobal>().0);
         self.serve_busy = true;
         cx.notify();
@@ -1759,7 +1772,7 @@ impl Wisp {
                 .background_executor()
                 .spawn(async move {
                     let outcome = supervisor
-                        .sync(version.as_deref(), &specs)
+                        .sync(version.as_deref(), &specs, loopback)
                         .map(|()| supervisor.status());
                     (supervisor, outcome)
                 })
@@ -1863,11 +1876,13 @@ impl Wisp {
         if domains == self.hosts_written {
             return;
         }
+        let address = self.settings.loopback();
         // A previous run, or another tool, may already have written the entries.
         // Reading the file itself avoids an unnecessary elevation prompt.
-        if !hosts::needs_update(&domains) {
+        if !hosts::needs_update(address, &domains) {
             self.hosts_written = domains;
             self.hosts_error = None;
+            self.check_hosts_conflicts();
             return;
         }
 
@@ -1877,7 +1892,7 @@ impl Wisp {
         cx.spawn(async move |entity, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { elevation::perform_hosts(mode, &to_write) })
+                .spawn(async move { elevation::perform_hosts(mode, address, &to_write) })
                 .await;
             entity
                 .update(cx, |this, cx| {
@@ -1887,6 +1902,7 @@ impl Wisp {
                             let should_report = this.hosts_written.is_empty() && !domains.is_empty();
                             this.hosts_written = domains;
                             this.hosts_error = None;
+                            this.check_hosts_conflicts();
                             // The first write may have installed no-prompt control.
                             if this.mode == ControlMode::Uac {
                                 this.mode = elevation::detect_mode();
@@ -1919,6 +1935,60 @@ impl Wisp {
                 .ok();
         })
         .detach();
+    }
+
+    /// Look for hosts lines, outside Wisp's block, that send a served domain
+    /// somewhere other than Wisp's address. Wisp never edits those; the banner
+    /// names them so the user can remove them.
+    fn check_hosts_conflicts(&mut self) {
+        let address = self.settings.loopback();
+        self.hosts_conflicts = hosts::read()
+            .map(|text| hosts::conflicts(&text, address, &self.hosts_written))
+            .unwrap_or_default();
+    }
+
+    /// Serve on the loopback address typed on the Hosting settings page.
+    fn apply_loopback_address(&mut self, cx: &mut Context<Self>) {
+        let typed = self.loopback_input.read(cx).value().to_string();
+        let Some(address) = crate::settings::parse_loopback(&typed) else {
+            self.push_toast(
+                ToastKind::Error,
+                "Enter an address that starts with 127, such as 127.0.0.2.".to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        if address == self.settings.loopback() {
+            return;
+        }
+        // A sync in flight was started with the old address and would leave
+        // nginx on it while the hosts file moved on.
+        if self.serve_busy || self.hosts_busy {
+            self.push_toast(
+                ToastKind::Warning,
+                "Wisp is busy starting or stopping. Try again in a moment.".to_string(),
+            );
+            cx.notify();
+            return;
+        }
+
+        self.settings.loopback_address =
+            (address != std::net::Ipv4Addr::LOCALHOST).then(|| address.to_string());
+        self.settings.save();
+        // The hosts block names the old address, whatever domains it lists.
+        self.hosts_written.clear();
+        self.hosts_conflicts.clear();
+        if self.nginx_on.is_empty() {
+            self.sync_hosts(cx);
+        } else {
+            // Rewrites the server blocks, reloads nginx, then the hosts file.
+            self.sync_server(cx);
+        }
+        self.push_toast(
+            ToastKind::Success,
+            format!("Local domains now use {address}."),
+        );
+        cx.notify();
     }
 
     fn setup_elevated(&mut self, cx: &mut Context<Self>) {
@@ -5974,6 +6044,7 @@ impl Wisp {
             "active_nginx": self.settings.active_nginx,
             "ca_trusted": self.settings.ca_trusted,
             "mcp_enabled": self.settings.mcp_enabled,
+            "loopback_address": self.settings.loopback().to_string(),
             "onboarding_complete": self.settings.onboarding_complete,
             "hosts_mode": mcp_mode_name(self.mode),
             "available_version": self.settings.available_version,
@@ -6716,6 +6787,43 @@ impl Render for Wisp {
             );
         }
 
+        if !self.hosts_conflicts.is_empty() {
+            let message = format!(
+                "The hosts file has another entry for {} that does not point at {}, so the \
+                 browser may open a different program. Remove those lines (they are outside \
+                 Wisp's block) and reload the page.",
+                self.hosts_conflicts.join(", "),
+                self.settings.loopback(),
+            );
+            root = root.child(
+                div()
+                    .px(px(20.))
+                    .pt(px(14.))
+                    .pb(px(12.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div().flex_1().child(
+                            Alert::warning("hosts-conflicts", message)
+                                .title("Another hosts entry is in the way")
+                                .banner(),
+                        ),
+                    )
+                    .child(
+                        Button::new("hosts-conflicts-recheck")
+                            .small()
+                            .outline()
+                            .label("Check again")
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.check_hosts_conflicts();
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+
         if let Some(banner) = self.update_banner(cx) {
             root = root.child(banner);
         }
@@ -6852,10 +6960,54 @@ fn hosting_settings_page(entity: &Entity<Wisp>, wisp: &Wisp) -> SettingPage {
     let read = entity.clone();
     let write = entity.clone();
     let folder = entity.clone();
+    let loopback = entity.clone();
 
     SettingPage::new("Hosting")
         .icon(icon(IconName::ShieldCheck))
         .description("How Wisp writes the Windows hosts file for local domains.")
+        .group(
+            SettingGroup::new()
+                .title("Loopback address")
+                .item(SettingItem::render(move |_options, _window, cx| {
+                    let input = loopback.read(cx).loopback_input.clone();
+                    let apply = loopback.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    "Where your .test domains point. Keep 127.0.0.1 unless \
+                                     another program takes ports 80 and 443 there (a Docker \
+                                     engine in WSL, for example) and your sites open that \
+                                     instead. Then use another address that starts with 127, \
+                                     such as 127.0.0.2: it is still this computer.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(div().w(px(180.)).child(Input::new(&input)))
+                                .child(
+                                    Button::new("settings-loopback-apply")
+                                        .outline()
+                                        .small()
+                                        .label("Apply")
+                                        .on_click(move |_, _, cx| {
+                                            apply.update(cx, |this, cx| {
+                                                this.apply_loopback_address(cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                })),
+        )
         .group(
             SettingGroup::new()
                 .title("Hosts file")

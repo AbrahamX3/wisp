@@ -23,12 +23,12 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    let Some(domains) = helper_task::read_request() else {
+    let Some((address, domains)) = helper_task::read_request() else {
         write_out(out.as_deref(), false, "Invalid request for --ctl.");
         return 2;
     };
 
-    match hosts::write(&domains) {
+    match hosts::write(address, &domains) {
         Ok(()) => {
             write_out(out.as_deref(), true, "");
             0
@@ -42,12 +42,12 @@ pub fn run(args: &[String]) -> i32 {
 
 /// Entry point used by the scheduled task.
 pub fn run_from_task() -> i32 {
-    let Some(domains) = helper_task::read_request() else {
+    let Some((address, domains)) = helper_task::read_request() else {
         helper_task::write_response(false, "The elevated helper received an invalid request.");
         return 2;
     };
 
-    match hosts::write(&domains) {
+    match hosts::write(address, &domains) {
         Ok(()) => {
             helper_task::write_response(true, "");
             0

@@ -69,16 +69,20 @@ pub fn detect_mode() -> ControlMode {
 }
 
 /// Write the hosts file using the best available mode.
-pub fn perform_hosts(mode: ControlMode, domains: &[String]) -> ActionOutcome {
+pub fn perform_hosts(
+    mode: ControlMode,
+    address: std::net::Ipv4Addr,
+    domains: &[String],
+) -> ActionOutcome {
     // The elevated paths work from the request file, so stage it first.
     if !matches!(mode, ControlMode::Elevated) {
-        if let Err(error) = helper_task::write_request(domains) {
+        if let Err(error) = helper_task::write_request(address, domains) {
             return ActionOutcome::Failed(error.to_string());
         }
     }
 
     match mode {
-        ControlMode::Elevated => match hosts::write(domains) {
+        ControlMode::Elevated => match hosts::write(address, domains) {
             Ok(()) => ActionOutcome::Done,
             Err(error) => ActionOutcome::Failed(error.to_string()),
         },
